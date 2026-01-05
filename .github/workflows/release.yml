@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-amd64
+
+          - os: ubuntu-latest
+            platform: linux-arm64
+
+          - os: macos-latest
+            platform: darwin-amd64
+
+          - os: macos-latest
+            platform: darwin-arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Get version
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Build release
+        run: |
+          chmod +x scripts/release.sh
+          ./scripts/release.sh ${{ steps.get_version.outputs.VERSION }}
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/*.tar.gz*
+
+  create-release:
+    name: Create GitHub Release
+    needs: build-release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: Get version
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          VERSION=${{ steps.get_version.outputs.VERSION }}
+          cat > release_notes.md << EOF
+          # ecapture_decryptor ${VERSION}
+          
+          ## 📦 Downloads
+          
+          Choose the appropriate package for your platform:
+          
+          - **macOS Apple Silicon**: \`ecapture_decryptor-${VERSION}-darwin-arm64.tar.gz\`
+          - **macOS Intel**: \`ecapture_decryptor-${VERSION}-darwin-amd64.tar.gz\`
+          - **Linux x86_64**: \`ecapture_decryptor-${VERSION}-linux-amd64.tar.gz\`
+          - **Linux Aarch64**: \`ecapture_decryptor-${VERSION}-linux-arm64.tar.gz\`
+          
+          ## 📝 Installation
+          
+          \`\`\`bash
+          # Download and extract
+          tar -xzf ecapture_decryptor-${VERSION}-<platform>.tar.gz
+          cd ecapture_decryptor-${VERSION}-<platform>
+          
+          # Verify checksum
+          sha256sum -c SHA256SUMS
+          
+          # Use the library
+          gcc -o myapp myapp.c -I./include -L./lib -lecapture_decryptor
+          \`\`\`
+          
+          ## 🔐 Verification
+          
+          Verify the integrity of downloaded files using SHA256 checksums:
+          
+          \`\`\`bash
+          sha256sum -c ecapture_decryptor-${VERSION}-<platform>.tar.gz.sha256
+          \`\`\`
+          
+          ## 📄 License
+          
+          **Non-Commercial License** - See LICENSE-BINARY in the package
+          
+          For commercial licensing, contact: cfc4n.cs@gmail.com
+          
+          ## 📖 Documentation
+          
+          - [README](https://github.com/cfc4n/ecapture_decryptor/blob/main/README.md)
+          - [Release Guide](https://github.com/cfc4n/ecapture_decryptor/blob/main/RELEASE_GUIDE.md)
+          - [Examples](https://github.com/cfc4n/ecapture_decryptor/tree/main/examples)
+          
+          ## 🆕 What's New
+          
+          See [CHANGELOG.md](https://github.com/cfc4n/ecapture_decryptor/blob/main/CHANGELOG.md) for detailed changes.
+          
+          ---
+          
+          **Full Changelog**: https://github.com/cfc4n/ecapture_decryptor/compare/v1.0.0...${VERSION}
+          EOF
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/**/*.tar.gz*
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload to release assets
+        run: |
+          echo "Release created successfully!"
+          echo "Download page: https://github.com/${{ github.repository }}/releases/tag/${{ steps.get_version.outputs.VERSION }}"
+

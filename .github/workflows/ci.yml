@@ -1,0 +1,244 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-format:
+    name: Lint and Format Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Install development tools
+        run: make tools
+
+      - name: Check code format
+        run: |
+          # Check gofmt
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "::error::Code is not formatted. Please run 'make fmt'"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: Check goimports
+        run: |
+          # Check goimports
+          if [ -n "$(goimports -l .)" ]; then
+            echo "::error::Imports are not formatted. Please run 'make fmt'"
+            goimports -d .
+            exit 1
+          fi
+
+      - name: Run golangci-lint
+        run: golangci-lint run ./...
+
+  test:
+    name: Unit Tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        go-version: ['1.24']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Download Go modules
+        run: go mod download
+
+      - name: Run unit tests
+        run: go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Upload coverage to Codecov
+        if: matrix.os == 'ubuntu-latest'
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.out
+          flags: unittests
+          name: codecov-${{ matrix.os }}
+          fail_ci_if_error: false
+
+  build:
+    name: Build Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Build static library
+        run: make build-static
+
+      - name: Build shared library
+        run: make build-shared
+
+      - name: Verify build artifacts
+        run: |
+          # Check if artifacts exist
+          ls -lh lib/
+          ls -lh include/
+          
+          # Verify static library
+          if [ ! -f "lib/libecapture_decryptor.a" ]; then
+            echo "::error::Static library not found"
+            exit 1
+          fi
+          
+          # Verify shared library
+          if [ ! -f "lib/libecapture_decryptor.so" ] && [ ! -f "lib/libecapture_decryptor.dylib" ]; then
+            echo "::error::Shared library not found"
+            exit 1
+          fi
+          
+          # Verify header
+          if [ ! -f "include/libecapture_decryptor.h" ]; then
+            echo "::error::Header file not found"
+            exit 1
+          fi
+          
+          echo "✓ All build artifacts verified"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.os }}
+          path: |
+            lib/
+            include/
+          retention-days: 7
+
+  build-examples:
+    name: Build Examples
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-${{ matrix.os }}
+
+      - name: Build Go examples
+        run: |
+          cd examples/go_demo
+          make
+
+      - name: Build C examples
+        run: |
+          cd examples/c_demo
+          make
+
+      - name: Verify example binaries
+        run: |
+          echo "✓ Examples built successfully"
+          find examples -type f -perm +111 -exec ls -lh {} \;
+
+  all-checks-passed:
+    name: All Checks Passed
+    needs: [lint-and-format, test, build, build-examples]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          echo "✅ All CI checks passed successfully!"
+          echo "- Code format check: ✓"
+          echo "- Linting: ✓"
+          echo "- Unit tests: ✓"
+          echo "- Build test: ✓"
+          echo "- Example builds: ✓"
+

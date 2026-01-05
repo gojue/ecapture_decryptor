@@ -1,0 +1,1488 @@
+[
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:18:37.059064Z",
+    "metadata": {
+      "headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "User-Agent": [
+          "curl/8.7.1"
+        ]
+      },
+      "method": "GET",
+      "url": "/"
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63151,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 55
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:18:37.059064Z",
+    "metadata": {
+      "headers": {
+        "Content-Length": [
+          "30"
+        ],
+        "Content-Type": [
+          "application/octet-stream",
+          "text/plain"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:18:37 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ],
+        "X-Protocol": [
+          "HTTP/1.0"
+        ]
+      },
+      "status": 200
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63151,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 225
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:18:43.353123Z",
+    "metadata": {
+      "authority": "local.koujue.cc",
+      "headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "User-Agent": [
+          "curl/8.7.1"
+        ]
+      },
+      "method": "GET",
+      "path": "/redirect",
+      "scheme": "https",
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63157,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 63
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:18:41.265789Z",
+    "metadata": {
+      "authority": "local.koujue.cc",
+      "headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "Content-Length": [
+          "19"
+        ],
+        "Content-Type": [
+          "application/x-www-form-urlencoded"
+        ],
+        "User-Agent": [
+          "curl/8.7.1"
+        ]
+      },
+      "method": "POST",
+      "path": "/api/post",
+      "scheme": "https",
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63155,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 152
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:18:39.160183Z",
+    "metadata": {
+      "authority": "local.koujue.cc",
+      "headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "User-Agent": [
+          "curl/8.7.1"
+        ]
+      },
+      "method": "GET",
+      "path": "/",
+      "scheme": "https",
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63153,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 55
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:18:38.108569Z",
+    "metadata": {
+      "headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "User-Agent": [
+          "curl/8.7.1"
+        ]
+      },
+      "method": "GET",
+      "url": "/"
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63152,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 55
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:18:43.353123Z",
+    "metadata": {
+      "headers": {
+        "Content-Length": [
+          "154"
+        ],
+        "Content-Type": [
+          "text/html"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:18:43 GMT"
+        ],
+        "Location": [
+          "https://local.koujue.cc/api/info"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ]
+      },
+      "status": 302,
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63157,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 328
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:18:41.265789Z",
+    "metadata": {
+      "headers": {
+        "Content-Length": [
+          "55"
+        ],
+        "Content-Type": [
+          "application/octet-stream",
+          "application/json"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:18:41 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ]
+      },
+      "status": 200,
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63155,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 231
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:18:40.213612Z",
+    "metadata": {
+      "authority": "local.koujue.cc",
+      "headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "Content-Length": [
+          "10"
+        ],
+        "Content-Type": [
+          "application/json"
+        ],
+        "User-Agent": [
+          "curl/8.7.1"
+        ]
+      },
+      "method": "POST",
+      "path": "/api/post",
+      "scheme": "https",
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63154,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 126
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:18:39.160183Z",
+    "metadata": {
+      "headers": {
+        "Content-Length": [
+          "30"
+        ],
+        "Content-Type": [
+          "application/octet-stream",
+          "text/plain"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:18:39 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ],
+        "X-Protocol": [
+          "HTTP/2.0"
+        ]
+      },
+      "status": 200,
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63153,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 222
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:18:44.398308Z",
+    "metadata": {
+      "authority": "local.koujue.cc",
+      "headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "User-Agent": [
+          "curl/8.7.1"
+        ]
+      },
+      "method": "GET",
+      "path": "/redirect",
+      "scheme": "https",
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63158,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 63
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:18:44.398308Z",
+    "metadata": {
+      "authority": "local.koujue.cc",
+      "headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "User-Agent": [
+          "curl/8.7.1"
+        ]
+      },
+      "method": "GET",
+      "path": "/api/info",
+      "scheme": "https",
+      "stream_id": 3
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63158,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 63
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:18:40.213612Z",
+    "metadata": {
+      "headers": {
+        "Content-Length": [
+          "55"
+        ],
+        "Content-Type": [
+          "application/octet-stream",
+          "application/json"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:18:40 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ]
+      },
+      "status": 200,
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63154,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 231
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:18:44.398308Z",
+    "metadata": {
+      "headers": {
+        "Content-Length": [
+          "154"
+        ],
+        "Content-Type": [
+          "text/html"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:18:44 GMT"
+        ],
+        "Location": [
+          "https://local.koujue.cc/api/info"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ]
+      },
+      "status": 302,
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63158,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 328
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:18:44.398308Z",
+    "metadata": {
+      "headers": {
+        "Content-Length": [
+          "54"
+        ],
+        "Content-Type": [
+          "application/octet-stream",
+          "application/json"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:18:44 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ]
+      },
+      "status": 200,
+      "stream_id": 3
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63158,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 230
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:18:38.108569Z",
+    "metadata": {
+      "headers": {
+        "Connection": [
+          "keep-alive"
+        ],
+        "Content-Length": [
+          "30"
+        ],
+        "Content-Type": [
+          "application/octet-stream",
+          "text/plain"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:18:38 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ],
+        "X-Protocol": [
+          "HTTP/1.1"
+        ]
+      },
+      "status": 200
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63152,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 249
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:18:47.488611Z",
+    "metadata": {
+      "authority": "local.koujue.cc",
+      "headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "User-Agent": [
+          "curl/8.7.1"
+        ]
+      },
+      "method": "GET",
+      "path": "/status/200",
+      "scheme": "https",
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63160,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 65
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:18:49.537076Z",
+    "metadata": {
+      "authority": "local.koujue.cc",
+      "headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "User-Agent": [
+          "curl/8.7.1"
+        ]
+      },
+      "method": "GET",
+      "path": "/status/201",
+      "scheme": "https",
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63171,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 65
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:18:49.537189Z",
+    "metadata": {
+      "headers": {
+        "Content-Length": [
+          "8"
+        ],
+        "Content-Type": [
+          "application/octet-stream"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:18:49 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ]
+      },
+      "status": 201,
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63171,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 151
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:18:45.446792Z",
+    "metadata": {
+      "authority": "local.koujue.cc",
+      "headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "Accept-Encoding": [
+          "gzip"
+        ],
+        "User-Agent": [
+          "curl/8.7.1"
+        ]
+      },
+      "method": "GET",
+      "path": "/gzip",
+      "scheme": "https",
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63159,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 82
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:18:47.488611Z",
+    "metadata": {
+      "headers": {
+        "Content-Length": [
+          "3"
+        ],
+        "Content-Type": [
+          "application/octet-stream"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:18:47 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ]
+      },
+      "status": 200,
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63160,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 146
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:18:45.446792Z",
+    "metadata": {
+      "headers": {
+        "Content-Length": [
+          "91"
+        ],
+        "Content-Type": [
+          "application/octet-stream",
+          "text/plain"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:18:45 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ]
+      },
+      "status": 200,
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63159,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 261
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:18:42.32261Z",
+    "metadata": {
+      "authority": "local.koujue.cc",
+      "headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "Content-Length": [
+          "5243095"
+        ],
+        "Content-Type": [
+          "multipart/form-data; boundary=------------------------7tmLgj4zkhg54LMRtdWERw"
+        ],
+        "User-Agent": [
+          "curl/8.7.1"
+        ]
+      },
+      "method": "POST",
+      "path": "/api/upload",
+      "scheme": "https",
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63156,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 65719
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:18:42.32261Z",
+    "metadata": {
+      "headers": {
+        "Content-Length": [
+          "56"
+        ],
+        "Content-Type": [
+          "application/octet-stream",
+          "application/json"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:18:42 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ]
+      },
+      "status": 200,
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63156,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 232
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:18:50.58154Z",
+    "metadata": {
+      "authority": "local.koujue.cc",
+      "headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "User-Agent": [
+          "curl/8.7.1"
+        ]
+      },
+      "method": "GET",
+      "path": "/status/400",
+      "scheme": "https",
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63172,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 65
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:18:50.58154Z",
+    "metadata": {
+      "headers": {
+        "Content-Length": [
+          "12"
+        ],
+        "Content-Type": [
+          "application/octet-stream"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:18:50 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ]
+      },
+      "status": 400,
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63172,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 156
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:18:51.629689Z",
+    "metadata": {
+      "authority": "local.koujue.cc",
+      "headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "User-Agent": [
+          "curl/8.7.1"
+        ]
+      },
+      "method": "GET",
+      "path": "/status/404",
+      "scheme": "https",
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63173,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 65
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:18:53.682311Z",
+    "metadata": {
+      "authority": "local.koujue.cc",
+      "headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "User-Agent": [
+          "curl/8.7.1"
+        ]
+      },
+      "method": "GET",
+      "path": "/status/500",
+      "scheme": "https",
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63174,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 65
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:18:51.629689Z",
+    "metadata": {
+      "headers": {
+        "Content-Length": [
+          "10"
+        ],
+        "Content-Type": [
+          "application/octet-stream"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:18:51 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ]
+      },
+      "status": 404,
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63173,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 154
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/2",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:18:53.682311Z",
+    "metadata": {
+      "headers": {
+        "Content-Length": [
+          "22"
+        ],
+        "Content-Type": [
+          "application/octet-stream"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:18:53 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ]
+      },
+      "status": 500,
+      "stream_id": 1
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63174,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 166
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:18:54.745696Z",
+    "metadata": {
+      "headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "Accept-Encoding": [
+          "identity"
+        ],
+        "Connection": [
+          "Keep-Alive"
+        ],
+        "User-Agent": [
+          "Wget/1.24.5"
+        ]
+      },
+      "method": "GET",
+      "url": "/"
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63175,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 107
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:18:54.745696Z",
+    "metadata": {
+      "headers": {
+        "Connection": [
+          "keep-alive"
+        ],
+        "Content-Length": [
+          "30"
+        ],
+        "Content-Type": [
+          "application/octet-stream",
+          "text/plain"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:18:54 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ],
+        "X-Protocol": [
+          "HTTP/1.1"
+        ]
+      },
+      "status": 200
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63175,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 249
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:18:56.792991Z",
+    "metadata": {
+      "headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "Accept-Encoding": [
+          "identity"
+        ],
+        "Connection": [
+          "Keep-Alive"
+        ],
+        "User-Agent": [
+          "Wget/1.24.5"
+        ]
+      },
+      "method": "GET",
+      "url": "/api/info"
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63176,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 115
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:18:56.792991Z",
+    "metadata": {
+      "headers": {
+        "Connection": [
+          "keep-alive"
+        ],
+        "Content-Length": [
+          "54"
+        ],
+        "Content-Type": [
+          "application/octet-stream",
+          "application/json"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:18:56 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ]
+      },
+      "status": 200
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63176,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 257
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:18:58.839593Z",
+    "metadata": {
+      "headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "Accept-Encoding": [
+          "identity"
+        ],
+        "Connection": [
+          "Keep-Alive"
+        ],
+        "Content-Length": [
+          "9"
+        ],
+        "Content-Type": [
+          "application/x-www-form-urlencoded"
+        ],
+        "User-Agent": [
+          "Wget/1.24.5"
+        ]
+      },
+      "method": "POST",
+      "url": "/api/post"
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63177,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 193
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:18:58.839593Z",
+    "metadata": {
+      "headers": {
+        "Connection": [
+          "keep-alive"
+        ],
+        "Content-Length": [
+          "55"
+        ],
+        "Content-Type": [
+          "application/octet-stream",
+          "application/json"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:18:58 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ]
+      },
+      "status": 200
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63177,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 258
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:18:59.889678Z",
+    "metadata": {
+      "headers": {
+        "Accept": [
+          "*/*"
+        ],
+        "Accept-Encoding": [
+          "identity"
+        ],
+        "Connection": [
+          "Keep-Alive"
+        ],
+        "User-Agent": [
+          "Wget/1.24.5"
+        ]
+      },
+      "method": "GET",
+      "url": "/files/test.txt"
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63178,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 121
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:18:59.889678Z",
+    "metadata": {
+      "headers": {
+        "Connection": [
+          "keep-alive"
+        ],
+        "Content-Length": [
+          "162"
+        ],
+        "Content-Type": [
+          "text/html"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:18:59 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ]
+      },
+      "status": 404
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63178,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 326
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:19:04.107612Z",
+    "metadata": {
+      "headers": {
+        "Accept-Encoding": [
+          "identity"
+        ],
+        "Connection": [
+          "close"
+        ],
+        "User-Agent": [
+          "Python-urllib/3.13"
+        ]
+      },
+      "method": "GET",
+      "url": "/"
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63180,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 96
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:19:06.193409Z",
+    "metadata": {
+      "headers": {
+        "Accept-Encoding": [
+          "identity"
+        ],
+        "Connection": [
+          "close"
+        ],
+        "Content-Length": [
+          "11"
+        ],
+        "Content-Type": [
+          "application/json"
+        ],
+        "User-Agent": [
+          "Python-urllib/3.13"
+        ]
+      },
+      "method": "POST",
+      "url": "/api/post"
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63181,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 168
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:19:04.107612Z",
+    "metadata": {
+      "headers": {
+        "Content-Length": [
+          "30"
+        ],
+        "Content-Type": [
+          "application/octet-stream",
+          "text/plain"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:19:04 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ],
+        "X-Protocol": [
+          "HTTP/1.1"
+        ]
+      },
+      "status": 200
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63180,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 225
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:19:06.193409Z",
+    "metadata": {
+      "headers": {
+        "Content-Length": [
+          "55"
+        ],
+        "Content-Type": [
+          "application/octet-stream",
+          "application/json"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:19:06 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ]
+      },
+      "status": 200
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63181,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 234
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:19:08.396069Z",
+    "metadata": {
+      "headers": {},
+      "method": "GET",
+      "url": "/"
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63183,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 18
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:19:08.396069Z",
+    "metadata": {
+      "headers": {
+        "Content-Length": [
+          "30"
+        ],
+        "Content-Type": [
+          "application/octet-stream",
+          "text/plain"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:19:08 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ],
+        "X-Protocol": [
+          "HTTP/1.0"
+        ]
+      },
+      "status": 200
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63183,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 225
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:19:10.49498Z",
+    "metadata": {
+      "headers": {
+        "Connection": [
+          "close"
+        ],
+        "Content-Length": [
+          "14"
+        ],
+        "Content-Type": [
+          "application/json"
+        ]
+      },
+      "method": "POST",
+      "url": "/api/post"
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63185,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 112
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:19:10.496615Z",
+    "metadata": {
+      "headers": {
+        "Content-Length": [
+          "55"
+        ],
+        "Content-Type": [
+          "application/octet-stream",
+          "application/json"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:19:10 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ]
+      },
+      "status": 200
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63185,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 234
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "request",
+    "timestamp": "2025-12-12T04:19:09.444781Z",
+    "metadata": {
+      "headers": {
+        "Connection": [
+          "close"
+        ]
+      },
+      "method": "GET",
+      "url": "/"
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63184,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 37
+  },
+  {
+    "transport": "tcp",
+    "protocol": "http/1.1",
+    "direction": "response",
+    "timestamp": "2025-12-12T04:19:09.444781Z",
+    "metadata": {
+      "headers": {
+        "Content-Length": [
+          "30"
+        ],
+        "Content-Type": [
+          "application/octet-stream",
+          "text/plain"
+        ],
+        "Date": [
+          "Fri, 12 Dec 2025 04:19:09 GMT"
+        ],
+        "Server": [
+          "nginx/1.18.0 (Ubuntu)"
+        ],
+        "X-Protocol": [
+          "HTTP/1.1"
+        ]
+      },
+      "status": 200
+    },
+    "srcIP": "172.16.71.1",
+    "srcPort": 63184,
+    "dstIP": "172.16.71.128",
+    "dstPort": 443,
+    "PID": 0,
+    "PName": "decryptor",
+    "dataLength": 225
+  }
+]

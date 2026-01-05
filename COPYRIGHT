@@ -1,0 +1,77 @@
+================================================================================
+ecapture_decryptor - TLS/SSL Traffic Decryption Library
+================================================================================
+
+Copyright (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com)
+All Rights Reserved.
+
+================================================================================
+SOURCE CODE LICENSE
+================================================================================
+
+The source code of this project is proprietary and confidential.
+ALL RIGHTS RESERVED. NO PERMISSIONS GRANTED.
+
+Unauthorized copying, modification, distribution, or use of the source code
+is strictly prohibited without explicit written permission from CFC4N.
+
+================================================================================
+BINARY LIBRARY LICENSE
+================================================================================
+
+The compiled binary libraries (libecapture_decryptor.a, libecapture_decryptor.so)
+are licensed for NON-COMMERCIAL USE ONLY.
+
+PERMITTED:
+  ✓ Personal use
+  ✓ Research and educational use
+  ✓ Evaluation and testing
+  ✓ Linking with non-commercial applications
+
+PROHIBITED:
+  ✗ Commercial use without license
+  ✗ Reverse engineering or decompilation
+  ✗ Modification or hacking
+  ✗ Redistribution of modified versions
+  ✗ Removal of copyright notices
+
+REQUIRED:
+  • Retain all copyright notices
+  • Provide attribution in your application
+  • Include this license with distributions
+
+================================================================================
+ATTRIBUTION REQUIREMENT
+================================================================================
+
+When using this library, you must include:
+
+  "This software uses the ecapture_decryptor library
+   Copyright (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com)
+   Licensed for Non-Commercial Use
+   https://github.com/cfc4n/ecapture_decryptor"
+
+================================================================================
+COMMERCIAL LICENSING
+================================================================================
+
+For commercial use, please contact:
+  Email: cfc4n.cs@gmail.com
+  Subject: Commercial License Inquiry - ecapture_decryptor
+
+================================================================================
+DISCLAIMER
+================================================================================
+
+THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+THE AUTHOR SHALL NOT BE LIABLE FOR ANY DAMAGES ARISING FROM THE USE
+OF THIS SOFTWARE.
+
+================================================================================
+
+For complete license terms, see:
+  - LICENSE (Main License)
+  - LICENSE-BINARY (Binary Library License)
+
+Project: https://github.com/cfc4n/ecapture_decryptor
+

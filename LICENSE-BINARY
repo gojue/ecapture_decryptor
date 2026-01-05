@@ -1,0 +1,327 @@
+# Binary Library License / 二进制库许可证
+
+**ecapture_decryptor Library Non-Commercial License**
+
+**Version 1.0 - January 5, 2026**
+
+---
+
+## Copyright Notice / 版权声明
+
+Copyright (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com)
+All Rights Reserved.
+
+版权所有 (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com)
+保留所有权利。
+
+---
+
+## Preamble / 前言
+
+### English
+
+This license governs the use of the ecapture_decryptor binary libraries (the "Software"). By downloading, accessing, or using the Software, you agree to be bound by the terms of this license. If you do not agree to these terms, do not use the Software.
+
+### 中文
+
+本许可证管辖 ecapture_decryptor 二进制库（"本软件"）的使用。通过下载、访问或使用本软件，您同意受本许可证条款的约束。如果您不同意这些条款，请勿使用本软件。
+
+---
+
+## Definitions / 定义
+
+### English
+
+- **"Software"**: The ecapture_decryptor binary libraries in compiled form, including static libraries (.a), dynamic/shared libraries (.so, .dylib, .dll), and associated header files (.h).
+- **"You"** or **"Your"**: Any individual or legal entity exercising rights under this License.
+- **"Use"**: To execute, run, link, or otherwise utilize the Software.
+- **"Non-Commercial Use"**: Use for personal, educational, research, or evaluation purposes that does not generate revenue or provide commercial advantage.
+- **"Commercial Use"**: Any use that generates revenue, provides commercial advantage, or is conducted within a commercial organization for business purposes.
+
+### 中文
+
+- **"本软件"**：编译形式的 ecapture_decryptor 二进制库，包括静态库（.a）、动态/共享库（.so、.dylib、.dll）和相关头文件（.h）。
+- **"您"** 或 **"您的"**：根据本许可证行使权利的任何个人或法律实体。
+- **"使用"**：执行、运行、链接或以其他方式利用本软件。
+- **"非商业使用"**：用于个人、教育、研究或评估目的的使用，不产生收入或提供商业优势。
+- **"商业使用"**：产生收入、提供商业优势或在商业组织内为商业目的进行的任何使用。
+
+---
+
+## Grant of License / 许可授予
+
+### English
+
+Subject to the terms and conditions of this License, CFC4N hereby grants You a worldwide, royalty-free, non-exclusive, non-transferable license to:
+
+1. **Use** the Software for Non-Commercial purposes
+2. **Link** the Software (statically or dynamically) with Your own applications for Non-Commercial purposes
+3. **Distribute** the unmodified Software alongside Your Non-Commercial applications
+4. **Test and Evaluate** the Software for compatibility and functionality assessment
+
+### 中文
+
+根据本许可证的条款和条件，CFC4N 特此授予您全球范围内的、免版税的、非独占的、不可转让的许可，以便：
+
+1. 将本软件用于非商业目的
+2. 将本软件（静态或动态）与您自己的应用程序链接用于非商业目的
+3. 随您的非商业应用程序一起分发未修改的本软件
+4. 测试和评估本软件的兼容性和功能
+
+---
+
+## Restrictions / 限制条款
+
+### English
+
+You are expressly prohibited from:
+
+1. **Commercial Use**: Using the Software for any commercial purpose without obtaining a separate commercial license from CFC4N
+
+2. **Modification**:
+   - Reverse engineering, decompiling, or disassembling the Software
+   - Modifying, adapting, or creating derivative works based on the Software
+   - Attempting to extract, reconstruct, or derive the source code
+
+3. **Hacking and Circumvention**:
+   - Bypassing, disabling, or circumventing any security features or access controls
+   - Modifying the Software to alter its intended functionality
+   - Using the Software in conjunction with tools designed to hack or circumvent protections
+
+4. **Redistribution of Modified Versions**:
+   - Distributing modified, hacked, or altered versions of the Software
+   - Distributing the Software with removed or altered copyright notices
+
+5. **Sublicensing**:
+   - Granting sublicenses to any third party
+   - Transferring Your rights under this License to others
+
+6. **Attribution Removal**:
+   - Removing, altering, or obscuring copyright notices
+   - Removing, altering, or obscuring author attribution
+   - Removing or modifying this License file
+
+### 中文
+
+您明确禁止：
+
+1. **商业使用**：未经 CFC4N 单独商业许可，将本软件用于任何商业目的
+
+2. **修改**：
+   - 对本软件进行反向工程、反编译或反汇编
+   - 修改、改编或基于本软件创作衍生作品
+   - 尝试提取、重建或推导源代码
+
+3. **破解和规避**：
+   - 绕过、禁用或规避任何安全功能或访问控制
+   - 修改本软件以改变其预期功能
+   - 将本软件与旨在破解或规避保护的工具结合使用
+
+4. **重新分发修改版本**：
+   - 分发修改、破解或更改的本软件版本
+   - 分发删除或更改版权声明的本软件
+
+5. **再许可**：
+   - 向任何第三方授予再许可
+   - 将您在本许可证下的权利转让给他人
+
+6. **删除署名**：
+   - 删除、更改或模糊版权声明
+   - 删除、更改或模糊作者署名
+   - 删除或修改本许可证文件
+
+---
+
+## Attribution Requirements / 署名要求
+
+### English
+
+When using or distributing the Software, You **MUST**:
+
+1. **Retain Copyright Notices**: Keep all copyright notices intact in the Software and any documentation
+
+2. **Provide Attribution**: Include the following attribution prominently in:
+   - Your application's "About" or "Credits" section
+   - Any documentation or README files
+   - Your project's website or repository (if applicable)
+
+   **Required Attribution Text**:
+   ```
+   This software uses the ecapture_decryptor library
+   Copyright (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com)
+   Licensed for Non-Commercial Use
+   Project: https://github.com/cfc4n/ecapture_decryptor
+   ```
+
+3. **Include License**: Distribute a copy of this License with the Software
+
+4. **Link to Source**: Provide a link to the official project repository
+
+### 中文
+
+使用或分发本软件时，您**必须**：
+
+1. **保留版权声明**：在本软件和任何文档中保持所有版权声明完整
+
+2. **提供署名**：在以下位置显著包含署名信息：
+   - 您的应用程序的"关于"或"致谢"部分
+   - 任何文档或 README 文件
+   - 您的项目网站或代码仓库（如适用）
+
+   **必需的署名文本**：
+   ```
+   本软件使用 ecapture_decryptor 库
+   版权所有 (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com)
+   授权用于非商业用途
+   项目地址：https://github.com/cfc4n/ecapture_decryptor
+   ```
+
+3. **包含许可证**：随本软件分发本许可证的副本
+
+4. **链接到源代码**：提供指向官方项目仓库的链接
+
+---
+
+## Commercial Use / 商业使用
+
+### English
+
+**Commercial Use Requires Separate License**
+
+If You wish to use the Software for commercial purposes, You must:
+
+1. Contact CFC4N to obtain a commercial license
+2. Negotiate commercial terms and fees
+3. Execute a separate commercial license agreement
+
+**Examples of Commercial Use** (non-exhaustive):
+- Using the Software in a product or service that generates revenue
+- Using the Software in a commercial organization's internal operations
+- Offering services based on the Software to customers or clients
+- Bundling the Software with commercial products
+- Using the Software in a Software-as-a-Service (SaaS) offering
+
+**Contact for Commercial Licensing**:
+- Email: cfc4n.cs@gmail.com
+- Subject: "Commercial License Inquiry - ecapture_decryptor"
+
+### 中文
+
+**商业使用需要单独许可**
+
+如果您希望将本软件用于商业目的，您必须：
+
+1. 联系 CFC4N 获取商业许可
+2. 协商商业条款和费用
+3. 签署单独的商业许可协议
+
+**商业使用示例**（非穷尽列举）：
+- 在产生收入的产品或服务中使用本软件
+- 在商业组织的内部运营中使用本软件
+- 基于本软件向客户或客户端提供服务
+- 将本软件与商业产品捆绑销售
+- 在软件即服务（SaaS）产品中使用本软件
+
+**商业许可联系方式**：
+- 邮箱：cfc4n.cs@gmail.com
+- 主题："Commercial License Inquiry - ecapture_decryptor"
+
+---
+
+## Warranty Disclaimer / 免责声明
+
+### English
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT.
+
+IN NO EVENT SHALL CFC4N BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+### 中文
+
+本软件按"原样"提供，不提供任何形式的明示或暗示担保，包括但不限于适销性、特定用途适用性、所有权和非侵权性的担保。
+
+在任何情况下，CFC4N 均不对因本软件或本软件的使用或其他交易而产生的任何索赔、损害或其他责任负责，无论是合同诉讼、侵权行为还是其他原因。
+
+---
+
+## Limitation of Liability / 责任限制
+
+### English
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL CFC4N BE LIABLE FOR ANY SPECIAL, INCIDENTAL, INDIRECT, OR CONSEQUENTIAL DAMAGES WHATSOEVER (INCLUDING, WITHOUT LIMITATION, DAMAGES FOR LOSS OF BUSINESS PROFITS, BUSINESS INTERRUPTION, LOSS OF BUSINESS INFORMATION, OR ANY OTHER PECUNIARY LOSS) ARISING OUT OF THE USE OF OR INABILITY TO USE THE SOFTWARE.
+
+### 中文
+
+在适用法律允许的最大范围内，CFC4N 在任何情况下均不对因使用或无法使用本软件而产生的任何特殊、偶然、间接或后果性损害（包括但不限于商业利润损失、业务中断、商业信息丢失或任何其他金钱损失）承担责任。
+
+---
+
+## Termination / 终止
+
+### English
+
+This License is effective until terminated. Your rights under this License will terminate automatically without notice if You fail to comply with any term of this License. Upon termination:
+
+1. You must immediately cease all use of the Software
+2. You must destroy all copies of the Software in Your possession
+3. You must remove the Software from all Your applications and systems
+
+Sections regarding Attribution Requirements, Warranty Disclaimer, Limitation of Liability, and Governing Law shall survive termination.
+
+### 中文
+
+本许可证在终止前一直有效。如果您未能遵守本许可证的任何条款，您在本许可证下的权利将自动终止，无需通知。终止后：
+
+1. 您必须立即停止使用本软件的所有使用
+2. 您必须销毁您拥有的所有本软件副本
+3. 您必须从所有应用程序和系统中删除本软件
+
+关于署名要求、免责声明、责任限制和适用法律的条款在终止后继续有效。
+
+---
+
+## Governing Law / 适用法律
+
+### English
+
+This License shall be governed by and construed in accordance with the laws of the People's Republic of China, without regard to its conflict of law provisions.
+
+### 中文
+
+本许可证应根据中华人民共和国法律进行解释和管辖，不考虑其法律冲突条款。
+
+---
+
+## Entire Agreement / 完整协议
+
+### English
+
+This License constitutes the entire agreement between You and CFC4N regarding the Software and supersedes all prior or contemporaneous understandings regarding such subject matter.
+
+### 中文
+
+本许可证构成您和 CFC4N 之间关于本软件的完整协议，并取代所有先前或同期关于该主题的理解。
+
+---
+
+## Contact Information / 联系信息
+
+**Author / 作者**: CFC4N
+
+**Email / 邮箱**: cfc4n.cs@gmail.com
+
+**Project / 项目**: https://github.com/cfc4n/ecapture_decryptor
+
+**For inquiries regarding / 如需咨询**:
+- Commercial licensing / 商业许可
+- Permission requests / 权限请求
+- General questions / 一般问题
+
+---
+
+**License Version / 许可证版本**: 1.0
+
+**Effective Date / 生效日期**: January 5, 2026
+
+**Last Updated / 最后更新**: January 5, 2026
+

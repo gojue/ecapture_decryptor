@@ -1,0 +1,164 @@
+# Dual License Agreement / 双重许可协议
+
+This project is licensed under a dual licensing model:
+本项目采用双重许可模式：
+
+## 1. Source Code License / 源代码许可证
+
+**Copyright (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com). All Rights Reserved.**
+
+**版权所有 (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com)。保留所有权利。**
+
+### English Version
+
+The source code of this project is the exclusive property of CFC4N.
+
+**ALL RIGHTS RESERVED. NO PERMISSIONS GRANTED.**
+
+Without explicit written permission from the copyright holder (CFC4N), you are **NOT** permitted to:
+
+- Use the source code in any form
+- Copy, modify, or distribute the source code
+- Create derivative works based on the source code
+- Reverse engineer, decompile, or disassemble the source code
+- Sublicense or transfer any rights to the source code
+- Use the source code for any commercial or non-commercial purposes
+
+This source code is provided for reference and transparency purposes only. Viewing the source code does not grant any license or permission to use it.
+
+Any unauthorized use, reproduction, or distribution of the source code will be prosecuted to the fullest extent of applicable law.
+
+### 中文版本
+
+本项目的源代码是 CFC4N 的专有财产。
+
+**保留所有权利。不授予任何许可。**
+
+未经版权所有者（CFC4N）明确书面许可，您**不得**：
+
+- 以任何形式使用源代码
+- 复制、修改或分发源代码
+- 基于源代码创作衍生作品
+- 对源代码进行反向工程、反编译或反汇编
+- 再许可或转让源代码的任何权利
+- 将源代码用于任何商业或非商业目的
+
+本源代码仅供参考和透明度目的。查看源代码不授予任何使用许可或权限。
+
+任何未经授权使用、复制或分发源代码的行为将受到适用法律的最大限度追究。
+
+---
+
+## 2. Binary Library License / 二进制库许可证
+
+**Copyright (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com). All Rights Reserved.**
+
+**版权所有 (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com)。保留所有权利。**
+
+This license applies to the compiled binary libraries (static and dynamic) distributed by the copyright holder, including but not limited to:
+- libecapture_decryptor.a (static library)
+- libecapture_decryptor.so / libecapture_decryptor.dylib (shared library)
+- libecapture_decryptor.h (header file)
+
+本许可证适用于由版权持有人分发的编译二进制库（静态和动态），包括但不限于：
+- libecapture_decryptor.a（静态库）
+- libecapture_decryptor.so / libecapture_decryptor.dylib（动态库）
+- libecapture_decryptor.h（头文件）
+
+### English Version
+
+#### Permitted Uses / 允许的使用
+
+You are permitted to:
+
+1. **Personal Use**: Use the binary libraries for personal, non-commercial purposes
+2. **Linking**: Link the libraries (static or dynamic) into your own applications
+3. **Distribution**: Distribute the unmodified binary libraries with your applications
+4. **Research**: Use the libraries for academic and research purposes
+
+#### Restrictions / 限制
+
+You are **NOT** permitted to:
+
+1. **Commercial Use**: Use the libraries for any commercial purposes without explicit written permission from CFC4N
+2. **Modification**: Reverse engineer, decompile, disassemble, modify, or create derivative works from the binary libraries
+3. **Hacking**: Attempt to bypass, circumvent, or hack the library functionality
+4. **Redistribution**: Redistribute modified versions of the libraries
+5. **Sublicensing**: Grant sublicenses to third parties
+6. **Removal of Attribution**: Remove or obscure copyright notices, attributions, or this license
+
+#### Attribution Requirements / 署名要求
+
+When using the binary libraries, you **MUST**:
+
+1. Retain all copyright notices and attributions
+2. Include the following attribution in your documentation and/or application:
+   ```
+   This application uses ecapture_decryptor library
+   Copyright (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com)
+   https://github.com/cfc4n/ecapture_decryptor
+   ```
+3. Provide a link to the original project repository
+
+### 中文版本
+
+#### 允许的使用
+
+您被允许：
+
+1. **个人使用**：将二进制库用于个人、非商业目的
+2. **链接**：将库（静态或动态）链接到您自己的应用程序中
+3. **分发**：随您的应用程序分发未修改的二进制库
+4. **研究**：将库用于学术和研究目的
+
+#### 限制条款
+
+您**不得**：
+
+1. **商业使用**：未经 CFC4N 明确书面许可，不得将库用于任何商业目的
+2. **修改**：不得对二进制库进行反向工程、反编译、反汇编、修改或创建衍生作品
+3. **破解**：不得尝试绕过、规避或破解库的功能
+4. **再分发**：不得重新分发修改过的库版本
+5. **再许可**：不得向第三方授予再许可
+6. **删除署名**：不得删除或模糊版权声明、署名或本许可证
+
+#### 署名要求
+
+使用二进制库时，您**必须**：
+
+1. 保留所有版权声明和署名信息
+2. 在您的文档和/或应用程序中包含以下署名：
+   ```
+   本应用程序使用 ecapture_decryptor 库
+   版权所有 (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com)
+   https://github.com/cfc4n/ecapture_decryptor
+   ```
+3. 提供指向原始项目仓库的链接
+
+---
+
+## Disclaimer of Warranty / 免责声明
+
+### English Version
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+### 中文版本
+
+本软件按"原样"提供，不提供任何形式的明示或暗示担保，包括但不限于适销性、特定用途适用性和非侵权性的担保。在任何情况下，版权持有人均不对因软件或软件的使用或其他交易而产生的任何索赔、损害或其他责任负责，无论是合同诉讼、侵权行为还是其他原因。
+
+---
+
+## Contact / 联系方式
+
+For licensing inquiries, commercial use permissions, or other questions:
+如需咨询许可、商业使用许可或其他问题：
+
+- **Author / 作者**: CFC4N
+- **Email / 邮箱**: cfc4n.cs@gmail.com
+- **GitHub**: https://github.com/cfc4n/ecapture_decryptor
+
+---
+
+**Last Updated / 最后更新**: January 5, 2026
+
