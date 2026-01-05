@@ -53,7 +53,7 @@ func saveAsHAR(packets []*types.DecryptedPacket, filename string, verbose bool) 
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ")
@@ -78,10 +78,11 @@ func pairHTTPPackets(packets []*types.DecryptedPacket) []HTTPPair {
 		}
 
 		connID := pkt.ConnectionID()
-		if pkt.Direction == "request" {
+		switch pkt.Direction {
+		case "request":
 			// 保存请求，等待响应
 			pendingRequests[connID] = pkt
-		} else if pkt.Direction == "response" {
+		case "response":
 			// 找到对应的请求
 			if req, ok := pendingRequests[connID]; ok {
 				pairs = append(pairs, HTTPPair{
@@ -106,7 +107,7 @@ func convertToHAREntry(pair HTTPPair) (HAREntry, error) {
 	if err != nil {
 		return HAREntry{}, fmt.Errorf("parse request: %w", err)
 	}
-	defer httpReq.Body.Close()
+	defer func() { _ = httpReq.Body.Close() }()
 
 	reqBody, _ := io.ReadAll(httpReq.Body)
 
@@ -115,7 +116,7 @@ func convertToHAREntry(pair HTTPPair) (HAREntry, error) {
 	if err != nil {
 		return HAREntry{}, fmt.Errorf("parse response: %w", err)
 	}
-	defer httpResp.Body.Close()
+	defer func() { _ = httpResp.Body.Close() }()
 
 	respBody, _ := io.ReadAll(httpResp.Body)
 

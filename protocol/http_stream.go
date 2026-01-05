@@ -27,8 +27,6 @@ type HTTPStreamParser struct {
 	serverIP       string
 	serverPort     uint32
 	packetChan     chan *types.DecryptedPacket // 解密包输出通道
-	requestBuf     bytes.Buffer
-	responseBuf    bytes.Buffer
 	mu             sync.Mutex
 	pendingReq     *http.Request
 	pendingReqRaw  []byte
@@ -38,8 +36,6 @@ type HTTPStreamParser struct {
 	// For accumulating complete request/response data
 	currentReqData  bytes.Buffer
 	currentRespData bytes.Buffer
-	inRequest       bool
-	inResponse      bool
 }
 
 // NewHTTPStreamParser creates a new HTTP stream parser
@@ -112,11 +108,11 @@ func (p *HTTPStreamParser) tryParseRequest() {
 		bodyBytes = make([]byte, req.ContentLength)
 		n, err := io.ReadFull(req.Body, bodyBytes)
 		if err != nil || n < int(req.ContentLength) {
-			req.Body.Close()
+			_ = req.Body.Close()
 			return // Not enough body data
 		}
 	}
-	req.Body.Close()
+	_ = req.Body.Close()
 
 	// Store the request
 	p.pendingReq = req
@@ -133,7 +129,7 @@ func (p *HTTPStreamParser) tryParseRequest() {
 		// Reconstruct the raw HTTP request
 		var reqBuf bytes.Buffer
 		fmt.Fprintf(&reqBuf, "%s %s %s\r\n", req.Method, req.URL.String(), req.Proto)
-		req.Header.Write(&reqBuf)
+		_ = req.Header.Write(&reqBuf)
 		reqBuf.WriteString("\r\n")
 		reqBuf.Write(bodyBytes)
 
@@ -153,7 +149,7 @@ func (p *HTTPStreamParser) tryParseRequest() {
 	remainingBytes := reader.Buffered()
 	if remainingBytes > 0 {
 		remaining := make([]byte, remainingBytes)
-		reader.Read(remaining)
+		_, _ = reader.Read(remaining)
 		p.currentReqData.Reset()
 		p.currentReqData.Write(remaining)
 	} else {
@@ -177,7 +173,7 @@ func (p *HTTPStreamParser) tryParseResponse() {
 	// Try to read the complete body
 	// For chunked transfer encoding, we need to make sure all chunks are received
 	bodyBytes, readErr := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 
 	// Check if we have all the data we need
 	if readErr != nil {
@@ -213,7 +209,7 @@ func (p *HTTPStreamParser) tryParseResponse() {
 		// Reconstruct the raw HTTP response
 		var respBuf bytes.Buffer
 		fmt.Fprintf(&respBuf, "%s %s\r\n", resp.Proto, resp.Status)
-		resp.Header.Write(&respBuf)
+		_ = resp.Header.Write(&respBuf)
 		respBuf.WriteString("\r\n")
 		respBuf.Write(bodyBytes)
 
@@ -236,7 +232,7 @@ func (p *HTTPStreamParser) tryParseResponse() {
 	remainingBytes := reader.Buffered()
 	if remainingBytes > 0 {
 		remaining := make([]byte, remainingBytes)
-		reader.Read(remaining)
+		_, _ = reader.Read(remaining)
 		p.currentRespData.Reset()
 		p.currentRespData.Write(remaining)
 	} else {

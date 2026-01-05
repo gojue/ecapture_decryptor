@@ -35,14 +35,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to open sslkeylog file: %v", err)
 	}
-	defer keylogFile.Close()
+	defer func() { _ = keylogFile.Close() }()
 
 	// 打开 pcap 文件
 	pcapFile, err := os.Open(*pcapfile)
 	if err != nil {
 		log.Fatalf("Failed to open pcap file: %v", err)
 	}
-	defer pcapFile.Close()
+	defer func() { _ = pcapFile.Close() }()
 
 	// 创建解密包输出通道
 	packetChan := make(chan *types.DecryptedPacket, 100)

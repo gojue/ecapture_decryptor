@@ -149,3 +149,44 @@ jobs:
           echo "Release created successfully!"
           echo "Download page: https://github.com/${{ github.repository }}/releases/tag/${{ steps.get_version.outputs.VERSION }}"
 
+  sync-to-mirror:
+    name: Sync Release to Mirror Repository
+    needs: create-release
+    runs-on: ubuntu-latest
+    # Set this to false to enable syncing, or remove the condition entirely
+    if: vars.MIRROR_REPO != ''
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: Get version
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: List artifacts
+        run: |
+          echo "Artifacts to sync:"
+          find dist/ -name "*.tar.gz*" -type f
+
+      - name: Sync to mirror repository
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/**/*.tar.gz*
+          tag_name: ${{ steps.get_version.outputs.VERSION }}
+          draft: false
+          prerelease: false
+          repository: ${{ vars.MIRROR_REPO }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.MIRROR_REPO_TOKEN }}
+
+      - name: Sync completed
+        run: |
+          echo "Artifacts synced successfully to ${{ vars.MIRROR_REPO }}!"
+          echo "Mirror download page: https://github.com/${{ vars.MIRROR_REPO }}/releases/tag/${{ steps.get_version.outputs.VERSION }}"
+

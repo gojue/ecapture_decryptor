@@ -131,7 +131,9 @@ func (sb *StreamBuffer) TryReadRecord() []byte {
 
 	// Read the complete record
 	record := make([]byte, totalLen)
-	sb.buf.Read(record)
+	if _, err := sb.buf.Read(record); err != nil {
+		return nil
+	}
 	return record
 }
 

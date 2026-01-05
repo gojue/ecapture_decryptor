@@ -235,13 +235,3 @@ const (
 	VersionTLS12 = 0x0303
 	VersionTLS13 = 0x0304
 )
-
-// versionName returns a human-readable version name
-func versionName(version uint16) string {
-	return GetTLSVersionName(version)
-}
-
-// cipherSuiteName returns a human-readable cipher suite name
-func cipherSuiteName(cs uint16) string {
-	return GetCipherSuiteName(cs)
-}

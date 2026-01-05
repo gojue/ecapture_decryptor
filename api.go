@@ -244,6 +244,6 @@ func (e *DecryptorEngine) closeAllConnections() {
 	defer e.mu.Unlock()
 
 	for _, dec := range e.conntrack {
-		dec.Close()
+		_ = dec.Close()
 	}
 }

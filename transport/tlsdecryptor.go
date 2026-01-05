@@ -46,7 +46,6 @@ type TLSDecryptor struct {
 	handshakeComplete        bool
 	version                  uint16
 	cipherSuite              uint16
-	outputMu                 sync.Mutex   // Mutex for synchronized output
 	handshakeMu              sync.RWMutex // Protects handshake-related fields
 
 	// For ordered output - separate queues for requests and responses
@@ -235,30 +234,30 @@ func (td *TLSDecryptor) writeOutput(data *DecryptedData) {
 		isPrintable = false
 	}
 
-	fmt.Fprintf(td.clientOut, "\nSeq:%d %s, len:%d\n", data.SeqNum, td.ConnectionInfo, len(data.Data))
+	_, _ = fmt.Fprintf(td.clientOut, "\nSeq:%d %s, len:%d\n", data.SeqNum, td.ConnectionInfo, len(data.Data))
 
 	if isPrintable {
 		// 可打印数据，直接输出
-		td.clientOut.Write(data.Data)
+		_, _ = td.clientOut.Write(data.Data)
 	} else {
 		// 二进制数据，只显示摘要信息
 		previewLen := 64
 		if len(data.Data) < previewLen {
 			previewLen = len(data.Data)
 		}
-		fmt.Fprintf(td.clientOut, "[Binary data, showing first %d bytes in hex]\n", previewLen)
+		_, _ = fmt.Fprintf(td.clientOut, "[Binary data, showing first %d bytes in hex]\n", previewLen)
 		for i := 0; i < previewLen; i++ {
 			if i > 0 && i%16 == 0 {
-				fmt.Fprintln(td.clientOut)
+				_, _ = fmt.Fprintln(td.clientOut)
 			}
-			fmt.Fprintf(td.clientOut, "%02x ", data.Data[i])
+			_, _ = fmt.Fprintf(td.clientOut, "%02x ", data.Data[i])
 		}
 		if len(data.Data) > previewLen {
-			fmt.Fprintf(td.clientOut, "\n... (%d more bytes)\n", len(data.Data)-previewLen)
+			_, _ = fmt.Fprintf(td.clientOut, "\n... (%d more bytes)\n", len(data.Data)-previewLen)
 		}
 	}
 
-	fmt.Fprintln(td.clientOut)
+	_, _ = fmt.Fprintln(td.clientOut)
 }
 
 func (td *TLSDecryptor) FeedClient(data []byte) error {
@@ -438,7 +437,7 @@ func (td *TLSDecryptor) processServerRecords() {
 }
 
 func (td *TLSDecryptor) CloseClient() error {
-	td.clientIn.Close()
+	_ = td.clientIn.Close()
 	// Process any remaining records
 	td.handshakeMu.RLock()
 	complete := td.handshakeComplete
@@ -451,7 +450,7 @@ func (td *TLSDecryptor) CloseClient() error {
 }
 
 func (td *TLSDecryptor) CloseServer() error {
-	td.serverIn.Close()
+	_ = td.serverIn.Close()
 	// Process any remaining records
 	td.handshakeMu.RLock()
 	complete := td.handshakeComplete
@@ -466,8 +465,8 @@ func (td *TLSDecryptor) CloseServer() error {
 func (td *TLSDecryptor) Close() error {
 	td.closeOnce.Do(func() {
 		td.isClosed = true // Mark as closed before closing streams
-		td.clientIn.Close()
-		td.serverIn.Close()
+		_ = td.clientIn.Close()
+		_ = td.serverIn.Close()
 		// Process any remaining records
 		if td.handshakeComplete {
 			td.processClientRecords()
@@ -491,7 +490,7 @@ func (td *TLSDecryptor) Close() error {
 }
 
 func (td *TLSDecryptor) Decrypt() error {
-	defer td.Close()
+	defer func() { _ = td.Close() }()
 
 	// Parse handshake to get cipher suite and secrets
 	if err := td.parseHandshake(); err != nil {

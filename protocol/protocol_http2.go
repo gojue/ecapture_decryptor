@@ -43,7 +43,6 @@ type HTTP2StreamParser struct {
 	streams map[uint32]*http2Stream
 
 	// 时间戳
-	startTime  time.Time
 	packetTime time.Time
 
 	// 跳过连接前言
@@ -205,7 +204,7 @@ func (p *HTTP2StreamParser) parseFrames(buf *bytes.Buffer, isClient bool) {
 
 		// 读取完整帧
 		frameData := make([]byte, totalLen)
-		buf.Read(frameData)
+		_, _ = buf.Read(frameData)
 		payload := frameData[9:]
 
 		// 处理帧
@@ -445,7 +444,7 @@ func (p *HTTP2StreamParser) extractRequestPseudoHeaders(req *http2Request) {
 // extractResponsePseudoHeaders 从头部提取伪头部到响应字段
 func (p *HTTP2StreamParser) extractResponsePseudoHeaders(resp *http2Response) {
 	if v := resp.headers.Get(":status"); v != "" {
-		fmt.Sscanf(v, "%d", &resp.status)
+		_, _ = fmt.Sscanf(v, "%d", &resp.status)
 		resp.headers.Del(":status")
 	}
 }

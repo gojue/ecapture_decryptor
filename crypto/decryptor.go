@@ -84,7 +84,9 @@ func hkdfExpandLabel(hashFunc func() hash.Hash, secret []byte, label string, con
 
 	reader := hkdf.Expand(hashFunc, secret, hkdfLabel)
 	result := make([]byte, length)
-	reader.Read(result)
+	if _, err := reader.Read(result); err != nil {
+		return nil
+	}
 	return result
 }
 

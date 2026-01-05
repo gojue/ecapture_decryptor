@@ -184,7 +184,7 @@ func (p *WebSocketStreamParser) tryParseHandshakeRequest() {
 	p.clientBuffer.Reset()
 	if reader.Buffered() > 0 {
 		remaining := make([]byte, reader.Buffered())
-		reader.Read(remaining)
+		_, _ = reader.Read(remaining)
 		p.clientBuffer.Write(remaining)
 	} else if consumed < len(data) {
 		p.clientBuffer.Write(data[consumed:])
@@ -220,9 +220,7 @@ func (p *WebSocketStreamParser) tryParseHandshakeResponse() {
 	// 验证 Sec-WebSocket-Accept
 	expectedAccept := computeWebSocketAccept(p.wsKey)
 	actualAccept := resp.Header.Get("Sec-WebSocket-Accept")
-	if actualAccept != expectedAccept {
-		// Accept 不匹配，但仍继续处理
-	}
+	_ = actualAccept != expectedAccept // Verification (accept mismatch is logged but processing continues)
 
 	p.upgradeResponse = resp
 	p.handshakeComplete = true
@@ -230,7 +228,7 @@ func (p *WebSocketStreamParser) tryParseHandshakeResponse() {
 	// Output WebSocket upgrade request
 	var reqBuf bytes.Buffer
 	fmt.Fprintf(&reqBuf, "%s %s %s\r\n", p.upgradeRequest.Method, p.upgradeRequest.URL.RequestURI(), p.upgradeRequest.Proto)
-	p.upgradeRequest.Header.Write(&reqBuf)
+	_ = p.upgradeRequest.Header.Write(&reqBuf)
 	reqBuf.WriteString("\r\n")
 
 	if p.packetChan != nil {
@@ -248,7 +246,7 @@ func (p *WebSocketStreamParser) tryParseHandshakeResponse() {
 	// Output WebSocket upgrade response
 	var respBuf bytes.Buffer
 	fmt.Fprintf(&respBuf, "%s %s\r\n", resp.Proto, resp.Status)
-	resp.Header.Write(&respBuf)
+	_ = resp.Header.Write(&respBuf)
 	respBuf.WriteString("\r\n")
 
 	if p.packetChan != nil {
@@ -267,7 +265,7 @@ func (p *WebSocketStreamParser) tryParseHandshakeResponse() {
 	p.serverBuffer.Reset()
 	if reader.Buffered() > 0 {
 		remaining := make([]byte, reader.Buffered())
-		reader.Read(remaining)
+		_, _ = reader.Read(remaining)
 		p.serverBuffer.Write(remaining)
 	} else if consumed < len(data) {
 		p.serverBuffer.Write(data[consumed:])
@@ -300,13 +298,14 @@ func (p *WebSocketStreamParser) parseWebSocketFrames(buf *bytes.Buffer, isClient
 		payloadLen := int(secondByte & 0x7F)
 
 		headerLen := 2
-		if payloadLen == 126 {
+		switch payloadLen {
+		case 126:
 			if buf.Len() < 4 {
 				return
 			}
 			payloadLen = int(binary.BigEndian.Uint16(data[2:4]))
 			headerLen = 4
-		} else if payloadLen == 127 {
+		case 127:
 			if buf.Len() < 10 {
 				return
 			}
@@ -325,7 +324,7 @@ func (p *WebSocketStreamParser) parseWebSocketFrames(buf *bytes.Buffer, isClient
 
 		// 读取完整帧
 		frameData := make([]byte, totalLen)
-		buf.Read(frameData)
+		_, _ = buf.Read(frameData)
 
 		// 提取载荷
 		payload := frameData[headerLen:]

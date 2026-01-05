@@ -24,7 +24,7 @@ func TestDecryptPcapFile(t *testing.T) {
 		t.Skipf("Test keylog file not found: %v", err)
 		return
 	}
-	defer keylogFile.Close()
+	defer func() { _ = keylogFile.Close() }()
 
 	// Open test pcap file
 	pcapFile, err := os.Open("test/testdata/all_clients.pcap")
@@ -32,7 +32,7 @@ func TestDecryptPcapFile(t *testing.T) {
 		t.Skipf("Test pcap file not found: %v", err)
 		return
 	}
-	defer pcapFile.Close()
+	defer func() { _ = pcapFile.Close() }()
 
 	// Create output channel
 	packetChan := make(chan *types.DecryptedPacket, 100)

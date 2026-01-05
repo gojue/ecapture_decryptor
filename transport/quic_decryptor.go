@@ -63,11 +63,9 @@ type QUICDecryptor struct {
 	packetTime     time.Time
 
 	// Connection state
-	version           uint32
-	destConnID        []byte
-	srcConnID         []byte
-	clientRandom      []byte
-	handshakeComplete bool
+	version    uint32
+	destConnID []byte
+	srcConnID  []byte
 
 	// Decryption keys
 	clientInitialKeys   *QUICKeys
@@ -511,10 +509,4 @@ func IsQUICVersionSupported(version uint32) bool {
 		return true
 	}
 	return false
-}
-
-// createAEAD creates AEAD cipher based on cipher suite
-// Uses the cipher suite registry for consistency
-func createAEAD(key []byte, cipherSuite uint16) (cipher.AEAD, error) {
-	return crypto.CreateAEAD(cipherSuite, key)
 }

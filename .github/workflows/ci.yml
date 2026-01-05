@@ -226,7 +226,7 @@ jobs:
       - name: Verify example binaries
         run: |
           echo "✓ Examples built successfully"
-          find examples -type f -perm +111 -exec ls -lh {} \;
+          find examples -type f -executable -exec ls -lh {} \;
 
   all-checks-passed:
     name: All Checks Passed

@@ -163,7 +163,6 @@ type HTTP3StreamParser struct {
 	streams map[uint64]*http3Stream
 
 	// 时间戳
-	startTime  time.Time
 	packetTime time.Time
 
 	// 数据缓冲
@@ -173,8 +172,7 @@ type HTTP3StreamParser struct {
 
 // qpackEntry QPACK 动态表条目
 type qpackEntry struct {
-	name  string
-	value string
+	// Reserved for future use
 }
 
 // http3Stream HTTP/3 流
@@ -194,7 +192,6 @@ type http3Request struct {
 	authority   string
 	headers     http.Header
 	body        bytes.Buffer
-	endStream   bool
 	headersDone bool
 	outputted   bool // 标记是否已经输出，避免重复
 }
@@ -204,7 +201,6 @@ type http3Response struct {
 	status      int
 	headers     http.Header
 	body        bytes.Buffer
-	endStream   bool
 	headersDone bool
 }
 
@@ -289,7 +285,7 @@ func (p *HTTP3StreamParser) parseFrames(buf *bytes.Buffer, isClient bool) {
 
 		// 读取完整帧
 		frameData := make([]byte, totalLen)
-		buf.Read(frameData)
+		_, _ = buf.Read(frameData)
 		payload := frameData[headerLen:]
 
 		// 处理帧
@@ -416,7 +412,7 @@ func (p *HTTP3StreamParser) handleHeadersFrame(payload []byte, isClient bool) {
 		}
 		for name, value := range headers {
 			if name == ":status" {
-				fmt.Sscanf(value, "%d", &stream.response.status)
+				_, _ = fmt.Sscanf(value, "%d", &stream.response.status)
 			} else if !strings.HasPrefix(name, ":") {
 				stream.response.headers.Add(name, value)
 			}
@@ -499,16 +495,13 @@ func (p *HTTP3StreamParser) decodeQPACKHeaders(data []byte, isClient bool) map[s
 				break
 			}
 			valueLen := int(data[0] & 0x7F)
-			huffman := data[0]&0x80 != 0
+			_ = data[0]&0x80 != 0 // huffman flag (not used in simplified implementation)
 			data = data[1:]
 
 			if len(data) < valueLen {
 				break
 			}
 			value := string(data[:valueLen])
-			if huffman {
-				// 简化处理：不解码 Huffman
-			}
 			data = data[valueLen:]
 
 			if name != "" {

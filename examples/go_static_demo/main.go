@@ -80,7 +80,7 @@ func main() {
 		_, _ = fmt.Fprintf(os.Stderr, "\n❌ ERROR: Failed to open keylog file: %v\n", err)
 		os.Exit(1)
 	}
-	defer keylogFd.Close()
+	defer func() { _ = keylogFd.Close() }()
 
 	// Open pcap file
 	pcapFd, err := os.Open(*pcapFile)
@@ -88,7 +88,7 @@ func main() {
 		_, _ = fmt.Fprintf(os.Stderr, "\n❌ ERROR: Failed to open pcap file: %v\n", err)
 		os.Exit(2)
 	}
-	defer pcapFd.Close()
+	defer func() { _ = pcapFd.Close() }()
 
 	// Collect packets
 	packetChan := make(chan *types.DecryptedPacket, 100)
@@ -118,7 +118,7 @@ func main() {
 		_, _ = fmt.Fprintf(os.Stderr, "\n❌ ERROR: Failed to create output file: %v\n", err)
 		os.Exit(4)
 	}
-	defer outFd.Close()
+	defer func() { _ = outFd.Close() }()
 
 	// Write JSON
 	encoder := json.NewEncoder(outFd)
