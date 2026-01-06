@@ -468,7 +468,10 @@ func (td *TLSDecryptor) Close() error {
 		_ = td.clientIn.Close()
 		_ = td.serverIn.Close()
 		// Process any remaining records
-		if td.handshakeComplete {
+		td.handshakeMu.RLock()
+		complete := td.handshakeComplete
+		td.handshakeMu.RUnlock()
+		if complete {
 			td.processClientRecords()
 			td.processServerRecords()
 		}

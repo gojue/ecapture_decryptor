@@ -4,7 +4,15 @@
 LIBPATH := ./lib
 INCPATH := ./include
 LIBNAME_STATIC := libecapture_decryptor.a
-LIBNAME_SHARED := libecapture_decryptor.so
+
+# Detect OS for shared library extension
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+	LIBNAME_SHARED := libecapture_decryptor.dylib
+else
+	LIBNAME_SHARED := libecapture_decryptor.so
+endif
+
 HEADER := libecapture_decryptor.h
 PKG_PATH := github.com/cfc4n/ecapture_decryptor
 

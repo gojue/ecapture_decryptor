@@ -31,7 +31,7 @@ import (
 
 //export GetVersion
 func GetVersion() *C.char {
-	return C.CString("ecapture_decryptor v1.0.0 - Copyright (c) 2024-2026 CFC4N - Non-Commercial License")
+	return C.CString("eCapture Decryptor v1.0.8 - Copyright (c) 2024-2026 CFC4N - Non-Commercial License")
 }
 
 // DecryptPcapToFile decrypts a pcap file using SSL keylog and writes packets to output file
@@ -208,7 +208,7 @@ func DecryptLiveTrafficToFile(
 						handle.mu.Unlock()
 					}
 					// Flush to ensure data is written
-					outFd.Sync()
+					_ = outFd.Sync()
 				case <-handle.stopChan:
 					return
 				}

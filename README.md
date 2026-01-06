@@ -333,36 +333,97 @@ g++ -o myapp myapp.cpp \
 
 ## 🏗️ 架构
 
+### 数据流架构
+
+```mermaid
+flowchart TD
+    A[PCAP 文件/实时流量] --> B[Packet Source<br/>数据包源]
+    B --> C[Connection Tracker<br/>连接跟踪器]
+    
+    C --> D{协议类型}
+    D -->|TCP/TLS| E[TLS Decryptor<br/>TLS 1.2/1.3 解密]
+    D -->|UDP/QUIC| F[QUIC Decryptor<br/>QUIC 解密]
+    
+    G[SSLKEYLOG 文件] --> H[KeyLog Store<br/>密钥存储]
+    H --> E
+    H --> F
+    
+    E --> I[Protocol Parser<br/>协议解析器]
+    F --> I
+    
+    I --> J{应用层协议}
+    J -->|HTTP/1.1| K[HTTP/1.1 Parser]
+    J -->|HTTP/2| L[HTTP/2 Parser]
+    J -->|HTTP/3| M[HTTP/3 Parser]
+    J -->|WebSocket| N[WebSocket Parser]
+    
+    K --> O[DecryptedPacket<br/>解密数据包]
+    L --> O
+    M --> O
+    N --> O
+    
+    O --> P[Output Channel<br/>输出通道]
+    
+    P --> Q{用户处理}
+    Q --> R[HAR 转换器]
+    Q --> S[JSON 输出]
+    Q --> T[自定义处理]
+    
+    style A fill:#e1f5ff
+    style O fill:#fff4e1
+    style P fill:#e8f5e9
+    style H fill:#f3e5f5
 ```
-解密库架构：
-┌─────────────┐
-│ PCAP 文件   │
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐     ┌──────────────┐
-│ 传输层解密   │────▶│ 协议解析器   │
-│ TLS/QUIC    │     │ HTTP/WebSocket│
-└─────────────┘     └──────┬───────┘
-                           │
-                           ▼
-                    DecryptedPacket
-                           │
-        ┌──────────────────┼──────────────────┐
-        ▼                  ▼                  ▼
-    转为HAR            转为JSON          自定义处理
+
+### 分层架构
+
+```mermaid
+graph TB
+    subgraph Application["应用程序层"]
+        APP[Go 应用 / C/C++ 应用]
+    end
+    
+    subgraph API["公开 API 层"]
+        API1[DecryptPcapFile]
+        API2[DecryptLiveTraffic]
+        API3[DecryptWithConfig]
+    end
+    
+    subgraph Protocol["协议解析层 protocol/"]
+        HTTP1[HTTP/1.1 Parser]
+        HTTP2[HTTP/2 Parser]
+        HTTP3[HTTP/3 Parser]
+        WS[WebSocket Parser]
+    end
+    
+    subgraph Transport["传输层解密 transport/"]
+        TLS[TLS Decryptor<br/>TLS 1.2/1.3]
+        QUIC[QUIC Decryptor]
+    end
+    
+    subgraph Crypto["密码学层 crypto/"]
+        KeyLog[KeyLog Store<br/>密钥管理]
+        Cipher[Cipher Registry<br/>密码套件]
+        Decrypt[Record Decryptor<br/>记录解密]
+    end
+    
+    subgraph Capture["数据包捕获层"]
+        GoPacket[gopacket<br/>pcap/pcapng 解析]
+    end
+    
+    APP --> API
+    API --> Protocol
+    Protocol --> Transport
+    Transport --> Crypto
+    Crypto --> Capture
+    
+    style Application fill:#e3f2fd
+    style API fill:#f3e5f5
+    style Protocol fill:#e8f5e9
+    style Transport fill:#fff3e0
+    style Crypto fill:#fce4ec
+    style Capture fill:#f1f8e9
 ```
-
-## 🔄 从旧版本迁移
-
-如果你使用的是旧版本（输出 HAR 格式），请参考：
-- `REFACTOR_COMPLETE.md` - 完整的重构说明
-- `examples/har_converter.go` - HAR 转换示例
-
-**主要变化：**
-- ❌ 旧版：`chan types.HAREntry` → ✅ 新版：`chan *types.DecryptedPacket`
-- 更灵活：用户决定如何处理解密数据
-- HAR 转换移到 examples 作为可选功能
 
 ## 📚 文档
 
@@ -431,7 +492,7 @@ g++ -o myapp myapp.cpp \
 使用本库时，必须包含以下署名：
 
 ```
-本软件使用 ecapture_decryptor 库
+本软件使用 eCapture Decryptor 库
 版权所有 (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com)
 授权用于非商业用途
 https://github.com/cfc4n/ecapture_decryptor
@@ -441,7 +502,7 @@ https://github.com/cfc4n/ecapture_decryptor
 
 如需商业使用，请联系：
 - **邮箱**: cfc4n.cs@gmail.com
-- **主题**: "Commercial License Inquiry - ecapture_decryptor"
+- **主题**: "Commercial License Inquiry - eCapture Decryptor"
 
 #### 详细许可条款 / Detailed Terms
 

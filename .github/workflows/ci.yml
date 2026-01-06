@@ -213,20 +213,27 @@ jobs:
         with:
           name: build-${{ matrix.os }}
 
+      - name: Rebuild static library for examples
+        run: make build-static
+
       - name: Build Go examples
         run: |
           cd examples/go_demo
+          make clean || true
           make
 
       - name: Build C examples
         run: |
           cd examples/c_demo
+          make clean || true
           make
 
       - name: Verify example binaries
         run: |
           echo "✓ Examples built successfully"
-          find examples -type f -executable -exec ls -lh {} \;
+          echo ""
+          echo "Built binaries:"
+          ls -lh bin/ 2>/dev/null || echo "No binaries in bin/ directory"
 
   all-checks-passed:
     name: All Checks Passed

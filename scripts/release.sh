@@ -31,35 +31,65 @@ echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}Building Release: ${VERSION}${NC}"
 echo -e "${GREEN}========================================${NC}"
 
-# Detect OS and architecture
-OS=$(uname -s)
-ARCH=$(uname -m)
+# Check if we're cross-compiling (GOOS/GOARCH env vars are set)
+if [ -n "$GOOS" ] && [ -n "$GOARCH" ]; then
+    echo -e "${YELLOW}Cross-compilation mode detected${NC}"
+    echo -e "${YELLOW}Target: GOOS=$GOOS, GOARCH=$GOARCH${NC}"
 
-case "$OS" in
-    Darwin)
-        OS_NAME="darwin"
+    # Use environment variables for cross-compilation
+    OS_NAME="$GOOS"
+    case "$GOARCH" in
+        amd64)
+            ARCH_NAME="amd64"
+            ;;
+        arm64)
+            ARCH_NAME="arm64"
+            ;;
+        *)
+            echo -e "${RED}Unsupported GOARCH: $GOARCH${NC}"
+            exit 1
+            ;;
+    esac
+else
+    # Native build - detect from current system
+    echo -e "${YELLOW}Native build mode${NC}"
+    OS=$(uname -s)
+    ARCH=$(uname -m)
+
+    case "$OS" in
+        Darwin)
+            OS_NAME="darwin"
+            ;;
+        Linux)
+            OS_NAME="linux"
+            ;;
+        *)
+            echo -e "${RED}Unsupported OS: $OS${NC}"
+            exit 1
+            ;;
+    esac
+
+    case "$ARCH" in
+        x86_64)
+            ARCH_NAME="amd64"
+            ;;
+        arm64|aarch64)
+            ARCH_NAME="arm64"
+            ;;
+        *)
+            echo -e "${RED}Unsupported architecture: $ARCH${NC}"
+            exit 1
+            ;;
+    esac
+fi
+
+# Set shared library extension based on OS
+case "$OS_NAME" in
+    darwin)
         SHARED_EXT="dylib"
         ;;
-    Linux)
-        OS_NAME="linux"
+    linux)
         SHARED_EXT="so"
-        ;;
-    *)
-        echo -e "${RED}Unsupported OS: $OS${NC}"
-        exit 1
-        ;;
-esac
-
-case "$ARCH" in
-    x86_64)
-        ARCH_NAME="amd64"
-        ;;
-    arm64|aarch64)
-        ARCH_NAME="arm64"
-        ;;
-    *)
-        echo -e "${RED}Unsupported architecture: $ARCH${NC}"
-        exit 1
         ;;
 esac
 
@@ -67,8 +97,8 @@ PLATFORM="${OS_NAME}-${ARCH_NAME}"
 RELEASE_NAME="${PROJECT_NAME}-${VERSION}-${PLATFORM}"
 RELEASE_PATH="${RELEASE_DIR}/${RELEASE_NAME}"
 
-echo -e "${YELLOW}Platform: ${PLATFORM}${NC}"
-echo -e "${YELLOW}Release: ${RELEASE_NAME}${NC}"
+echo -e "${YELLOW}Target Platform: ${PLATFORM}${NC}"
+echo -e "${YELLOW}Release Name: ${RELEASE_NAME}${NC}"
 echo ""
 
 # Clean previous build
@@ -79,7 +109,7 @@ mkdir -p "${RELEASE_PATH}"
 
 # Update version in capi/main.go
 echo -e "${GREEN}Step 2: Updating version number...${NC}"
-sed -i.bak "s/ecapture_decryptor v[0-9.]*-/ecapture_decryptor ${VERSION}-/" capi/main.go
+sed -i.bak "s/eCapture Decryptor v[0-9.]* -/eCapture Decryptor ${VERSION} -/" capi/main.go
 rm -f capi/main.go.bak
 
 # Build static library
@@ -94,7 +124,7 @@ make build-shared
 echo -e "${GREEN}Step 5: Packaging libraries...${NC}"
 mkdir -p "${RELEASE_PATH}/lib"
 mkdir -p "${RELEASE_PATH}/include"
-mkdir -p "${RELEASE_PATH}/docs"
+#mkdir -p "${RELEASE_PATH}/docs"
 
 cp lib/libecapture_decryptor.a "${RELEASE_PATH}/lib/"
 cp lib/libecapture_decryptor.${SHARED_EXT} "${RELEASE_PATH}/lib/"
@@ -108,7 +138,7 @@ cp COPYRIGHT "${RELEASE_PATH}/"
 
 # Create README for the release
 cat > "${RELEASE_PATH}/README.md" << EOF
-# ${PROJECT_NAME} ${VERSION}
+# eCapture Decryptor ${VERSION}
 
 Binary library distribution for ${PLATFORM}
 
@@ -159,19 +189,19 @@ For commercial use, contact: cfc4n.cs@gmail.com
 
 - Full documentation: https://github.com/cfc4n/${PROJECT_NAME}
 - API reference: See \`include/libecapture_decryptor.h\`
-- Examples: https://github.com/cfc4n/${PROJECT_NAME}/tree/main/examples
+- Examples: https://github.com/cfc4n/${PROJECT_NAME}/tree/master/examples
 
 ## Support
 
 - Issues: https://github.com/cfc4n/${PROJECT_NAME}/issues
 - Email: cfc4n.cs@gmail.com
 EOF
-
-# Copy examples
+#
+## Copy examples
 echo -e "${GREEN}Step 7: Adding example code...${NC}"
-mkdir -p "${RELEASE_PATH}/docs/examples"
-cp -r examples/c_demo/*.c "${RELEASE_PATH}/docs/examples/" 2>/dev/null || true
-cp -r examples/c_demo/README.md "${RELEASE_PATH}/docs/examples/" 2>/dev/null || true
+#mkdir -p "${RELEASE_PATH}/docs/examples"
+#cp -r examples/c_demo/*.c "${RELEASE_PATH}/docs/examples/" 2>/dev/null || true
+#cp -r examples/c_demo/README.md "${RELEASE_PATH}/docs/examples/" 2>/dev/null || true
 
 # Create checksum file
 echo -e "${GREEN}Step 8: Generating checksums...${NC}"

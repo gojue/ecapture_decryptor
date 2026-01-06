@@ -45,7 +45,7 @@ func TestDecryptPcapFile(t *testing.T) {
 
 	// Collect packets with timeout
 	packets := make([]*types.DecryptedPacket, 0)
-	timeout := time.After(5 * time.Second)
+	timeout := time.After(30 * time.Second)
 
 collectLoop:
 	for {

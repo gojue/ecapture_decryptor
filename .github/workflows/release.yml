@@ -17,12 +17,12 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: linux-amd64
-
-          - os: ubuntu-latest
+# ubuntu-24.04-arm is not supported yet for private repositories
+          - os: ubuntu-24.04
             platform: linux-arm64
-
-          - os: macos-latest
-            platform: darwin-amd64
+#
+#          - os: macos-15
+#            platform: darwin-amd64
 
           - os: macos-latest
             platform: darwin-arm64
@@ -42,11 +42,29 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential
 
+      - name: Install ARM64 cross-compilation toolchain (Linux ARM64)
+        if: runner.os == 'Linux' && matrix.platform == 'linux-arm64'
+        run: |
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
       - name: Get version
         id: get_version
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
-      - name: Build release
+      - name: Build release (Linux ARM64 cross-compilation)
+        if: runner.os == 'Linux' && matrix.platform == 'linux-arm64'
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: 1
+          CC: aarch64-linux-gnu-gcc
+          CXX: aarch64-linux-gnu-g++
+        run: |
+          chmod +x scripts/release.sh
+          ./scripts/release.sh ${{ steps.get_version.outputs.VERSION }}
+
+      - name: Build release (Native build)
+        if: "!(runner.os == 'Linux' && matrix.platform == 'linux-arm64')"
         run: |
           chmod +x scripts/release.sh
           ./scripts/release.sh ${{ steps.get_version.outputs.VERSION }}
@@ -69,76 +87,23 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          path: dist/
+          path: dist-temp/
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p dist
+          find dist-temp -type f \( -name "*.tar.gz" -o -name "*.sha256" \) -exec mv {} dist/ \;
+          ls -lh dist/
 
       - name: Get version
         id: get_version
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
-      - name: Generate release notes
-        id: release_notes
-        run: |
-          VERSION=${{ steps.get_version.outputs.VERSION }}
-          cat > release_notes.md << EOF
-          # ecapture_decryptor ${VERSION}
-          
-          ## 📦 Downloads
-          
-          Choose the appropriate package for your platform:
-          
-          - **macOS Apple Silicon**: \`ecapture_decryptor-${VERSION}-darwin-arm64.tar.gz\`
-          - **macOS Intel**: \`ecapture_decryptor-${VERSION}-darwin-amd64.tar.gz\`
-          - **Linux x86_64**: \`ecapture_decryptor-${VERSION}-linux-amd64.tar.gz\`
-          - **Linux Aarch64**: \`ecapture_decryptor-${VERSION}-linux-arm64.tar.gz\`
-          
-          ## 📝 Installation
-          
-          \`\`\`bash
-          # Download and extract
-          tar -xzf ecapture_decryptor-${VERSION}-<platform>.tar.gz
-          cd ecapture_decryptor-${VERSION}-<platform>
-          
-          # Verify checksum
-          sha256sum -c SHA256SUMS
-          
-          # Use the library
-          gcc -o myapp myapp.c -I./include -L./lib -lecapture_decryptor
-          \`\`\`
-          
-          ## 🔐 Verification
-          
-          Verify the integrity of downloaded files using SHA256 checksums:
-          
-          \`\`\`bash
-          sha256sum -c ecapture_decryptor-${VERSION}-<platform>.tar.gz.sha256
-          \`\`\`
-          
-          ## 📄 License
-          
-          **Non-Commercial License** - See LICENSE-BINARY in the package
-          
-          For commercial licensing, contact: cfc4n.cs@gmail.com
-          
-          ## 📖 Documentation
-          
-          - [README](https://github.com/cfc4n/ecapture_decryptor/blob/main/README.md)
-          - [Release Guide](https://github.com/cfc4n/ecapture_decryptor/blob/main/RELEASE_GUIDE.md)
-          - [Examples](https://github.com/cfc4n/ecapture_decryptor/tree/main/examples)
-          
-          ## 🆕 What's New
-          
-          See [CHANGELOG.md](https://github.com/cfc4n/ecapture_decryptor/blob/main/CHANGELOG.md) for detailed changes.
-          
-          ---
-          
-          **Full Changelog**: https://github.com/cfc4n/ecapture_decryptor/compare/v1.0.0...${VERSION}
-          EOF
-
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: dist/**/*.tar.gz*
-          body_path: release_notes.md
+          files: dist/*
+          generate_release_notes: true
           draft: false
           prerelease: false
         env:
@@ -153,8 +118,10 @@ jobs:
     name: Sync Release to Mirror Repository
     needs: create-release
     runs-on: ubuntu-latest
-    # Set this to false to enable syncing, or remove the condition entirely
-    if: vars.MIRROR_REPO != ''
+    # Skip this job by default. Enable by setting both repository variables:
+    # - MIRROR_REPO: target repository (e.g., 'username/mirror-repo')
+    # - ENABLE_MIRROR_SYNC: set to 'true' to enable syncing
+    if: vars.ENABLE_MIRROR_SYNC == 'true' && vars.MIRROR_REPO != ''
 
     steps:
       - name: Checkout code
@@ -163,7 +130,12 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          path: dist/
+          path: dist-temp/
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p dist
+          find dist-temp -type f \( -name "*.tar.gz" -o -name "*.sha256" \) -exec mv {} dist/ \;
 
       - name: Get version
         id: get_version
@@ -172,12 +144,12 @@ jobs:
       - name: List artifacts
         run: |
           echo "Artifacts to sync:"
-          find dist/ -name "*.tar.gz*" -type f
+          ls -lh dist/
 
       - name: Sync to mirror repository
         uses: softprops/action-gh-release@v1
         with:
-          files: dist/**/*.tar.gz*
+          files: dist/*
           tag_name: ${{ steps.get_version.outputs.VERSION }}
           draft: false
           prerelease: false
