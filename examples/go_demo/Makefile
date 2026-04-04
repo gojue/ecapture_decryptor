@@ -27,7 +27,7 @@ build:
 # Test with sample data
 test: build
 	@echo "Testing Go demo program..."
-	@if [ -f "$(TESTDATA)/all_clients.pcap" ] && [ -f "$(TESTDATA)/all_clients_sslkey.log" ]; then \
+	if [ -f "$(TESTDATA)/all_clients.pcap" ] && [ -f "$(TESTDATA)/all_clients_sslkey.log" ]; then \
 		$(BINDIR)/$(BINNAME) \
 			-pcap $(TESTDATA)/all_clients.pcap \
 			-sslkeylog $(TESTDATA)/all_clients_sslkey.log \

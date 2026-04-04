@@ -15,4 +15,5 @@ require (
 	golang.org/x/text v0.32.0 // indirect
 )
 
-replace github.com/google/gopacket v1.1.19 => github.com/cfc4n/gopacket v1.1.20
+//replace github.com/google/gopacket v1.1.19 => github.com/cfc4n/gopacket v1.1.20
+replace github.com/google/gopacket v1.1.19 => /Users/cfc4n/Project/github/gopacket
