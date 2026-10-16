@@ -12,6 +12,26 @@
 
 ## 🚀 快速开始
 
+### 增量 pcapng + DSB 解密
+
+`DecryptPcapngStream(ctx, input, emit)` 从持续增长的 pcapng `io.ReadCloser`
+读取完整块，并在 DSB 到达时立即加载 NSS Key Log 密钥。DSB 可以晚于握手、
+应用数据，甚至最后一个网络包。SDK 按 TCP 序号重组、去重，并输出完整的
+HTTP/1.1 或 HTTP/2 请求/响应；`emit` 返回错误会停止读取并返回该错误。
+取消 `ctx` 会关闭 `input`，以解除阻塞读取。调用方应按需给 `input` 配置
+能够被 `Close` 中断的实现，例如 `io.PipeReader` 或网络连接。
+
+```go
+err := ecapture_decryptor.DecryptPcapngStream(ctx, input, func(message *types.DecryptedPacket) error {
+    // message.Data 是完整 HTTP 消息；Metadata 包含 host / authority 和 stream_id。
+    return handle(message)
+})
+```
+
+eCapture 集成及其源码和二进制分发（含商业使用）适用
+[LICENSE](LICENSE) 中的 **eCapture Integration Exception**。其他 SDK 用途
+仍按原有授权条款处理。
+
 ### 安装
 
 ```bash

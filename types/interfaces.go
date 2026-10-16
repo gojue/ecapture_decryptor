@@ -56,10 +56,11 @@ type ConnectionKey struct {
 	Pid         int
 	FD          int
 	ProcessName string
+	Generation  uint64
 }
 
 func (k ConnectionKey) String() string {
-	return fmt.Sprintf("%d-%d-%s/%s:%d--%s:%d/%s", k.Pid, k.FD, k.ProcessName, k.SrcIP, k.SrcPort, k.DstIP, k.DstPort, k.Proto)
+	return fmt.Sprintf("%d-%d-%s/%s:%d--%s:%d/%s#%d", k.Pid, k.FD, k.ProcessName, k.SrcIP, k.SrcPort, k.DstIP, k.DstPort, k.Proto, k.Generation)
 }
 
 func (k ConnectionKey) Reverse() ConnectionKey {
@@ -72,6 +73,7 @@ func (k ConnectionKey) Reverse() ConnectionKey {
 		Pid:         k.Pid,
 		FD:          k.FD,
 		ProcessName: k.ProcessName,
+		Generation:  k.Generation,
 	}
 }
 

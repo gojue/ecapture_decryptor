@@ -8,6 +8,8 @@
 package ecapture_decryptor
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -28,6 +30,7 @@ type DecryptorConfig struct {
 	pcapReader   io.Reader
 	packetChan   chan *types.DecryptedPacket
 	logger       *log.Logger
+	strictPcapng bool
 }
 
 // NewDecryptorConfig 创建默认配置
@@ -95,6 +98,7 @@ func DecryptWithConfig(config *DecryptorConfig) error {
 		keyLog:    keyLog,
 		factory:   NewDecryptorFactory(keyLog, config.logger, config.packetChan),
 		conntrack: make(map[string]types.Decryptor),
+		tcpFlows:  make(map[string]*tcpConnection),
 		logger:    config.logger,
 	}
 
@@ -103,12 +107,34 @@ func DecryptWithConfig(config *DecryptorConfig) error {
 
 // DecryptorEngine 解密引擎
 type DecryptorEngine struct {
-	config    *DecryptorConfig
-	keyLog    *crypto.KeyLogStore
-	factory   *DecryptorFactory
-	conntrack map[string]types.Decryptor
-	mu        sync.RWMutex // protects conntrack
-	logger    *log.Logger
+	config         *DecryptorConfig
+	keyLog         *crypto.KeyLogStore
+	factory        *DecryptorFactory
+	conntrack      map[string]types.Decryptor
+	tcpFlows       map[string]*tcpConnection
+	nextGeneration uint64
+	connections    sync.WaitGroup
+	mu             sync.RWMutex // protects conntrack
+	logger         *log.Logger
+	errMu          sync.Mutex
+	connectionErrs []error
+}
+
+func (e *DecryptorEngine) recordConnectionError(err error) {
+	if err == nil {
+		return
+	}
+	e.errMu.Lock()
+	defer e.errMu.Unlock()
+	if len(e.connectionErrs) < 16 {
+		e.connectionErrs = append(e.connectionErrs, err)
+	}
+}
+
+func (e *DecryptorEngine) connectionError() error {
+	e.errMu.Lock()
+	defer e.errMu.Unlock()
+	return errors.Join(e.connectionErrs...)
 }
 
 // Run 运行解密引擎
@@ -121,6 +147,12 @@ func (e *DecryptorEngine) Run() error {
 	options.SkipUnknownVersion = true
 	ngReader, err := pcapgo.NewNgReader(e.config.pcapReader, options)
 	if err != nil || ngReader == nil {
+		if e.config.strictPcapng {
+			if err == nil {
+				err = fmt.Errorf("pcapng reader is nil")
+			}
+			return fmt.Errorf("open pcapng stream: %w", err)
+		}
 		e.logger.Println("Failed to open as pcapng format, falling back to legacy Pcap:", err)
 		// Fall back to legacy pcap format
 		return e.processLegacyPcap()
@@ -151,45 +183,22 @@ func (e *DecryptorEngine) processPcapng(ngReader *pcapgo.NgReader) error {
 }
 
 // processPcapngFileMode 文件模式：先提取 DSB，再重新读取处理包
-func (e *DecryptorEngine) processPcapngFileMode(ngReader *pcapgo.NgReader) error {
+func (e *DecryptorEngine) processPcapngFileMode(_ *pcapgo.NgReader) error {
 	e.logger.Println("Using file mode for pcapng processing")
-
-	// 第一遍：读取所有包以触发 DSB 收集
-	e.logger.Println("First pass: collecting Decryption Secrets Blocks...")
-	packetCount := 0
-	for {
-		_, _, err := ngReader.ReadPacketData()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			e.logger.Printf("Warning: error reading packet data: %v", err)
-			continue
-		}
-		packetCount++
-	}
-	e.logger.Printf("First pass completed, scanned %d packets", packetCount)
-
-	// 提取并加载 DSB
-	dsbs := ngReader.GetDecryptionSecretsBlocks()
-	e.logger.Printf("Found %d Decryption Secrets Blocks in pcapng", len(dsbs))
-	for i, dsb := range dsbs {
-		payload := dsb.Payload()
-		n, writeErr := e.keyLog.Write(payload)
-		if writeErr != nil {
-			e.logger.Printf("Warning: failed to write DSB #%d: %v", i, writeErr)
-		} else {
-			e.logger.Printf("Loaded DSB #%d: %d bytes written to keylog", i+1, n)
-		}
-	}
-
-	// Seek 回到文件开头
 	seeker := e.config.pcapReader.(io.Seeker)
-	_, err := seeker.Seek(0, io.SeekStart)
-	if err != nil {
+	if _, err := seeker.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	e.logger.Println("Seeked back to start of file for second pass")
+	blocks := &pcapngBlockReader{source: e.config.pcapReader, onTLSSecrets: func(payload []byte) error {
+		_, err := e.keyLog.Write(payload)
+		return err
+	}}
+	if _, err := io.Copy(io.Discard, blocks); err != nil {
+		return fmt.Errorf("scan pcapng secrets: %w", err)
+	}
+	if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
 
 	// 重新创建 reader 进行第二遍读取
 	options := pcapgo.DefaultNgReaderOptions
@@ -204,7 +213,7 @@ func (e *DecryptorEngine) processPcapngFileMode(ngReader *pcapgo.NgReader) error
 	packetSource := gopacket.NewPacketSource(ngReader2, ngReader2.LinkType())
 	packetSource.NoCopy = true
 
-	packetCount = 0
+	packetCount := 0
 	for packet := range packetSource.Packets() {
 		packetCount++
 		if packetCount%100 == 0 {
@@ -217,23 +226,31 @@ func (e *DecryptorEngine) processPcapngFileMode(ngReader *pcapgo.NgReader) error
 	// 等待所有解密 goroutine 完成
 	e.waitForAllConnections()
 	e.logger.Println("DecryptorEngine.Run() completed successfully")
-	return nil
+	return e.connectionError()
 }
 
 // processPcapngStreamMode 流式模式：一次遍历，边处理边提取 DSB
-func (e *DecryptorEngine) processPcapngStreamMode(ngReader *pcapgo.NgReader) error {
+func (e *DecryptorEngine) processPcapngStreamMode(ngReader *pcapgo.NgReader) (result error) {
 	e.logger.Println("Using stream mode for pcapng processing")
 	e.logger.Println("Note: DSB blocks will be loaded incrementally as they are encountered")
-
-	packetSource := gopacket.NewPacketSource(ngReader, ngReader.LinkType())
-	packetSource.NoCopy = true
+	defer func() {
+		e.waitForAllConnections()
+		result = errors.Join(result, e.connectionError())
+	}()
 
 	e.logger.Println("Processing packets in streaming mode...")
 	packetCount := 0
-	lastDSBCount := 0
-
-	for packet := range packetSource.Packets() {
-
+	// DecryptPcapngStream observes DSB blocks before NgReader consumes them.
+	for {
+		data, ci, err := ngReader.ReadPacketData()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		packet := gopacket.NewPacket(data, ngReader.LinkType(), gopacket.Default)
+		packet.Metadata().Timestamp = ci.Timestamp
 		packetCount++
 		if packetCount%100 == 0 {
 			e.logger.Printf("Processed %d packets so far...", packetCount)
@@ -241,26 +258,8 @@ func (e *DecryptorEngine) processPcapngStreamMode(ngReader *pcapgo.NgReader) err
 		e.processPacket(packet)
 	}
 
-	// 最后再检查一次是否有遗漏的 DSB
-	finalDSBs := ngReader.GetDecryptionSecretsBlocks()
-	if len(finalDSBs) > lastDSBCount {
-		e.logger.Printf("Found additional DSB blocks at end: %d -> %d", lastDSBCount, len(finalDSBs))
-		for i := lastDSBCount; i < len(finalDSBs); i++ {
-			dsb := finalDSBs[i]
-			payload := dsb.Payload()
-			n, writeErr := e.keyLog.Write(payload)
-			if writeErr != nil {
-				e.logger.Printf("Warning: failed to write DSB #%d: %v", i, writeErr)
-			} else {
-				e.logger.Printf("Loaded DSB #%d: %d bytes written to keylog", i+1, n)
-			}
-		}
-	}
-
 	e.logger.Printf("Finished processing %d packets in streaming mode", packetCount)
 
-	// 等待所有解密 goroutine 完成
-	e.waitForAllConnections()
 	e.logger.Println("DecryptorEngine.Run() completed successfully")
 	return nil
 }
@@ -305,38 +304,15 @@ func (e *DecryptorEngine) processLegacyPcap() error {
 	// 等待所有解密 goroutine 完成
 	e.waitForAllConnections()
 	e.logger.Println("DecryptorEngine.Run() completed successfully")
-	return nil
+	return e.connectionError()
 }
 
 // waitForAllConnections 等待所有连接处理完成，带超时保护
 func (e *DecryptorEngine) waitForAllConnections() {
 	e.logger.Println("Waiting for all connections to finish...")
-
-	// 首先关闭所有连接
 	e.closeAllConnections()
-
-	// 等待最多 5 秒，让 goroutine 完成
-	done := make(chan struct{})
-	go func() {
-		for {
-			e.mu.RLock()
-			count := len(e.conntrack)
-			e.mu.RUnlock()
-
-			if count == 0 {
-				close(done)
-				return
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-	}()
-
-	select {
-	case <-done:
-		e.logger.Println("All connections finished")
-	case <-time.After(5 * time.Second):
-		e.logger.Println("Warning: timeout waiting for connections to finish")
-	}
+	e.connections.Wait()
+	e.logger.Println("All connections finished")
 }
 
 // processPacket processes a single packet
@@ -368,83 +344,131 @@ func (e *DecryptorEngine) processPacket(packet gopacket.Packet) {
 }
 
 // handlePacket handles a packet
-func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transport types.TransportLayer, packetTime time.Time) {
+func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.TransportLayer, packetTime time.Time) {
 	key := types.ConnectionKey{
 		SrcIP:       ip.GetSrcIP(),
 		DstIP:       ip.GetDstIP(),
-		SrcPort:     transport.GetSrcPort(),
-		DstPort:     transport.GetDstPort(),
-		Proto:       transport.Protocol(),
+		SrcPort:     transportLayer.GetSrcPort(),
+		DstPort:     transportLayer.GetDstPort(),
+		Proto:       transportLayer.Protocol(),
 		Pid:         0,
 		FD:          0,
 		ProcessName: "decryptor",
 	}
 	rkey := key.Reverse()
+	baseKey := key.String()
+	reverseKey := rkey.String()
 
 	var ct types.Decryptor
 	var isReverse bool
+	var flow *tcpConnection
+	var connectionMapKey string
 
-	// Check if connection exists (read lock)
 	e.mu.RLock()
-	if existingCt, ok := e.conntrack[key.String()]; ok {
+	if existingCt, ok := e.conntrack[baseKey]; ok {
 		ct = existingCt
-	} else if existingRct, ok := e.conntrack[rkey.String()]; ok {
+		connectionMapKey = baseKey
+	} else if existingRct, ok := e.conntrack[reverseKey]; ok {
 		ct = existingRct
 		isReverse = true
+		connectionMapKey = reverseKey
 	}
+	flow = e.tcpFlows[connectionMapKey]
 	e.mu.RUnlock()
 
-	if transport.IsSYN() && ct == nil {
+	newConnection := transportLayer.IsSYN()
+	if tcp, ok := transportLayer.(*transport.TCPAdapter); ok {
+		newConnection = tcp.SYN && !tcp.ACK
+	}
+	if newConnection {
+		if ct != nil {
+			_ = ct.Close() // A fresh SYN starts a new generation of this tuple.
+		}
+		e.mu.Lock()
+		e.nextGeneration++
+		key.Generation = e.nextGeneration
+		e.mu.Unlock()
 		ct = e.factory.Create(key)
 		if ct == nil {
 			return
 		}
-
-		// Store new connection (write lock)
+		flow = &tcpConnection{}
+		if tcp, ok := transportLayer.(*transport.TCPAdapter); ok {
+			flow.client.Start(tcp.Seq + 1)
+		}
 		e.mu.Lock()
-		e.conntrack[key.String()] = ct
+		e.conntrack[baseKey] = ct
+		e.tcpFlows[baseKey] = flow
+		e.connections.Add(1)
 		e.mu.Unlock()
-
 		go func() {
+			defer e.connections.Done()
 			e.logger.Println("START Decrypt", ct.GetAddr())
 			if err := ct.Decrypt(); err != nil {
-				e.logger.Println("ERROR Decrypt", key.String(), err)
+				e.logger.Println("ERROR Decrypt", ct.GetAddr(), err)
+				e.recordConnectionError(fmt.Errorf("decrypt TLS connection %s: %w", ct.GetAddr(), err))
 			}
 			e.logger.Println("DONE Decrypt", ct.GetAddr())
-
-			// Delete connection (write lock)
 			e.mu.Lock()
-			delete(e.conntrack, key.String())
+			if e.conntrack[baseKey] == ct {
+				delete(e.conntrack, baseKey)
+				delete(e.tcpFlows, baseKey)
+			}
 			e.mu.Unlock()
 		}()
 		return
 	}
-
-	if transport.IsFIN() {
-		if ct != nil {
-			if isReverse {
-				_ = ct.CloseServer()
-			} else {
-				_ = ct.CloseClient()
-			}
-		}
+	if ct == nil {
 		return
 	}
-
-	payload := transport.GetPayload()
-	if len(payload) == 0 || ct == nil {
-		return
-	}
-
-	ct.SetPacketTime(packetTime)
-
-	if isReverse {
-		if err := ct.FeedServer(payload); err != nil {
-			e.logger.Println("ERROR FeedServer", key.String(), err)
+	payload := transportLayer.GetPayload()
+	var chunks [][]byte
+	if tcp, ok := transportLayer.(*transport.TCPAdapter); ok {
+		if flow == nil {
+			return
 		}
-	} else {
-		if err := ct.FeedClient(payload); err != nil {
-			e.logger.Println("ERROR FeedClient", key.String(), err)
+		direction := &flow.client
+		if isReverse {
+			direction = &flow.server
+		}
+		if tcp.SYN {
+			direction.Start(tcp.Seq + 1)
+		}
+		seq := tcp.Seq
+		if tcp.SYN {
+			seq++
+		}
+		var err error
+		chunks, err = direction.Push(seq, payload)
+		if err != nil {
+			e.logger.Printf("TCP reassembly failed for %s: %v", ct.GetAddr(), err)
+			e.recordConnectionError(fmt.Errorf("reassemble TCP connection %s: %w", ct.GetAddr(), err))
+			_ = ct.Close()
+			return
+		}
+	} else if len(payload) > 0 {
+		chunks = [][]byte{payload}
+	}
+	for _, chunk := range chunks {
+		ct.SetPacketTime(packetTime)
+		var err error
+		if isReverse {
+			err = ct.FeedServer(chunk)
+		} else {
+			err = ct.FeedClient(chunk)
+		}
+		if err != nil {
+			e.logger.Printf("feed TLS connection %s: %v", ct.GetAddr(), err)
+			e.recordConnectionError(fmt.Errorf("feed TLS connection %s: %w", ct.GetAddr(), err))
+			_ = ct.Close()
+			return
+		}
+	}
+	if transportLayer.IsFIN() {
+		if isReverse {
+			_ = ct.CloseServer()
+		} else {
+			_ = ct.CloseClient()
 		}
 	}
 }

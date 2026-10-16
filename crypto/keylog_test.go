@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadFromReader(t *testing.T) {
@@ -70,5 +71,28 @@ func TestWriteStreaming(t *testing.T) {
 	}
 	if len(got.ClientHandshakeTrafficSecret) == 0 {
 		t.Errorf("expected ClientHandshakeTrafficSecret to be set after streaming write")
+	}
+}
+
+func TestWaitForSecretsLateAndMissing(t *testing.T) {
+	store := NewKeyLogStore()
+	random := []byte{1, 2, 3, 4}
+	ready := func(secrets *TLSSecrets) bool { return secrets != nil && len(secrets.MasterSecret) > 0 }
+	stop := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := store.WaitForSecrets(random, ready, stop, time.Second)
+		done <- err
+	}()
+	store.AddSecret("CLIENT_RANDOM", hex.EncodeToString(random), []byte{5, 6})
+	if err := <-done; err != nil {
+		t.Fatalf("late secret not observed: %v", err)
+	}
+	if _, err := store.WaitForSecrets([]byte{9}, ready, stop, time.Millisecond); err == nil {
+		t.Fatal("missing secret did not time out")
+	}
+	close(stop)
+	if _, err := store.WaitForSecrets([]byte{9}, ready, stop, time.Second); err == nil {
+		t.Fatal("closed connection did not interrupt missing-secret wait")
 	}
 }

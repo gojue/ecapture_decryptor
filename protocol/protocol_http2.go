@@ -25,6 +25,8 @@ import (
 // HTTP/2 连接前言
 var http2Preface = []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
 
+const maxHTTP2BufferedBytes = 16 << 20
+
 // HTTP2StreamParser HTTP/2 流解析器
 type HTTP2StreamParser struct {
 	addr       types.ConnectionKey
@@ -54,7 +56,14 @@ type HTTP2StreamParser struct {
 	serverBuffer bytes.Buffer
 
 	// 标记是否为HTTP/2连接
-	isHTTP2 bool
+	isHTTP2  bool
+	parseErr error
+}
+
+func (p *HTTP2StreamParser) Err() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.parseErr
 }
 
 // http2Stream HTTP/2 流
@@ -77,6 +86,7 @@ type http2Request struct {
 	endStream   bool
 	headersDone bool
 	outputted   bool // 标记是否已经输出，避免重复
+	headerBlock bytes.Buffer
 }
 
 // http2Response HTTP/2 响应
@@ -86,6 +96,7 @@ type http2Response struct {
 	body        bytes.Buffer
 	endStream   bool
 	headersDone bool
+	headerBlock bytes.Buffer
 }
 
 // NewHTTP2StreamParser 创建 HTTP/2 流解析器
@@ -125,6 +136,14 @@ func (p *HTTP2StreamParser) SetPacketTime(t time.Time) {
 func (p *HTTP2StreamParser) FeedRequest(data []byte) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.parseErr != nil {
+		return
+	}
+	if p.clientBuffer.Len()+len(data) > maxHTTP2BufferedBytes {
+		p.parseErr = fmt.Errorf("HTTP/2 client frame buffer exceeds %d-byte limit", maxHTTP2BufferedBytes)
+		p.clientBuffer.Reset()
+		return
+	}
 
 	// 检测HTTP/2连接前言
 	if !p.clientPrefaceReceived {
@@ -163,6 +182,14 @@ func (p *HTTP2StreamParser) FeedRequest(data []byte) {
 func (p *HTTP2StreamParser) FeedResponse(data []byte) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.parseErr != nil {
+		return
+	}
+	if p.serverBuffer.Len()+len(data) > maxHTTP2BufferedBytes {
+		p.parseErr = fmt.Errorf("HTTP/2 server frame buffer exceeds %d-byte limit", maxHTTP2BufferedBytes)
+		p.serverBuffer.Reset()
+		return
+	}
 
 	if !p.isHTTP2 {
 		return
@@ -302,8 +329,14 @@ func (p *HTTP2StreamParser) handleHeadersFrame(streamID uint32, flags http2.Flag
 				headers: make(http.Header),
 			}
 		}
-		p.decodeHeaders(headerBlock, stream.request.headers, true)
+		if stream.request.headerBlock.Len()+len(headerBlock) > maxHTTP2BufferedBytes {
+			p.parseErr = fmt.Errorf("HTTP/2 request headers exceed %d-byte limit", maxHTTP2BufferedBytes)
+			return
+		}
+		stream.request.headerBlock.Write(headerBlock)
 		if flags&http2.FlagHeadersEndHeaders != 0 {
+			p.decodeHeaders(stream.request.headerBlock.Bytes(), stream.request.headers, true)
+			stream.request.headerBlock.Reset()
 			stream.request.headersDone = true
 			p.extractRequestPseudoHeaders(stream.request)
 		}
@@ -321,8 +354,14 @@ func (p *HTTP2StreamParser) handleHeadersFrame(streamID uint32, flags http2.Flag
 			}
 			stream.responseTime = p.packetTime
 		}
-		p.decodeHeaders(headerBlock, stream.response.headers, false)
+		if stream.response.headerBlock.Len()+len(headerBlock) > maxHTTP2BufferedBytes {
+			p.parseErr = fmt.Errorf("HTTP/2 response headers exceed %d-byte limit", maxHTTP2BufferedBytes)
+			return
+		}
+		stream.response.headerBlock.Write(headerBlock)
 		if flags&http2.FlagHeadersEndHeaders != 0 {
+			p.decodeHeaders(stream.response.headerBlock.Bytes(), stream.response.headers, false)
+			stream.response.headerBlock.Reset()
 			stream.response.headersDone = true
 			p.extractResponsePseudoHeaders(stream.response)
 		}
@@ -341,16 +380,34 @@ func (p *HTTP2StreamParser) handleContinuationFrame(streamID uint32, flags http2
 	}
 
 	if isClient && stream.request != nil {
-		p.decodeHeaders(payload, stream.request.headers, true)
+		if stream.request.headerBlock.Len()+len(payload) > maxHTTP2BufferedBytes {
+			p.parseErr = fmt.Errorf("HTTP/2 request headers exceed %d-byte limit", maxHTTP2BufferedBytes)
+			return
+		}
+		stream.request.headerBlock.Write(payload)
 		if flags&http2.FlagContinuationEndHeaders != 0 {
+			p.decodeHeaders(stream.request.headerBlock.Bytes(), stream.request.headers, true)
+			stream.request.headerBlock.Reset()
 			stream.request.headersDone = true
 			p.extractRequestPseudoHeaders(stream.request)
+			if stream.request.endStream {
+				p.tryOutputRequest(stream)
+			}
 		}
 	} else if !isClient && stream.response != nil {
-		p.decodeHeaders(payload, stream.response.headers, false)
+		if stream.response.headerBlock.Len()+len(payload) > maxHTTP2BufferedBytes {
+			p.parseErr = fmt.Errorf("HTTP/2 response headers exceed %d-byte limit", maxHTTP2BufferedBytes)
+			return
+		}
+		stream.response.headerBlock.Write(payload)
 		if flags&http2.FlagContinuationEndHeaders != 0 {
+			p.decodeHeaders(stream.response.headerBlock.Bytes(), stream.response.headers, false)
+			stream.response.headerBlock.Reset()
 			stream.response.headersDone = true
 			p.extractResponsePseudoHeaders(stream.response)
+			if stream.response.endStream {
+				p.completeStream(stream)
+			}
 		}
 	}
 }
@@ -377,6 +434,10 @@ func (p *HTTP2StreamParser) handleDataFrame(streamID uint32, flags http2.Flags, 
 	}
 
 	if isClient && stream.request != nil {
+		if stream.request.body.Len()+len(data) > maxHTTP2BufferedBytes {
+			p.parseErr = fmt.Errorf("HTTP/2 request body exceeds %d-byte limit", maxHTTP2BufferedBytes)
+			return
+		}
 		stream.request.body.Write(data)
 		if flags&http2.FlagDataEndStream != 0 {
 			stream.request.endStream = true
@@ -386,6 +447,10 @@ func (p *HTTP2StreamParser) handleDataFrame(streamID uint32, flags http2.Flags, 
 			}
 		}
 	} else if !isClient && stream.response != nil {
+		if stream.response.body.Len()+len(data) > maxHTTP2BufferedBytes {
+			p.parseErr = fmt.Errorf("HTTP/2 response body exceeds %d-byte limit", maxHTTP2BufferedBytes)
+			return
+		}
 		stream.response.body.Write(data)
 		if flags&http2.FlagDataEndStream != 0 {
 			stream.response.endStream = true
@@ -451,7 +516,7 @@ func (p *HTTP2StreamParser) extractResponsePseudoHeaders(resp *http2Response) {
 
 // completeStream 完成一个HTTP/2流，输出解密包
 func (p *HTTP2StreamParser) completeStream(stream *http2Stream) {
-	if stream.request == nil || stream.response == nil {
+	if stream.request == nil || stream.response == nil || !stream.response.headersDone || !stream.response.endStream {
 		return
 	}
 
@@ -476,13 +541,10 @@ func (p *HTTP2StreamParser) completeStream(stream *http2Stream) {
 		respPacket := types.NewDecryptedPacket(types.TransportProtocolTCP, "http/2", "response", respBuf.Bytes(), stream.responseTime, p.addr)
 		respPacket.WithMetadata("status", stream.response.status).
 			WithMetadata("stream_id", stream.id).
+			WithMetadata("authority", stream.request.authority).
 			WithMetadata("headers", stream.response.headers)
 
-		select {
-		case p.packetChan <- respPacket:
-		default:
-			// Channel full, skip
-		}
+		p.packetChan <- respPacket
 	}
 
 	// 清理流
@@ -534,17 +596,16 @@ func (p *HTTP2StreamParser) outputRequest(stream *http2Stream) {
 		WithMetadata("stream_id", stream.id).
 		WithMetadata("headers", stream.request.headers)
 
-	select {
-	case p.packetChan <- reqPacket:
-	default:
-		// Channel full, skip
-	}
+	p.packetChan <- reqPacket
 }
 
 // Flush 刷新所有未完成的流
 func (p *HTTP2StreamParser) Flush() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.parseErr != nil {
+		return
+	}
 
 	// 解析剩余数据
 	p.parseFrames(&p.clientBuffer, true)
@@ -553,7 +614,7 @@ func (p *HTTP2StreamParser) Flush() {
 	// 完成所有有响应的流
 	// Complete any pending streams
 	for _, stream := range p.streams {
-		if stream.request != nil && stream.response != nil && stream.response.headersDone {
+		if stream.request != nil && stream.response != nil && stream.response.headersDone && stream.response.endStream {
 			p.completeStream(stream)
 		}
 	}

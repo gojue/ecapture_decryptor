@@ -10,9 +10,11 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"io"
 	"strings"
 	"sync"
+	"time"
 )
 
 // KeyLogStore stores TLS secrets from NSS key log format
@@ -22,6 +24,7 @@ type KeyLogStore struct {
 	secrets map[string]*TLSSecrets
 	// buffer for partial lines when used as an io.Writer
 	partial bytes.Buffer
+	updated chan struct{}
 }
 
 /*
@@ -48,6 +51,7 @@ type TLSSecrets struct {
 func NewKeyLogStore() *KeyLogStore {
 	return &KeyLogStore{
 		secrets: make(map[string]*TLSSecrets),
+		updated: make(chan struct{}),
 	}
 }
 
@@ -80,6 +84,7 @@ func (kl *KeyLogStore) AddSecret(label string, clientRandomHex string, secret []
 		return
 	}
 	key := strings.ToLower(clientRandomHex)
+	secret = append([]byte(nil), secret...)
 	kl.mu.Lock()
 	defer kl.mu.Unlock()
 	if kl.secrets[key] == nil {
@@ -116,6 +121,8 @@ func (kl *KeyLogStore) AddSecret(label string, clientRandomHex string, secret []
 		s.ServerTrafficSecret = secret
 	}
 	kl.secrets[key] = s
+	close(kl.updated)
+	kl.updated = make(chan struct{})
 }
 
 // Write implements io.Writer to accept streaming keylog data. It buffers incomplete lines.
@@ -181,5 +188,44 @@ func (kl *KeyLogStore) GetSecrets(clientRandom []byte) *TLSSecrets {
 	key := hex.EncodeToString(clientRandom)
 	kl.mu.RLock()
 	defer kl.mu.RUnlock()
-	return kl.secrets[key]
+	return cloneSecrets(kl.secrets[key])
+}
+
+func cloneSecrets(s *TLSSecrets) *TLSSecrets {
+	if s == nil {
+		return nil
+	}
+	clone := *s
+	clone.ClientTrafficSecret = bytes.Clone(s.ClientTrafficSecret)
+	clone.ServerTrafficSecret = bytes.Clone(s.ServerTrafficSecret)
+	clone.ClientHandshakeTrafficSecret = bytes.Clone(s.ClientHandshakeTrafficSecret)
+	clone.ServerHandshakeTrafficSecret = bytes.Clone(s.ServerHandshakeTrafficSecret)
+	clone.MasterSecret = bytes.Clone(s.MasterSecret)
+	clone.ClientEarlyTrafficSecret = bytes.Clone(s.ClientEarlyTrafficSecret)
+	clone.ExporterSecret = bytes.Clone(s.ExporterSecret)
+	return &clone
+}
+
+// WaitForSecrets waits for the required key material without polling. The stop
+// channel is closed when the connection is abandoned.
+func (kl *KeyLogStore) WaitForSecrets(clientRandom []byte, ready func(*TLSSecrets) bool, stop <-chan struct{}, timeout time.Duration) (*TLSSecrets, error) {
+	key := hex.EncodeToString(clientRandom)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		kl.mu.RLock()
+		secrets := cloneSecrets(kl.secrets[key])
+		updated := kl.updated
+		kl.mu.RUnlock()
+		if ready(secrets) {
+			return secrets, nil
+		}
+		select {
+		case <-updated:
+		case <-stop:
+			return nil, io.ErrClosedPipe
+		case <-timer.C:
+			return nil, errors.New("timed out waiting for TLS secrets")
+		}
+	}
 }

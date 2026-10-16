@@ -2,6 +2,18 @@
 
 ## Quick Reference / 快速参考
 
+### eCapture integration exception / eCapture 集成例外
+
+The restrictions below do **not** apply to building, using, modifying, or
+distributing this SDK with eCapture and eCapture derivatives. The exception
+in [LICENSE](../LICENSE) expressly permits source and binary redistribution,
+linking, and commercial use for those purposes. Keep the required copyright
+and exception notices. Standalone SDK uses remain governed by the terms below.
+
+下述限制**不适用于**随 eCapture 及其衍生作品构建、使用、修改或分发本 SDK。
+[LICENSE](../LICENSE) 中的例外明确授权这些用途的源码及二进制再分发、
+链接和商业使用；请保留版权及例外条款声明。独立的 SDK 用途仍受下述条款约束。
+
 ### For Users / 给用户
 
 如果你想**使用这个库**（链接二进制文件）：
