@@ -195,10 +195,15 @@ func TestDecryptPcapngStreamDSBPlacement(t *testing.T) {
 			if err := writer.Flush(); err != nil {
 				t.Fatal(err)
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			// The capture includes a multi-megabyte upload. Race instrumentation
+			// and coverage can make offline replay much slower on shared CI runners.
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 			defer cancel()
 			count := 0
-			err = DecryptPcapngStream(ctx, io.NopCloser(shortReader{bytes.NewReader(encoded.Bytes())}), func(packet *types.DecryptedPacket) error {
+			// Block fragmentation is covered by TestPcapngBlockReaderObservesLateDSBAfterLastPacket.
+			// This fixture contains multi-megabyte HTTP bodies; forcing three-byte reads
+			// makes the race and coverage build spend its deadline in the test reader.
+			err = DecryptPcapngStream(ctx, io.NopCloser(bytes.NewReader(encoded.Bytes())), func(packet *types.DecryptedPacket) error {
 				if packet.Direction == "request" || packet.Direction == "response" {
 					count++
 				}
