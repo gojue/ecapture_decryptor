@@ -43,9 +43,10 @@ func TestDecryptPcapFile(t *testing.T) {
 		done <- DecryptPcapFile(keylogFile, pcapFile, packetChan)
 	}()
 
-	// Collect packets with timeout
+	// This fixture includes a multi-megabyte upload. Race and coverage
+	// instrumentation can make complete offline replay slow on shared CI runners.
 	packets := make([]*types.DecryptedPacket, 0)
-	timeout := time.After(30 * time.Second)
+	timeout := time.After(2 * time.Minute)
 
 collectLoop:
 	for {
