@@ -45,7 +45,7 @@ func main() {
 	defer func() { _ = pcapFile.Close() }()
 
 	// 创建解密包输出通道
-	packetChan := make(chan *types.DecryptedPacket, 100)
+	packetChan := make(chan *types.DecryptedPacket, 10000)
 
 	// 收集解密的包
 	packets := make([]*types.DecryptedPacket, 0)

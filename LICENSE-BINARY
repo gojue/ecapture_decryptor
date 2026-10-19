@@ -4,6 +4,13 @@
 
 **Version 1.0 - January 5, 2026**
 
+**eCapture exception:** The eCapture Integration Exception in [LICENSE](LICENSE)
+also applies to SDK binary libraries and overrides conflicting restrictions
+here for eCapture integration, including commercial use and redistribution.
+
+**eCapture 例外：**[LICENSE](LICENSE) 中的 eCapture 集成例外同样适用于 SDK
+二进制库。对于 eCapture 集成，该例外优先于本文冲突的限制，包括商业使用与再分发。
+
 ---
 
 ## Copyright Notice / 版权声明

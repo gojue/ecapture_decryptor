@@ -3,6 +3,34 @@
 This project is licensed under a dual licensing model:
 本项目采用双重许可模式：
 
+## 0. eCapture Integration Exception / eCapture 集成例外
+
+Notwithstanding the restrictions below, CFC4N grants every recipient of
+eCapture (`github.com/gojue/ecapture/v2`) a perpetual, worldwide,
+non-exclusive, royalty-free, irrevocable permission to use, copy, modify,
+compile, link, and distribute this SDK, in source or binary form, as part of
+building, using, developing, or distributing eCapture and works derived from
+eCapture. This permission includes commercial use and redistribution of
+eCapture binaries and corresponding source, including modified SDK versions
+used with eCapture. Recipients may pass on these same permissions to further
+recipients of eCapture. Retain this notice and the SDK copyright notice in
+source distributions and include them in binary distribution notices. No
+permission is granted for unrelated standalone uses of this SDK. If a term
+below conflicts with this exception, this exception controls for the uses
+described here.
+
+尽管下文另有禁止性规定，CFC4N 仍向 eCapture
+（`github.com/gojue/ecapture/v2`）的每位接收者授予永久、全球范围、非独占、
+免版税、不可撤销的许可：为构建、使用、开发或分发 eCapture 及其衍生作品，
+可以使用、复制、修改、编译、链接和分发本 SDK 的源码或二进制形式。
+该许可包含商业使用、再分发 eCapture 二进制及相应源码，以及随 eCapture
+使用的修改版 SDK。接收者可将相同许可传递给后续 eCapture 接收者。
+源码分发须保留本条款及 SDK 版权声明；二进制分发须在发行说明中保留。
+本例外不授权与 eCapture 无关的独立 SDK 用途。若下文条款与本例外冲突，
+就上述用途以本例外为准。
+
+---
+
 ## 1. Source Code License / 源代码许可证
 
 **Copyright (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com). All Rights Reserved.**

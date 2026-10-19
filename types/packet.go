@@ -59,7 +59,7 @@ type DecryptedPacket struct {
 
 // NewDecryptedPacket creates a new decrypted packet
 func NewDecryptedPacket(tProtocol, protocol, direction string, data []byte, timestamp time.Time, ci ConnectionKey) *DecryptedPacket {
-	return &DecryptedPacket{
+	p := &DecryptedPacket{
 		uuid:       ci,
 		Transport:  tProtocol,
 		Protocol:   protocol,
@@ -75,6 +75,11 @@ func NewDecryptedPacket(tProtocol, protocol, direction string, data []byte, time
 		Metadata:   make(map[string]interface{}),
 		DataLength: uint32(len(data)),
 	}
+	if direction == "response" {
+		p.SrcIP, p.DstIP = p.DstIP, p.SrcIP
+		p.SrcPort, p.DstPort = p.DstPort, p.SrcPort
+	}
+	return p
 }
 
 // WithMetadata adds metadata to the packet

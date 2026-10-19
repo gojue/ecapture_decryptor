@@ -69,7 +69,7 @@ func (d *HTTP1Detector) Detect(data []byte) int {
 		}
 	}
 
-	return 10
+	return 0
 }
 
 func (d *HTTP1Detector) CreateParser(ci types.ConnectionKey, packetChan chan *types.DecryptedPacket) types.StreamParserInterface {

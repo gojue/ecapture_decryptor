@@ -7,6 +7,7 @@
 package transport
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cfc4n/ecapture_decryptor/crypto"
@@ -66,8 +68,11 @@ type TLSDecryptor struct {
 	serverCurrentDecryptor  *crypto.RecordDecryptor
 
 	// Close protection
-	closeOnce sync.Once
-	isClosed  bool // Track if connection is closed to suppress spurious errors
+	closeOnce       sync.Once
+	isClosed        atomic.Bool // Track if connection is closed to suppress spurious errors
+	closeSignal     chan struct{}
+	clientProcessMu sync.Mutex
+	serverProcessMu sync.Mutex
 
 	// Track if we've seen a request before outputting responses
 	hasSeenRequest bool
@@ -77,6 +82,7 @@ type TLSDecryptor struct {
 
 	// Protocol detection
 	protocolDetected bool
+	sniffBuffer      []byte
 	protocolMu       sync.RWMutex                // Protects parser and protocolDetected
 	packetChan       chan *types.DecryptedPacket // 解密包输出通道
 
@@ -97,6 +103,7 @@ func NewTLSDecryptor(ci types.ConnectionKey, keyLog *crypto.KeyLogStore, clientO
 		requestQueue:   make([]*DecryptedData, 0),
 		responseQueue:  make([]*DecryptedData, 0),
 		outputDone:     make(chan struct{}),
+		closeSignal:    make(chan struct{}),
 		packetChan:     packetChan,
 	}
 
@@ -105,6 +112,8 @@ func NewTLSDecryptor(ci types.ConnectionKey, keyLog *crypto.KeyLogStore, clientO
 
 // SetPacketTime sets the packet timestamp from pcap
 func (td *TLSDecryptor) SetPacketTime(t time.Time) {
+	td.protocolMu.Lock()
+	defer td.protocolMu.Unlock()
 	td.packetTime = t
 	if td.parser != nil {
 		td.parser.SetPacketTime(t)
@@ -123,6 +132,13 @@ func (td *TLSDecryptor) queueRequest(data []byte) {
 	td.protocolMu.RUnlock()
 
 	if !detected && td.packetChan != nil {
+		td.sniffBuffer = append(td.sniffBuffer, data...)
+		preface := []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+		if len(td.sniffBuffer) < 4 || (len(td.sniffBuffer) < len(preface) && bytes.HasPrefix(preface, td.sniffBuffer)) {
+			return
+		}
+		data = td.sniffBuffer
+		td.sniffBuffer = nil
 		td.detectProtocol(data)
 	}
 
@@ -261,7 +277,7 @@ func (td *TLSDecryptor) writeOutput(data *DecryptedData) {
 }
 
 func (td *TLSDecryptor) FeedClient(data []byte) error {
-	if td.isClosed {
+	if td.isClosed.Load() {
 		return nil // Silently ignore data after connection is closed
 	}
 	if err := td.clientIn.Write(data); err != nil {
@@ -282,7 +298,7 @@ func (td *TLSDecryptor) FeedClient(data []byte) error {
 }
 
 func (td *TLSDecryptor) FeedServer(data []byte) error {
-	if td.isClosed {
+	if td.isClosed.Load() {
 		return nil // Silently ignore data after connection is closed
 	}
 	if err := td.serverIn.Write(data); err != nil {
@@ -304,6 +320,8 @@ func (td *TLSDecryptor) FeedServer(data []byte) error {
 
 // processClientRecords processes all available client records synchronously
 func (td *TLSDecryptor) processClientRecords() {
+	td.clientProcessMu.Lock()
+	defer td.clientProcessMu.Unlock()
 	for {
 		record := td.clientIn.TryReadRecord()
 		if record == nil {
@@ -371,6 +389,8 @@ func (td *TLSDecryptor) processClientRecords() {
 
 // processServerRecords processes all available server records synchronously
 func (td *TLSDecryptor) processServerRecords() {
+	td.serverProcessMu.Lock()
+	defer td.serverProcessMu.Unlock()
 	for {
 		record := td.serverIn.TryReadRecord()
 		if record == nil {
@@ -464,7 +484,8 @@ func (td *TLSDecryptor) CloseServer() error {
 
 func (td *TLSDecryptor) Close() error {
 	td.closeOnce.Do(func() {
-		td.isClosed = true // Mark as closed before closing streams
+		td.isClosed.Store(true) // Mark as closed before closing streams
+		close(td.closeSignal)
 		_ = td.clientIn.Close()
 		_ = td.serverIn.Close()
 		// Process any remaining records
@@ -505,6 +526,10 @@ func (td *TLSDecryptor) Decrypt() error {
 		}
 		return fmt.Errorf("parse handshake: %w", err)
 	}
+	// Feed may have queued encrypted records while waiting for a late DSB.
+	// Drain them immediately; subsequent Feed calls use the same direction lock.
+	td.processClientRecords()
+	td.processServerRecords()
 
 	// After handshake is complete, data will be processed inline via FeedClient/FeedServer
 	// The inline processing ensures the correct order of decryption output
@@ -524,6 +549,12 @@ func (td *TLSDecryptor) Decrypt() error {
 	}()
 
 	wg.Wait()
+	td.protocolMu.RLock()
+	parser := td.parser
+	td.protocolMu.RUnlock()
+	if errorParser, ok := parser.(interface{ Err() error }); ok {
+		return errorParser.Err()
+	}
 
 	return nil
 }
@@ -556,9 +587,17 @@ func (td *TLSDecryptor) parseHandshake() error {
 	td.logger.Printf("TLS Version: 0x%04x, Cipher Suite: 0x%04x", version, cipherSuite)
 
 	// Get secrets from key log
-	secrets := td.keyLog.GetSecrets(clientRandom)
-	if secrets == nil {
-		return fmt.Errorf("no secrets found for client random")
+	secrets, err := td.keyLog.WaitForSecrets(clientRandom, func(s *crypto.TLSSecrets) bool {
+		if s == nil {
+			return false
+		}
+		if version == tls.VersionTLS13 {
+			return len(s.ClientTrafficSecret) != 0 && len(s.ServerTrafficSecret) != 0
+		}
+		return len(s.MasterSecret) != 0
+	}, td.closeSignal, 30*time.Second)
+	if err != nil {
+		return fmt.Errorf("wait for TLS secrets: %w", err)
 	}
 
 	// Create decryptors based on TLS version

@@ -8,22 +8,28 @@ package crypto
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"sync"
 )
 
 // StreamBuffer is a thread-safe buffer for streaming TLS data
 type StreamBuffer struct {
-	buf     bytes.Buffer
-	mu      sync.Mutex
-	newData chan struct{}
-	Closed  chan struct{} // Exported for external waiting
+	buf       bytes.Buffer
+	mu        sync.Mutex
+	newData   chan struct{}
+	Closed    chan struct{} // Exported for external waiting
+	limit     int
+	closeOnce sync.Once
 }
+
+const defaultStreamLimit = 8 << 20
 
 func NewStreamBuffer() *StreamBuffer {
 	return &StreamBuffer{
 		newData: make(chan struct{}, 1),
 		Closed:  make(chan struct{}),
+		limit:   defaultStreamLimit,
 	}
 }
 
@@ -39,6 +45,9 @@ func (sb *StreamBuffer) Write(data []byte) error {
 	case <-sb.Closed:
 		return io.ErrClosedPipe
 	default:
+	}
+	if sb.buf.Len()+len(data) > sb.limit {
+		return errors.New("TLS stream buffer limit exceeded")
 	}
 
 	sb.buf.Write(data)
@@ -138,11 +147,6 @@ func (sb *StreamBuffer) TryReadRecord() []byte {
 }
 
 func (sb *StreamBuffer) Close() error {
-	select {
-	case <-sb.Closed:
-		// Already closed
-	default:
-		close(sb.Closed)
-	}
+	sb.closeOnce.Do(func() { close(sb.Closed) })
 	return nil
 }
