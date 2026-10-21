@@ -67,13 +67,16 @@ int main(int argc, char *argv[]) {
     printf("  Capturing for %d seconds...\n", duration);
 
     // Let it run for specified duration
+    int capture_failed = 0;
     for (int i = 0; i < duration; i++) {
         sleep(1);
 
         // Check for errors
         char check_buf[512] = {0};
         if (GetLiveTrafficError(handle, check_buf, sizeof(check_buf)) != 0) {
-            fprintf(stderr, "WARNING: Error during capture: %s\n", check_buf);
+            fprintf(stderr, "ERROR: Live capture failed: %s\n", check_buf);
+            capture_failed = 1;
+            break;
         }
 
         if ((i + 1) % 5 == 0) {
@@ -86,7 +89,11 @@ int main(int argc, char *argv[]) {
     // Stop the live capture
     int ret = StopLiveTraffic(handle);
     if (ret != 0) {
-        fprintf(stderr, "WARNING: Stop returned code %d\n", ret);
+        fprintf(stderr, "ERROR: Stop returned code %d\n", ret);
+        return ret;
+    }
+    if (capture_failed) {
+        return 2;
     }
 
     printf("✓ Live capture stopped\n");

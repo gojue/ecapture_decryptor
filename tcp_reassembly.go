@@ -73,6 +73,8 @@ func (d *tcpDirection) Push(seq uint32, payload []byte) ([][]byte, error) {
 }
 
 type tcpConnection struct {
-	client tcpDirection
-	server tcpDirection
+	client       tcpDirection
+	server       tcpDirection
+	clientSYNSeq uint32
+	hasClientSYN bool
 }

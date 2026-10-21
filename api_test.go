@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cfc4n/ecapture_decryptor/types"
+	"github.com/gojue/ecapture_decryptor/types"
 )
 
 func TestDecryptPcapFile(t *testing.T) {

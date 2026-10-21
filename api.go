@@ -8,6 +8,8 @@
 package ecapture_decryptor
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -16,9 +18,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cfc4n/ecapture_decryptor/crypto"
-	"github.com/cfc4n/ecapture_decryptor/transport"
-	"github.com/cfc4n/ecapture_decryptor/types"
+	"github.com/gojue/ecapture_decryptor/crypto"
+	"github.com/gojue/ecapture_decryptor/transport"
+	"github.com/gojue/ecapture_decryptor/types"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
@@ -72,7 +74,8 @@ func DecryptLiveTraffic(keylogReader io.Reader, pcapHandle io.Reader, packetChan
 	return DecryptWithConfig(config)
 }
 
-// DecryptPcapFile 解密 pcapng 文件
+// DecryptPcapFile 解密 pcapng 文件。keylogReader 可为 nil，此时使用文件内
+// DSB 中的 SSLKEYLOG；提供外部读取器时，两个来源的密钥都会加载。
 func DecryptPcapFile(keylogReader io.Reader, pcapFileHandle io.Reader, packetChan chan *types.DecryptedPacket) error {
 	config := NewDecryptorConfig().
 		WithSSLKeyLog(keylogReader).
@@ -91,6 +94,18 @@ func DecryptWithConfig(config *DecryptorConfig) error {
 	keyLog, err := crypto.NewKeyLogStoreFromReader(config.sslKeyLogger)
 	if err != nil {
 		return err
+	}
+	// A non-seekable pcapng source cannot be scanned twice. Observe DSB blocks
+	// while the packet reader advances, including a DSB after the last packet.
+	if _, seekable := config.pcapReader.(io.Seeker); !seekable && config.pcapReader != nil {
+		buffered := bufio.NewReader(config.pcapReader)
+		config.pcapReader = buffered
+		if magic, err := buffered.Peek(4); err == nil && bytes.Equal(magic, []byte{0x0a, 0x0d, 0x0d, 0x0a}) {
+			config.pcapReader = &pcapngBlockReader{source: buffered, onTLSSecrets: func(payload []byte) error {
+				_, err := keyLog.Write(payload)
+				return err
+			}}
+		}
 	}
 
 	engine := &DecryptorEngine{
@@ -379,6 +394,13 @@ func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.Tr
 	newConnection := transportLayer.IsSYN()
 	if tcp, ok := transportLayer.(*transport.TCPAdapter); ok {
 		newConnection = tcp.SYN && !tcp.ACK
+		if newConnection && ct != nil && flow != nil && flow.hasClientSYN && flow.clientSYNSeq == tcp.Seq {
+			return // A duplicated loopback SYN belongs to the existing TCP flow.
+		}
+	} else if key.Proto == types.TransportProtocolUDP {
+		// QUIC retransmits Initial packets in both directions. They belong to
+		// the existing flow rather than starting a new TCP-style generation.
+		newConnection = newConnection && ct == nil
 	}
 	if newConnection {
 		if ct != nil {
@@ -395,6 +417,8 @@ func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.Tr
 		flow = &tcpConnection{}
 		if tcp, ok := transportLayer.(*transport.TCPAdapter); ok {
 			flow.client.Start(tcp.Seq + 1)
+			flow.clientSYNSeq = tcp.Seq
+			flow.hasClientSYN = true
 		}
 		e.mu.Lock()
 		e.conntrack[baseKey] = ct
@@ -416,6 +440,15 @@ func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.Tr
 			}
 			e.mu.Unlock()
 		}()
+		// Unlike a TCP SYN, a QUIC Initial datagram carries encrypted handshake
+		// data. The decryptor must receive the packet that created the flow.
+		if key.Proto == types.TransportProtocolUDP && len(transportLayer.GetPayload()) > 0 {
+			ct.SetPacketTime(packetTime)
+			if err := ct.FeedClient(transportLayer.GetPayload()); err != nil {
+				e.recordConnectionError(fmt.Errorf("feed QUIC connection %s: %w", ct.GetAddr(), err))
+				_ = ct.Close()
+			}
+		}
 		return
 	}
 	if ct == nil {
@@ -431,7 +464,7 @@ func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.Tr
 		if isReverse {
 			direction = &flow.server
 		}
-		if tcp.SYN {
+		if tcp.SYN && !direction.started {
 			direction.Start(tcp.Seq + 1)
 		}
 		seq := tcp.Seq

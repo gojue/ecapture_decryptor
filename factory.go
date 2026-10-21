@@ -13,9 +13,9 @@ import (
 	"os"
 	"sync"
 
-	"github.com/cfc4n/ecapture_decryptor/crypto"
-	"github.com/cfc4n/ecapture_decryptor/transport"
-	"github.com/cfc4n/ecapture_decryptor/types"
+	"github.com/gojue/ecapture_decryptor/crypto"
+	"github.com/gojue/ecapture_decryptor/transport"
+	"github.com/gojue/ecapture_decryptor/types"
 )
 
 // DecryptorCreator 解密器创建函数类型

@@ -17,6 +17,7 @@ package main
 import "C"
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -25,8 +26,8 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/cfc4n/ecapture_decryptor"
-	"github.com/cfc4n/ecapture_decryptor/types"
+	decryptor "github.com/gojue/ecapture_decryptor"
+	"github.com/gojue/ecapture_decryptor/types"
 )
 
 //export GetVersion
@@ -34,7 +35,9 @@ func GetVersion() *C.char {
 	return C.CString("eCapture Decryptor v1.0.8 - Copyright (c) 2024-2026 CFC4N - Non-Commercial License")
 }
 
-// DecryptPcapToFile decrypts a pcap file using SSL keylog and writes packets to output file
+// DecryptPcapToFile decrypts a capture using an external SSL key log, a pcapng
+// DSB, or both, and writes packets to an output file. An empty or NULL
+// keylogPath uses only secrets embedded in the pcapng file.
 // format: "json" (writes packet data)
 // Returns 0 on success, non-zero on error
 //
@@ -48,17 +51,15 @@ func DecryptPcapToFile(
 	errorBufLen C.int,
 ) C.int {
 	pcapFile := C.GoString(pcapPath)
-	keylogFile := C.GoString(keylogPath)
 	outputFile := C.GoString(outputPath)
 	formatStr := C.GoString(format)
 
-	// Open keylog file
-	keylogFd, err := os.Open(keylogFile)
+	keylogReader, closeKeylog, err := openOptionalKeyLog(keylogPath)
 	if err != nil {
 		writeError(errorBuf, errorBufLen, "Failed to open keylog file: "+err.Error())
 		return 1
 	}
-	defer keylogFd.Close()
+	defer closeKeylog()
 
 	// Open pcap file
 	pcapFd, err := os.Open(pcapFile)
@@ -81,7 +82,7 @@ func DecryptPcapToFile(
 	}()
 
 	// Decrypt
-	err = ecapture_decryptor.DecryptPcapFile(keylogFd, pcapFd, packetChan)
+	err = decryptor.DecryptPcapFile(keylogReader, pcapFd, packetChan)
 	close(packetChan)
 	<-doneChan
 
@@ -302,9 +303,10 @@ func GetLiveTrafficError(handleID C.int, errorBuf *C.char, errorBufLen C.int) C.
 
 // DecryptPcapStreamToFile decrypts pcap data from a stream (e.g., stdin or named pipe)
 // This is useful for piping live capture: tcpdump -i eth0 -w - | your_program
-// keylogPath: path to SSL keylog file
+// keylogPath: path to SSL keylog file, or empty/NULL for pcapng DSB secrets
 // outputPath: path to output JSON file
-// maxPackets: maximum number of packets to process (0 = unlimited)
+// maxPackets: maximum number of decrypted messages to include in output
+// (0 = unlimited); the input stream is consumed through EOF.
 // errorBuf: buffer for error messages
 // Returns: 0 on success, non-zero on error
 //
@@ -316,17 +318,15 @@ func DecryptPcapStreamToFile(
 	errorBuf *C.char,
 	errorBufLen C.int,
 ) C.int {
-	keylogFile := C.GoString(keylogPath)
 	outputFile := C.GoString(outputPath)
 	maxPkts := int(maxPackets)
 
-	// Open keylog file
-	keylogFd, err := os.Open(keylogFile)
+	keylogReader, closeKeylog, err := openOptionalKeyLog(keylogPath)
 	if err != nil {
 		writeError(errorBuf, errorBufLen, "Failed to open keylog file: "+err.Error())
 		return 1
 	}
-	defer keylogFd.Close()
+	defer closeKeylog()
 
 	// Open output file
 	outFd, err := os.Create(outputFile)
@@ -336,30 +336,32 @@ func DecryptPcapStreamToFile(
 	}
 	defer outFd.Close()
 
-	// Use stdin as pcap source
-	pcapReader := bufio.NewReader(os.Stdin)
-
-	// Create packet channel
-	packetChan := make(chan *types.DecryptedPacket, 100)
+	// Use stdin as the capture source. The DSB-only path uses the pcapng
+	// block reader so secrets can arrive after the encrypted packets.
 	packets := make([]*types.DecryptedPacket, 0)
-	doneChan := make(chan struct{})
-
-	go func() {
-		defer close(doneChan)
-		count := 0
-		for packet := range packetChan {
-			packets = append(packets, packet)
-			count++
-			if maxPkts > 0 && count >= maxPkts {
-				break
+	if keylogReader == nil {
+		err = decryptor.DecryptPcapngStream(context.Background(), os.Stdin, func(packet *types.DecryptedPacket) error {
+			if maxPkts <= 0 || len(packets) < maxPkts {
+				packets = append(packets, packet)
 			}
-		}
-	}()
-
-	// Decrypt from stream
-	err = ecapture_decryptor.DecryptLiveTraffic(keylogFd, pcapReader, packetChan)
-	close(packetChan)
-	<-doneChan
+			return nil
+		})
+	} else {
+		pcapReader := bufio.NewReader(os.Stdin)
+		packetChan := make(chan *types.DecryptedPacket, 100)
+		doneChan := make(chan struct{})
+		go func() {
+			defer close(doneChan)
+			for packet := range packetChan {
+				if maxPkts <= 0 || len(packets) < maxPkts {
+					packets = append(packets, packet)
+				}
+			}
+		}()
+		err = decryptor.DecryptLiveTraffic(keylogReader, pcapReader, packetChan)
+		close(packetChan)
+		<-doneChan
+	}
 
 	if err != nil {
 		writeError(errorBuf, errorBufLen, "Decryption failed: "+err.Error())
@@ -382,6 +384,17 @@ func DecryptPcapStreamToFile(
 //export FreeString
 func FreeString(str *C.char) {
 	C.free(unsafe.Pointer(str))
+}
+
+func openOptionalKeyLog(path *C.char) (io.Reader, func(), error) {
+	if path == nil || C.GoString(path) == "" {
+		return nil, func() {}, nil
+	}
+	file, err := os.Open(C.GoString(path))
+	if err != nil {
+		return nil, nil, err
+	}
+	return file, func() { _ = file.Close() }, nil
 }
 
 // Helper function to write error messages to C buffer

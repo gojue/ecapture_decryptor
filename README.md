@@ -1,16 +1,48 @@
 # eCapture Decryptor - TLS/QUIC 流量解密库
 
-一个用于解密 TLS/QUIC 加密流量的 Go 语言库，支持多种应用层协议解析。
+一个使用 SSLKEYLOG 解密 pcapng 中 TLS/QUIC 流量的 Go 语言库。密钥可来自独立的 SSLKEYLOG 文件，也可来自 pcapng 内嵌的 TLS Decryption Secrets Block（DSB）。
+
+仓库名为 `ecapture_decryptor`，Go 模块路径为 `github.com/gojue/ecapture_decryptor`；根包、C 库文件和发布压缩包沿用 `ecapture_decryptor`。
 
 ## ✨ 特性
 
-- 🔓 **解密 TLS/QUIC 流量**：使用 SSLKEYLOG 文件解密 HTTPS/QUIC 流量
-- 🌐 **多协议支持**：HTTP/1.1, HTTP/2, HTTP/3, WebSocket
+- 🔓 **解密 TLS/QUIC 流量**：支持外部 SSLKEYLOG 文件和 pcapng 内嵌 DSB
+- 🌐 **多协议支持**：HTTP/1.0、HTTP/1.1、HTTP/2、HTTP/3、WebSocket
 - 📦 **灵活输出**：输出 `DecryptedPacket` 结构，用户可自由处理
 - 🔧 **多种使用方式**：Go 库、静态链接库（.a）、命令行工具
 - 🎯 **职责清晰**：只负责解密和协议解析，不强制输出格式
 
+### QUIC / HTTP/3 输入要求
+
+解密 HTTP/3 需要包含客户端 Initial（其中有 ClientHello）的双向 UDP 抓包，
+以及匹配该连接的 TLS 1.3 SSLKEYLOG。密钥可作为外部文件传入，也可放在
+pcapng 的 DSB 中。解析器按 QUIC 连接、包号和 STREAM 偏移重组数据，再按
+HTTP/3 请求流输出 `http/3` 的 `DecryptedPacket`。
+
+仓库中的 [Linux HTTP/3 抓包](test/fixtures/http3_capture/README.md)由 `tcpdump` 和
+eCapture 实际捕获，分别覆盖回环地址 `127.0.0.1:44433` 与公网域名
+`www.cloudflare.com:443`，可验证外部密钥、内嵌 DSB 和 DSB 文件的流式读取。
+当前端到端测试覆盖 QUIC v1；v2 和 draft-29 的密钥派生已实现，但尚无真实抓包测试。
+HTTP/3 头部解析支持 QPACK 静态表和字面量；使用动态表的连接暂不支持。
+QUIC 密钥更新和连接迁移尚未覆盖。
+
+[Linux HTTP/1.x 与 HTTP/2 抓包](test/fixtures/http_tcp_capture/README.md)覆盖
+HTTP/1.0 关闭连接定界响应、HTTP/1.1 长连接及双向分块传输、HTTP/2 多路复用；
+每个场景都有 tcpdump 外部 SSLKEYLOG 和 eCapture 内嵌 DSB 样本。
+
 ## 🚀 快速开始
+
+### pcapng 文件解密
+
+`DecryptPcapFile` 的 `keylogReader` 可以为 `nil`，此时从 pcapng 的 DSB 读取密钥；传入 SSLKEYLOG 文件读取器时，也会读取 pcapng 中的 DSB。两个来源可以同时使用。
+
+```go
+// 仅使用 pcapng 内嵌的 DSB。
+err := ecapture_decryptor.DecryptPcapFile(nil, pcapngFile, packetChan)
+
+// 使用外部 SSLKEYLOG 文件；pcapng 内若有 DSB 也会一并加载。
+err = ecapture_decryptor.DecryptPcapFile(keylogFile, pcapngFile, packetChan)
+```
 
 ### 增量 pcapng + DSB 解密
 
@@ -35,7 +67,7 @@ eCapture 集成及其源码和二进制分发（含商业使用）适用
 ### 安装
 
 ```bash
-go get github.com/cfc4n/ecapture_decryptor
+go get github.com/gojue/ecapture_decryptor
 ```
 
 ### 基本使用
@@ -47,8 +79,8 @@ import (
     "log"
     "os"
     
-    "github.com/cfc4n/ecapture_decryptor"
-    "github.com/cfc4n/ecapture_decryptor/types"
+    "github.com/gojue/ecapture_decryptor"
+    "github.com/gojue/ecapture_decryptor/types"
 )
 
 func main() {
@@ -84,20 +116,17 @@ func main() {
 ## 📦 构建
 
 ```bash
-# 构建示例程序（Go API，已优化体积）
-make build
+# 构建 Go 命令行示例
+make -C examples/go_demo build
 
 # 构建静态链接库 (.a 文件，供 C/C++ 使用)
-make build-lib
+make build-static
+
+# 构建动态链接库
+make build-shared
 
 # 构建 C 示例程序（使用静态库）
-make build-c-demo
-
-# 构建并使用 UPX 压缩（额外减小 50-60% 体积）
-make build-compressed
-
-# 对比不同优化级别的体积
-make build-compare
+make -C examples/c_demo all
 
 # 清理
 make clean
@@ -105,11 +134,12 @@ make clean
 
 构建产物：
 - `bin/ecapture_decryptor` - 命令行工具（Go）
-- `bin/libecapture_decryptor.a` - 静态链接库
-- `bin/libecapture_decryptor.h` - C 头文件
-- `examples/c_demo/offline_decryption` - C 离线解密示例
-- `examples/c_demo/stream_decryption` - C 流式解密示例
-- `examples/c_demo/live_capture_simple` - C 实时捕获示例
+- `lib/libecapture_decryptor.a` - 静态链接库
+- `lib/libecapture_decryptor.dylib` 或 `.so` - 动态链接库
+- `include/libecapture_decryptor.h` - C 头文件
+- `bin/offline_decryption` - C 离线解密示例
+- `bin/stream_decryption` - C 流式解密示例
+- `bin/live_capture_simple` - C 实时捕获示例
 
 ### 📉 体积优化
 
@@ -120,21 +150,24 @@ make clean
 ## 🎯 命令行使用
 
 ```bash
-# 基本使用 - 输出统计信息
+# 使用外部 SSLKEYLOG 文件
 ./bin/ecapture_decryptor \
-  -pcap traffic.pcap \
+  -pcap traffic.pcapng \
   -sslkeylog sslkey.log \
   -v
 
+# 使用 pcapng 内嵌的 DSB
+./bin/ecapture_decryptor -pcap traffic-with-dsb.pcapng -json output.json
+
 # 保存为 HAR 格式
 ./bin/ecapture_decryptor \
-  -pcap traffic.pcap \
+  -pcap traffic.pcapng \
   -sslkeylog sslkey.log \
   -har output.har
 
 # 保存为 JSON 格式
 ./bin/ecapture_decryptor \
-  -pcap traffic.pcap \
+  -pcap traffic.pcapng \
   -sslkeylog sslkey.log \
   -json output.json
 ```
@@ -201,25 +234,27 @@ func DecryptLiveTraffic(
 
 ## 🔗 C/C++ 静态库使用
 
+`capi/main.go` 是 SDK 的 C ABI 实现，会被编译成库和头文件；`examples/c_demo` 中的程序是该接口的调用示例。
+
 ### 构建静态库
 
 ```bash
-make build-lib
+make build-static
 ```
 
 这将生成：
-- `bin/libecapture_decryptor.a` - 静态库
-- `bin/libecapture_decryptor.h` - C 头文件
+- `lib/libecapture_decryptor.a` - 静态库
+- `include/libecapture_decryptor.h` - C 头文件
 
 ### C API 函数
 
 #### 离线解密
 - `GetVersion()` - 获取库版本
-- `DecryptPcapToFile()` - 解密 pcap 文件到 JSON
+- `DecryptPcapToFile()` - 解密 pcapng 文件到 JSON；keylogPath 传空字符串或 NULL 时使用内嵌 DSB
 - `FreeString()` - 释放 Go 分配的字符串
 
 #### 实时/流式解密
-- `DecryptPcapStreamToFile()` - 从 stdin 解密 pcap 流（可用于管道）
+- `DecryptPcapStreamToFile()` - 从 stdin 解密 pcap/pcapng 流（可用于管道）；不提供 keylogPath 时使用 pcapng DSB
 - `DecryptLiveTrafficToFile()` - 启动实时流量解密（非阻塞）
 - `StopLiveTraffic()` - 停止实时流量解密
 - `GetLiveTrafficError()` - 获取实时会话错误信息
@@ -302,7 +337,7 @@ if (handle > 0) {
 
 ```bash
 # 构建 C 示例程序
-make build-c-demo
+make -C examples/c_demo all
 
 # 运行测试
 cd examples/c_demo
@@ -357,92 +392,83 @@ g++ -o myapp myapp.cpp \
 
 ```mermaid
 flowchart TD
-    A[PCAP 文件/实时流量] --> B[Packet Source<br/>数据包源]
-    B --> C[Connection Tracker<br/>连接跟踪器]
-    
-    C --> D{协议类型}
-    D -->|TCP/TLS| E[TLS Decryptor<br/>TLS 1.2/1.3 解密]
-    D -->|UDP/QUIC| F[QUIC Decryptor<br/>QUIC 解密]
-    
-    G[SSLKEYLOG 文件] --> H[KeyLog Store<br/>密钥存储]
-    H --> E
-    H --> F
-    
-    E --> I[Protocol Parser<br/>协议解析器]
-    F --> I
-    
-    I --> J{应用层协议}
-    J -->|HTTP/1.1| K[HTTP/1.1 Parser]
-    J -->|HTTP/2| L[HTTP/2 Parser]
-    J -->|HTTP/3| M[HTTP/3 Parser]
-    J -->|WebSocket| N[WebSocket Parser]
-    
-    K --> O[DecryptedPacket<br/>解密数据包]
-    L --> O
-    M --> O
-    N --> O
-    
-    O --> P[Output Channel<br/>输出通道]
-    
-    P --> Q{用户处理}
-    Q --> R[HAR 转换器]
-    Q --> S[JSON 输出]
-    Q --> T[自定义处理]
-    
-    style A fill:#e1f5ff
-    style O fill:#fff4e1
-    style P fill:#e8f5e9
-    style H fill:#f3e5f5
+    Pcapng["pcapng 文件或输入流"] --> NgReader["pcapngBlockReader / pcapgo.NgReader"]
+    Pcap["传统 pcap 文件（兼容路径）"] --> PcapReader["pcapgo.Reader"]
+    NgReader -->|DSB| KeyLog["KeyLogStore<br/>SSLKEYLOG 密钥"]
+    External["外部 SSLKEYLOG 文件"] --> KeyLog
+    NgReader -->|网络包| Decoder["gopacket 网络层解析"]
+    PcapReader -->|网络包| Decoder
+    Decoder --> Tracker["连接跟踪与分流"]
+    Tracker -->|TCP| TCP["TCP 流重组"]
+    TCP --> TLS["TLS 记录解密"]
+    Tracker -->|UDP| QUIC["QUIC 包解密与 STREAM 重组"]
+    KeyLog --> TLS
+    KeyLog --> QUIC
+    TLS --> HTTP["HTTP/1.0、HTTP/1.1、HTTP/2<br/>或 WebSocket 解析"]
+    QUIC --> HTTP3["HTTP/3 / QPACK 解析"]
+    HTTP --> Packet["DecryptedPacket"]
+    HTTP3 --> Packet
+    Packet --> Output["Go channel / 流式 emit 回调"]
+    Output --> Custom["调用方自定义处理"]
+    Output --> HAR["examples/go_demo：HAR"]
+    Output --> JSON["示例程序 / C API：JSON"]
+
+    style Pcapng fill:#e1f5ff
+    style Pcap fill:#e1f5ff
+    style KeyLog fill:#f3e5f5
+    style Packet fill:#fff4e1
+    style Output fill:#e8f5e9
 ```
+
+核心 SDK 输出 `DecryptedPacket`；HAR 与 JSON 由调用方或示例程序生成。
+`DecryptPcapFile` 支持传统 pcap 文件，并从外部 SSLKEYLOG 获取密钥。
+`DecryptPcapngStream` 使用输入流中的 DSB，`DecryptLiveTraffic` 接受调用方提供的抓包流。
 
 ### 分层架构
 
 ```mermaid
-graph TB
-    subgraph Application["应用程序层"]
-        APP[Go 应用 / C/C++ 应用]
+flowchart TB
+    GoApp["Go 调用方"] --> GoAPI["Go API：DecryptPcapFile / DecryptWithConfig<br/>DecryptLiveTraffic / DecryptPcapngStream"]
+    CApp["C/C++ 调用方"] --> CAPI["capi/：C ABI"]
+    CAPI --> GoAPI
+
+    subgraph Core["根包：解密流程编排"]
+        Engine["DecryptorEngine / DecryptorFactory<br/>连接跟踪与 TCP 重组"]
+        Capture["pcapgo / gopacket<br/>pcapng 块读取与 DSB 提取"]
     end
-    
-    subgraph API["公开 API 层"]
-        API1[DecryptPcapFile]
-        API2[DecryptLiveTraffic]
-        API3[DecryptWithConfig]
+    subgraph Crypto["crypto/：密钥与密码学"]
+        KeyLog["KeyLogStore"]
+        Cipher["TLS RecordDecryptor / 密码套件配置"]
     end
-    
-    subgraph Protocol["协议解析层 protocol/"]
-        HTTP1[HTTP/1.1 Parser]
-        HTTP2[HTTP/2 Parser]
-        HTTP3[HTTP/3 Parser]
-        WS[WebSocket Parser]
+    subgraph Transport["transport/：传输解密"]
+        TLS["TLSDecryptor"]
+        QUIC["QUICDecryptor"]
     end
-    
-    subgraph Transport["传输层解密 transport/"]
-        TLS[TLS Decryptor<br/>TLS 1.2/1.3]
-        QUIC[QUIC Decryptor]
+    subgraph Protocol["protocol/：应用协议解析"]
+        HTTP["HTTP/1.x / HTTP/2 / WebSocket"]
+        HTTP3["HTTP/3 / QPACK"]
     end
-    
-    subgraph Crypto["密码学层 crypto/"]
-        KeyLog[KeyLog Store<br/>密钥管理]
-        Cipher[Cipher Registry<br/>密码套件]
-        Decrypt[Record Decryptor<br/>记录解密]
-    end
-    
-    subgraph Capture["数据包捕获层"]
-        GoPacket[gopacket<br/>pcap/pcapng 解析]
-    end
-    
-    APP --> API
-    API --> Protocol
-    Protocol --> Transport
-    Transport --> Crypto
-    Crypto --> Capture
-    
-    style Application fill:#e3f2fd
-    style API fill:#f3e5f5
-    style Protocol fill:#e8f5e9
-    style Transport fill:#fff3e0
+    Packet["types/：DecryptedPacket 输出模型"]
+
+    GoAPI --> Engine
+    Engine --> Capture
+    Capture -->|DSB| KeyLog
+    GoAPI -->|外部 SSLKEYLOG，文件或配置 API| KeyLog
+    Engine --> TLS
+    Engine --> QUIC
+    KeyLog --> TLS
+    KeyLog --> QUIC
+    Cipher --> TLS
+    TLS --> HTTP
+    QUIC --> HTTP3
+    HTTP --> Packet
+    HTTP3 --> Packet
+
+    style Core fill:#e3f2fd
     style Crypto fill:#fce4ec
-    style Capture fill:#f1f8e9
+    style Transport fill:#fff3e0
+    style Protocol fill:#e8f5e9
+    style Packet fill:#fff4e1
 ```
 
 ## 📚 文档
@@ -515,7 +541,7 @@ graph TB
 本软件使用 eCapture Decryptor 库
 版权所有 (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com)
 授权用于非商业用途
-https://github.com/cfc4n/ecapture_decryptor
+https://github.com/gojue/ecapture_decryptor
 ```
 
 #### 商业许可 / Commercial License

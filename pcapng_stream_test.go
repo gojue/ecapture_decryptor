@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cfc4n/ecapture_decryptor/types"
+	"github.com/gojue/ecapture_decryptor/types"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
@@ -124,6 +124,7 @@ func TestDecryptPcapngStreamCancellation(t *testing.T) {
 }
 
 func TestDecryptPcapngStreamDSBPlacement(t *testing.T) {
+	const minimumPerDirection = 25 // The fixture has 25 TLS connections with HTTP exchanges.
 	keylog, err := os.ReadFile("test/testdata/all_clients_sslkey.log")
 	if err != nil {
 		t.Fatal(err)
@@ -155,7 +156,6 @@ func TestDecryptPcapngStreamDSBPlacement(t *testing.T) {
 	if len(packets) < 10 {
 		t.Fatal("fixture lacks handshake and application packets")
 	}
-	var baseline int
 	for _, test := range []struct {
 		name      string
 		dsbAfter  int
@@ -199,26 +199,124 @@ func TestDecryptPcapngStreamDSBPlacement(t *testing.T) {
 			// and coverage can make offline replay much slower on shared CI runners.
 			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 			defer cancel()
-			count := 0
+			var requests, responses int
 			// Block fragmentation is covered by TestPcapngBlockReaderObservesLateDSBAfterLastPacket.
 			// This fixture contains multi-megabyte HTTP bodies; forcing three-byte reads
 			// makes the race and coverage build spend its deadline in the test reader.
 			err = DecryptPcapngStream(ctx, io.NopCloser(bytes.NewReader(encoded.Bytes())), func(packet *types.DecryptedPacket) error {
-				if packet.Direction == "request" || packet.Direction == "response" {
-					count++
+				if len(packet.Data) == 0 {
+					return nil
+				}
+				switch packet.Direction {
+				case "request":
+					requests++
+				case "response":
+					responses++
 				}
 				return nil
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			if count == 0 {
-				t.Fatal("DSB placement produced no decrypted HTTP messages")
+			if requests < minimumPerDirection || responses < minimumPerDirection {
+				t.Fatalf("DSB placement decrypted %d requests and %d responses; expected at least %d of each", requests, responses, minimumPerDirection)
 			}
-			if baseline == 0 {
-				baseline = count
-			} else if count != baseline {
-				t.Fatalf("message count %d differs from baseline %d", count, baseline)
+		})
+	}
+}
+
+func TestDecryptPcapFileKeyLogSources(t *testing.T) {
+	const minimumPerDirection = 25 // The fixture has 25 TLS connections with HTTP exchanges.
+	keylog, err := os.ReadFile("test/testdata/all_clients_sslkey.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name        string
+		includeDSB  bool
+		externalLog bool
+	}{
+		{name: "external_keylog", externalLog: true},
+		{name: "embedded_dsb", includeDSB: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			capture, err := os.Open("test/testdata/all_clients.pcap")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer capture.Close()
+			pcap, err := pcapgo.NewReader(capture)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := t.TempDir() + "/capture.pcapng"
+			output, err := os.Create(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writer, err := pcapgo.NewNgWriter(output, pcap.LinkType())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for {
+				packet, info, readErr := pcap.ReadPacketData()
+				if readErr == io.EOF {
+					break
+				}
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				if err := writer.WritePacket(info, packet); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.includeDSB {
+				if err := writer.WriteDecryptionSecretsBlock(pcapgo.DSB_SECRETS_TYPE_TLS, keylog); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := writer.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			if err := output.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			input, err := os.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer input.Close()
+			var external io.Reader
+			if test.externalLog {
+				external = bytes.NewReader(keylog)
+			}
+			packets := make(chan *types.DecryptedPacket, 256)
+			type messageCounts struct{ requests, responses int }
+			countDone := make(chan messageCounts, 1)
+			go func() {
+				var counts messageCounts
+				for packet := range packets {
+					if len(packet.Data) == 0 {
+						continue
+					}
+					switch packet.Direction {
+					case "request":
+						counts.requests++
+					case "response":
+						counts.responses++
+					}
+				}
+				countDone <- counts
+			}()
+			err = DecryptPcapFile(external, input, packets)
+			close(packets)
+			if err != nil {
+				t.Fatal(err)
+			}
+			counts := <-countDone
+			if counts.requests < minimumPerDirection || counts.responses < minimumPerDirection {
+				t.Fatalf("decrypted %d requests and %d responses; expected at least %d of each", counts.requests, counts.responses, minimumPerDirection)
 			}
 		})
 	}

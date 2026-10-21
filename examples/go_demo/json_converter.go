@@ -11,7 +11,7 @@ import (
 	"encoding/json"
 	"os"
 
-	"github.com/cfc4n/ecapture_decryptor/types"
+	"github.com/gojue/ecapture_decryptor/types"
 )
 
 // saveAsJSON 将解密的包保存为 JSON 格式

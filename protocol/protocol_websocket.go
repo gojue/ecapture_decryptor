@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cfc4n/ecapture_decryptor/types"
+	"github.com/gojue/ecapture_decryptor/types"
 )
 
 // WebSocket 操作码

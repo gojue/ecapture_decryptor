@@ -81,7 +81,7 @@ and exception notices. Standalone SDK uses remain governed by the terms below.
 This software uses the ecapture_decryptor library
 Copyright (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com)
 Licensed for Non-Commercial Use
-https://github.com/cfc4n/ecapture_decryptor
+https://github.com/gojue/ecapture_decryptor
 ```
 
 中文版本：
@@ -90,7 +90,7 @@ https://github.com/cfc4n/ecapture_decryptor
 本软件使用 ecapture_decryptor 库
 版权所有 (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com)
 授权用于非商业用途
-https://github.com/cfc4n/ecapture_decryptor
+https://github.com/gojue/ecapture_decryptor
 ```
 
 ---
@@ -147,7 +147,7 @@ https://github.com/cfc4n/ecapture_decryptor
 ## Questions? / 有疑问？
 
 - 📖 阅读完整许可证：[LICENSE](LICENSE) | [LICENSE-BINARY](LICENSE-BINARY)
-- 💬 提交 Issue：https://github.com/cfc4n/ecapture_decryptor/issues
+- 💬 提交 Issue：https://github.com/gojue/ecapture_decryptor/issues
 - ✉️ 联系作者：cfc4n.cs@gmail.com
 
 ---

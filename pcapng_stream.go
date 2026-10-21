@@ -12,8 +12,8 @@ import (
 	"log"
 	"sync"
 
-	"github.com/cfc4n/ecapture_decryptor/crypto"
-	"github.com/cfc4n/ecapture_decryptor/types"
+	"github.com/gojue/ecapture_decryptor/crypto"
+	"github.com/gojue/ecapture_decryptor/types"
 )
 
 const maxPcapngBlock = 16 << 20

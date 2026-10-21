@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cfc4n/ecapture_decryptor/types"
+	"github.com/gojue/ecapture_decryptor/types"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )

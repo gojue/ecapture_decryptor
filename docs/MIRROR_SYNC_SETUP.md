@@ -117,6 +117,6 @@ MIRROR_REPO_TOKEN = ghp_xxxxxxxxxxxxxxxxxxxx
 ```
 
 With this configuration, when you release `v1.2.3`:
-- Main repo: `https://github.com/cfc4n/ecapture_decryptor/releases/tag/v1.2.3`
+- Main repo: `https://github.com/gojue/ecapture_decryptor/releases/tag/v1.2.3`
 - Mirror repo: `https://github.com/example-org/ecapture_decryptor_releases/releases/tag/v1.2.3`
 

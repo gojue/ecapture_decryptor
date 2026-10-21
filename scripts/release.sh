@@ -13,6 +13,7 @@ NC='\033[0m' # No Color
 
 # Configuration
 PROJECT_NAME="ecapture_decryptor"
+REPOSITORY="gojue/ecapture_decryptor"
 AUTHOR="CFC4N"
 RELEASE_DIR="./dist"
 
@@ -187,13 +188,13 @@ For commercial use, contact: cfc4n.cs@gmail.com
 
 ## Documentation
 
-- Full documentation: https://github.com/cfc4n/${PROJECT_NAME}
+- Full documentation: https://github.com/${REPOSITORY}
 - API reference: See \`include/libecapture_decryptor.h\`
-- Examples: https://github.com/cfc4n/${PROJECT_NAME}/tree/master/examples
+- Examples: https://github.com/${REPOSITORY}/tree/master/examples
 
 ## Support
 
-- Issues: https://github.com/cfc4n/${PROJECT_NAME}/issues
+- Issues: https://github.com/${REPOSITORY}/issues
 - Email: cfc4n.cs@gmail.com
 EOF
 #

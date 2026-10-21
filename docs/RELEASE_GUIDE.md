@@ -100,7 +100,7 @@ gh release create v2.1.0 \
 
 #### 手动上传
 
-1. 访问 https://github.com/cfc4n/ecapture_decryptor/releases/new
+1. 访问 https://github.com/gojue/ecapture_decryptor/releases/new
 2. 填写版本标签：`v2.1.0`
 3. 填写标题：`ecapture_decryptor v2.1.0`
 4. 添加 Release Notes
@@ -298,7 +298,7 @@ ln -s libecapture_decryptor.so.2 libecapture_decryptor.so
 
 ```bash
 # 使用 GitHub API 获取下载统计
-gh api repos/cfc4n/ecapture_decryptor/releases/latest
+gh api repos/gojue/ecapture_decryptor/releases/latest
 ```
 
 ---
@@ -335,7 +335,7 @@ gh release upload v1.1.0 dist/ecapture_decryptor-v1.1.0-darwin-arm64.tar.gz --cl
 
 发布相关问题请联系：
 - Email: cfc4n.cs@gmail.com
-- Issues: https://github.com/cfc4n/ecapture_decryptor/issues
+- Issues: https://github.com/gojue/ecapture_decryptor/issues
 
 ---
 

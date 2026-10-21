@@ -231,7 +231,7 @@ tar -czf ecapture_decryptor-v1.1.0-darwin-arm64.tar.gz ...
 ## 📞 获取帮助
 
 - 📖 完整文档: [RELEASE_GUIDE.md](RELEASE_GUIDE.md)
-- 🐛 报告问题: https://github.com/cfc4n/ecapture_decryptor/issues
+- 🐛 报告问题: https://github.com/gojue/ecapture_decryptor/issues
 - ✉️ 联系作者: cfc4n.cs@gmail.com
 
 ---

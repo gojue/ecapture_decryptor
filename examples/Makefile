@@ -1,7 +1,7 @@
 # Makefile for Examples
 # Builds and tests all demo programs
 
-.PHONY: all build test clean help build-go-demo build-c-demo build-go-static-demo test-go-demo test-c-demo test-go-static-demo
+.PHONY: all build test test-e2e clean help build-go-demo build-c-demo build-go-static-demo test-go-demo test-c-demo test-go-static-demo
 
 all: build
 
@@ -24,8 +24,11 @@ build-go-static-demo:
 	@cd go_static_demo && $(MAKE) build
 	@echo ""
 
-# Test all demos
-test: test-go-demo test-c-demo test-go-static-demo
+# Build and run every demo against real pcapng fixtures, checking JSON/HAR.
+test: test-e2e
+
+test-e2e:
+	python3 test_e2e.py
 
 # Test individual demos
 test-go-demo:
@@ -60,6 +63,7 @@ help:
 	@echo "  build-c-demo        - Build C demo only"
 	@echo "  build-go-static-demo - Build Go static demo only"
 	@echo "  test                - Test all demos"
+	@echo "  test-e2e            - Build and test all demos with real pcapng fixtures"
 	@echo "  test-go-demo        - Test Go demo only"
 	@echo "  test-c-demo         - Test C demo only"
 	@echo "  test-go-static-demo - Test Go static demo only"

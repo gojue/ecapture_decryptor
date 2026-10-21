@@ -10,15 +10,21 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
-	"github.com/cfc4n/ecapture_decryptor/types"
+	"github.com/gojue/ecapture_decryptor/types"
 )
 
 // saveAsHAR 将解密的包保存为 HAR 格式
@@ -68,29 +74,51 @@ type HTTPPair struct {
 
 // pairHTTPPackets 将请求和响应配对
 func pairHTTPPackets(packets []*types.DecryptedPacket) []HTTPPair {
-	pairs := make([]HTTPPair, 0)
-	pendingRequests := make(map[string]*types.DecryptedPacket)
+	type exchangeGroup struct {
+		requests  []*types.DecryptedPacket
+		responses []*types.DecryptedPacket
+	}
+	groups := make(map[string]*exchangeGroup)
+	var groupOrder []string
 
 	for _, pkt := range packets {
-		// 只处理 HTTP 协议
 		if !strings.HasPrefix(pkt.Protocol, "http") {
 			continue
 		}
-
-		connID := pkt.ConnectionID()
+		// HTTP/2 and HTTP/3 may complete streams out of order. HTTP/1.x
+		// responses follow request order within a connection, even when a
+		// server replies with a different minor HTTP version.
+		protocolKey := pkt.Protocol
+		if strings.HasPrefix(protocolKey, "http/1.") {
+			protocolKey = "http/1.x"
+		}
+		key := pkt.ConnectionID() + "/" + protocolKey
+		if pkt.Protocol == "http/2" || pkt.Protocol == "http/3" {
+			if streamID, ok := pkt.Metadata["stream_id"]; ok {
+				key = fmt.Sprintf("%s/stream/%v", key, streamID)
+			}
+		}
+		group := groups[key]
+		if group == nil {
+			group = &exchangeGroup{}
+			groups[key] = group
+			groupOrder = append(groupOrder, key)
+		}
 		switch pkt.Direction {
 		case "request":
-			// 保存请求，等待响应
-			pendingRequests[connID] = pkt
+			group.requests = append(group.requests, pkt)
 		case "response":
-			// 找到对应的请求
-			if req, ok := pendingRequests[connID]; ok {
-				pairs = append(pairs, HTTPPair{
-					Request:  req,
-					Response: pkt,
-				})
-				delete(pendingRequests, connID)
-			}
+			group.responses = append(group.responses, pkt)
+		}
+	}
+	pairs := make([]HTTPPair, 0)
+	for _, key := range groupOrder {
+		group := groups[key]
+		for index := 0; index < len(group.requests) && index < len(group.responses); index++ {
+			pairs = append(pairs, HTTPPair{
+				Request:  group.requests[index],
+				Response: group.responses[index],
+			})
 		}
 	}
 
@@ -119,6 +147,7 @@ func convertToHAREntry(pair HTTPPair) (HAREntry, error) {
 	defer func() { _ = httpResp.Body.Close() }()
 
 	respBody, _ := io.ReadAll(httpResp.Body)
+	content := harResponseContent(respBody, httpResp.Header)
 
 	// 构建 HAR Entry
 	duration := resp.Timestamp.Sub(req.Timestamp).Milliseconds()
@@ -150,12 +179,17 @@ func convertToHAREntry(pair HTTPPair) (HAREntry, error) {
 
 	// 构建 URL
 	fullURL := httpReq.URL.String()
-	if !strings.HasPrefix(fullURL, "http") {
-		scheme := "https"
-		if httpReq.TLS == nil {
-			scheme = "http"
+	if !httpReq.URL.IsAbs() {
+		authority := httpReq.Host
+		if authority == "" {
+			authority, _ = req.Metadata["authority"].(string)
 		}
-		fullURL = fmt.Sprintf("%s://%s%s", scheme, httpReq.Host, httpReq.URL.String())
+		if authority == "" {
+			authority = net.JoinHostPort(req.DstIP, strconv.Itoa(int(req.DstPort)))
+		}
+		// Captured packets are decrypted TLS/QUIC traffic. ReadRequest sees
+		// synthetic HTTP bytes, so httpReq.TLS cannot indicate the scheme.
+		fullURL = "https://" + authority + httpReq.URL.RequestURI()
 	}
 
 	entry := HAREntry{
@@ -177,11 +211,7 @@ func convertToHAREntry(pair HTTPPair) (HAREntry, error) {
 			HTTPVersion: httpResp.Proto,
 			Cookies:     []HARCookie{},
 			Headers:     respHeaders,
-			Content: HARContent{
-				Size:     len(respBody),
-				MimeType: httpResp.Header.Get("Content-Type"),
-				Text:     string(respBody),
-			},
+			Content:     content,
 			RedirectURL: "",
 			HeadersSize: -1,
 			BodySize:    len(respBody),
@@ -208,4 +238,65 @@ func convertToHAREntry(pair HTTPPair) (HAREntry, error) {
 	}
 
 	return entry, nil
+}
+
+// harResponseContent decodes HTTP content coding for readable text. HAR's
+// bodySize still records the encoded size sent on the wire. Binary or unknown
+// encodings are base64 encoded so JSON serialization cannot lose bytes.
+func harResponseContent(body []byte, header http.Header) HARContent {
+	content := HARContent{Size: len(body), MimeType: header.Get("Content-Type")}
+	decoded := body
+	switch strings.ToLower(strings.TrimSpace(header.Get("Content-Encoding"))) {
+	case "", "identity":
+	case "gzip", "x-gzip":
+		reader, err := gzip.NewReader(bytes.NewReader(body))
+		if err == nil {
+			decoded, err = io.ReadAll(reader)
+			_ = reader.Close()
+		}
+		if err != nil {
+			content.Text = base64.StdEncoding.EncodeToString(body)
+			content.Encoding = "base64"
+			return content
+		}
+		content.Size = len(decoded)
+		content.Compression = len(decoded) - len(body)
+	default:
+		content.Text = base64.StdEncoding.EncodeToString(body)
+		content.Encoding = "base64"
+		return content
+	}
+
+	textual := isTextualMediaType(content.MimeType)
+	if !textual && utf8.Valid(decoded) {
+		// Some servers send both a generic and a specific Content-Type.
+		// Keep all original headers in the HAR, but select the text type
+		// for content when the decoded bytes are valid UTF-8.
+		for _, candidate := range header.Values("Content-Type") {
+			if isTextualMediaType(candidate) {
+				content.MimeType = candidate
+				textual = true
+				break
+			}
+		}
+	}
+	if textual && utf8.Valid(decoded) {
+		content.Text = string(decoded)
+	} else {
+		content.Text = base64.StdEncoding.EncodeToString(decoded)
+		content.Encoding = "base64"
+	}
+	return content
+}
+
+func isTextualMediaType(value string) bool {
+	mediaType, _, err := mime.ParseMediaType(value)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(mediaType, "text/") ||
+		mediaType == "application/json" || strings.HasSuffix(mediaType, "+json") ||
+		mediaType == "application/xml" || strings.HasSuffix(mediaType, "+xml") ||
+		mediaType == "application/javascript" || mediaType == "application/x-javascript" ||
+		mediaType == "image/svg+xml"
 }

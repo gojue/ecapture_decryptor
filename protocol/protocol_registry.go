@@ -10,7 +10,7 @@ package protocol
 import (
 	"sync"
 
-	"github.com/cfc4n/ecapture_decryptor/types"
+	"github.com/gojue/ecapture_decryptor/types"
 )
 
 // protocolRegistry 全局协议注册表

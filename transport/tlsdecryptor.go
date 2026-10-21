@@ -19,9 +19,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cfc4n/ecapture_decryptor/crypto"
-	"github.com/cfc4n/ecapture_decryptor/protocol"
-	"github.com/cfc4n/ecapture_decryptor/types"
+	"github.com/gojue/ecapture_decryptor/crypto"
+	"github.com/gojue/ecapture_decryptor/protocol"
+	"github.com/gojue/ecapture_decryptor/types"
 )
 
 // DecryptedData represents decrypted application data with direction
@@ -83,7 +83,8 @@ type TLSDecryptor struct {
 	// Protocol detection
 	protocolDetected bool
 	sniffBuffer      []byte
-	protocolMu       sync.RWMutex                // Protects parser and protocolDetected
+	pendingResponses [][]byte
+	protocolMu       sync.RWMutex                // Serializes parser feeds and protects detection state.
 	packetChan       chan *types.DecryptedPacket // 解密包输出通道
 
 	// Packet timestamp from pcap
@@ -126,30 +127,27 @@ func (td *TLSDecryptor) queueRequest(data []byte) {
 		return
 	}
 
-	// Detect protocol on first data
-	td.protocolMu.RLock()
-	detected := td.protocolDetected
-	td.protocolMu.RUnlock()
-
-	if !detected && td.packetChan != nil {
+	td.protocolMu.Lock()
+	if !td.protocolDetected && td.packetChan != nil {
 		td.sniffBuffer = append(td.sniffBuffer, data...)
 		preface := []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
 		if len(td.sniffBuffer) < 4 || (len(td.sniffBuffer) < len(preface) && bytes.HasPrefix(preface, td.sniffBuffer)) {
+			td.protocolMu.Unlock()
 			return
 		}
 		data = td.sniffBuffer
 		td.sniffBuffer = nil
-		td.detectProtocol(data)
+		td.detectProtocolLocked(data)
 	}
 
-	// Feed data to parser for HAR output
-	td.protocolMu.RLock()
-	parser := td.parser
-	td.protocolMu.RUnlock()
-
-	if parser != nil {
-		parser.FeedRequest(data)
+	if td.parser != nil {
+		td.parser.FeedRequest(data)
+		for _, response := range td.pendingResponses {
+			td.parser.FeedResponse(response)
+		}
+		td.pendingResponses = nil
 	}
+	td.protocolMu.Unlock()
 
 	td.queueMu.Lock()
 	defer td.queueMu.Unlock()
@@ -172,14 +170,15 @@ func (td *TLSDecryptor) queueResponse(data []byte) {
 		return
 	}
 
-	// Feed data to parser for HAR output
-	td.protocolMu.RLock()
-	parser := td.parser
-	td.protocolMu.RUnlock()
-
-	if parser != nil {
-		parser.FeedResponse(data)
+	td.protocolMu.Lock()
+	if td.parser != nil {
+		td.parser.FeedResponse(data)
+	} else if !td.protocolDetected && td.packetChan != nil {
+		// Decryption can finish on the server side before the client request
+		// selects a protocol parser. Preserve these bytes in record order.
+		td.pendingResponses = append(td.pendingResponses, bytes.Clone(data))
 	}
+	td.protocolMu.Unlock()
 
 	td.queueMu.Lock()
 	defer td.queueMu.Unlock()
@@ -552,6 +551,11 @@ func (td *TLSDecryptor) Decrypt() error {
 	td.protocolMu.RLock()
 	parser := td.parser
 	td.protocolMu.RUnlock()
+	// Close can run before this goroutine finishes draining queued TLS records.
+	// Flush again after the drain so close-delimited HTTP/1.0 bodies are emitted.
+	if parser != nil {
+		parser.Flush()
+	}
 	if errorParser, ok := parser.(interface{ Err() error }); ok {
 		return errorParser.Err()
 	}
@@ -697,11 +701,7 @@ func (td *TLSDecryptor) parseHandshake() error {
 }
 
 // detectProtocol detects the application layer protocol (HTTP/1.x, HTTP/2, or WebSocket)
-func (td *TLSDecryptor) detectProtocol(data []byte) {
-	td.protocolMu.Lock()
-	defer td.protocolMu.Unlock()
-
-	// Double-check after acquiring lock
+func (td *TLSDecryptor) detectProtocolLocked(data []byte) {
 	if td.protocolDetected {
 		return
 	}

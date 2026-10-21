@@ -30,7 +30,7 @@ duplicate symbol '__cgo_panic'
 
 ### 本示例的实现方式
 
-本示例直接使用 Go API (`github.com/cfc4n/ecapture_decryptor`)，这样：
+本示例直接使用 Go API (`github.com/gojue/ecapture_decryptor`)，这样：
 1. ✅ 避免了 CGO 符号冲突问题
 2. ✅ 提供与 C demo 完全相同的命令行接口和行为
 3. ✅ 性能更好（无 CGO 调用开销）
@@ -62,7 +62,7 @@ make build
 或者从项目根目录：
 
 ```bash
-make build-go-static-demo
+make -C examples/go_static_demo build
 ```
 
 生成的二进制文件：`bin/go_static_decryptor`
@@ -72,13 +72,13 @@ make build-go-static-demo
 ### 基本用法
 
 ```bash
-./bin/go_static_decryptor -pcap <pcap文件> -keylog <keylog文件> [-output <输出文件>]
+./bin/go_static_decryptor -pcap <pcapng文件> [-keylog <keylog文件>] [-output <输出文件>]
 ```
 
 ### 参数说明
 
 - `-pcap` : pcap 文件路径（必需）
-- `-keylog` : SSL keylog 文件路径（必需）
+- `-keylog` : 外部 SSL keylog 文件路径（可选；省略时使用 pcapng 内嵌 DSB）
 - `-output` : 输出 JSON 文件路径（可选，默认：output.json）
 - `-format` : 输出格式（目前只支持 json）
 - `-version` : 显示库版本信息
@@ -98,6 +98,12 @@ make build-go-static-demo
 
 ```bash
 ./bin/go_static_decryptor -version
+```
+
+#### 使用 pcapng 内嵌 DSB
+
+```bash
+./bin/go_static_decryptor -pcap traffic-with-dsb.pcapng -output result.json
 ```
 
 #### 3. 使用 Makefile 测试
@@ -122,7 +128,7 @@ pcapFd, _ := os.Open(pcapFile)
 packetChan := make(chan *types.DecryptedPacket, 100)
 
 // 解密
-err := ecapture_decryptor.DecryptPcapFile(keylogFd, pcapFd, packetChan)
+err := decryptor.DecryptPcapFile(keylogFd, pcapFd, packetChan)
 
 // 收集结果并写入 JSON
 ```
@@ -131,7 +137,7 @@ err := ecapture_decryptor.DecryptPcapFile(keylogFd, pcapFd, packetChan)
 
 提供与 C demo 一致的命令行接口：
 - `-pcap`: pcap 文件路径
-- `-keylog`: SSL keylog 文件路径  
+- `-keylog`: 可选的外部 SSL keylog 文件路径
 - `-output`: 输出文件路径
 - `-version`: 显示版本
 
@@ -155,12 +161,12 @@ err := ecapture_decryptor.DecryptPcapFile(keylogFd, pcapFd, packetChan)
 ### 找不到 Go 模块
 
 ```
-cannot find package "github.com/cfc4n/ecapture_decryptor"
+cannot find package "github.com/gojue/ecapture_decryptor"
 ```
 
 **解决方案**：确保在项目根目录下，Go 模块已初始化
 ```bash
-cd /Users/cfc4n/Project/github/ecapture_decryptor
+cd /path/to/ecapture_decryptor
 go mod download
 ```
 

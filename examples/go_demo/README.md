@@ -13,6 +13,7 @@ This demo program showcases the decryption of TLS/SSL traffic from pcap files us
   - HAR (HTTP Archive format)
   - JSON (custom format)
 - TLS/SSL key log file support
+- pcapng DSB support without a separate key log file
 - Support for HTTP/1.1, HTTP/2, HTTP/3, and WebSocket protocols
 
 ## Building
@@ -20,7 +21,7 @@ This demo program showcases the decryption of TLS/SSL traffic from pcap files us
 From the project root directory:
 
 ```bash
-make build
+make -C examples/go_demo build
 ```
 
 This will build the binary: `bin/ecapture_decryptor`
@@ -39,6 +40,12 @@ This will build the binary: `bin/ecapture_decryptor`
 ./bin/ecapture_decryptor -pcap <pcap_file> -sslkeylog <keylog_file> -json <output.json>
 ```
 
+### pcapng with embedded DSB
+
+```bash
+./bin/ecapture_decryptor -pcap <pcapng_with_dsb> -json <output.json>
+```
+
 ### Example with Test Data
 
 ```bash
@@ -53,11 +60,11 @@ This will build the binary: `bin/ecapture_decryptor`
 | Option | Description | Required |
 |--------|-------------|----------|
 | `-pcap` | Input pcap file path | Yes |
-| `-sslkeylog` | SSL/TLS keylog file path | Yes |
+| `-sslkeylog` | External SSL/TLS keylog file path; omit for pcapng with DSB | No |
 | `-har` | Output HAR file path | Optional* |
 | `-json` | Output JSON file path | Optional* |
 
-*At least one output format (-har or -json) must be specified.
+If neither output option is specified, the program prints decryption statistics.
 
 ## Files
 
@@ -71,7 +78,7 @@ This will build the binary: `bin/ecapture_decryptor`
 ```
 main.go
   ↓
-api.NewDecryptor()
+decryptor.DecryptPcapFile(keylogReader, pcapFile, packets)
   ↓
 Parse pcap + Decrypt TLS/SSL
   ↓
@@ -84,35 +91,16 @@ Output Converters
 
 ## API Usage Example
 
-```go
-import "github.com/cfc4n/ecapture_decryptor"
-
-// Create decryptor
-decryptor, err := api.NewDecryptor(pcapFile, sslKeylogFile)
-if err != nil {
-    log.Fatal(err)
-}
-defer decryptor.Close()
-
-// Decrypt and get packets
-packets, err := decryptor.DecryptAll()
-if err != nil {
-    log.Fatal(err)
-}
-
-// Convert to HAR format
-har := ConvertToHAR(packets)
-
-// Save to file
-saveHAR(har, outputFile)
-```
+See [main.go](main.go) for the complete call to
+`decryptor.DecryptPcapFile(keylogReader, pcapFile, packetChan)` and the
+JSON/HAR output handling.
 
 ## Testing
 
 Run the test with example data:
 
 ```bash
-make test
+make -C examples test
 ```
 
 Or manually:

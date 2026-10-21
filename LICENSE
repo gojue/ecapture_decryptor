@@ -124,7 +124,7 @@ When using the binary libraries, you **MUST**:
    ```
    This application uses ecapture_decryptor library
    Copyright (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com)
-   https://github.com/cfc4n/ecapture_decryptor
+   https://github.com/gojue/ecapture_decryptor
    ```
 3. Provide a link to the original project repository
 
@@ -159,7 +159,7 @@ When using the binary libraries, you **MUST**:
    ```
    本应用程序使用 ecapture_decryptor 库
    版权所有 (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com)
-   https://github.com/cfc4n/ecapture_decryptor
+   https://github.com/gojue/ecapture_decryptor
    ```
 3. 提供指向原始项目仓库的链接
 
@@ -184,7 +184,7 @@ For licensing inquiries, commercial use permissions, or other questions:
 
 - **Author / 作者**: CFC4N
 - **Email / 邮箱**: cfc4n.cs@gmail.com
-- **GitHub**: https://github.com/cfc4n/ecapture_decryptor
+- **GitHub**: https://github.com/gojue/ecapture_decryptor
 
 ---
 

@@ -5,7 +5,7 @@
 ## 📦 包结构
 
 ```
-github.com/cfc4n/ecapture_decryptor
+github.com/gojue/ecapture_decryptor
 ├── /                          # 主包 - 公开API
 ├── /types                     # 类型定义
 ├── /crypto                    # 加密/解密模块（内部）
@@ -32,7 +32,7 @@ func DecryptPcapFile(
 ```
 
 **参数：**
-- `keylogReader`: SSLKEYLOG 文件的读取器
+- `keylogReader`: 可选的外部 SSLKEYLOG 文件读取器；传入 `nil` 时使用 pcapng 内嵌 DSB。提供读取器时也会加载 DSB。
 - `pcapFileHandle`: PCAP/PCAPNG 文件的读取器
 - `packetChan`: 输出通道，接收解密后的数据包
 
