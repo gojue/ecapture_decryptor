@@ -1,9 +1,9 @@
 # v1.1.0 (2026-10-19)
 
 ## What's Changed
-* decryptor: stream pcapng secrets into complete HTTP/1.1 and HTTP/2 messages, including late DSBs, with replay tests and eCapture license updates by @cfc4n in https://github.com/cfc4n/ecapture_decryptor/pull/1
+* decryptor: stream pcapng secrets into complete HTTP/1.1 and HTTP/2 messages, including late DSBs, with replay tests and eCapture license updates by @cfc4n in https://github.com/gojue/ecapture_decryptor/pull/1
 
-**Full Changelog**: https://github.com/cfc4n/ecapture_decryptor/compare/v1.0.0...a72fe584c4917b54216b25344d4200331a026068
+**Full Changelog**: https://github.com/gojue/ecapture_decryptor/compare/v1.0.0...a72fe584c4917b54216b25344d4200331a026068
 
 <hr>
 
@@ -16,6 +16,6 @@
 * Use C APIs for offline pcap files and pcap data from standard input; build static (`.a`) and shared (`.so`/`.dylib`) libraries with a C header.
 * Run Go and C examples for decryption and export parsed traffic from the Go demo as JSON or HAR.
 
-**Full Changelog**: https://github.com/cfc4n/ecapture_decryptor/commits/v1.0.0/
+**Full Changelog**: https://github.com/gojue/ecapture_decryptor/commits/v1.0.0/
 
 <hr>

@@ -23,7 +23,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26'
 
       - name: Cache Go modules
         uses: actions/cache@v4
@@ -70,7 +70,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
-        go-version: ['1.24']
+        go-version: ['1.26']
 
     steps:
       - name: Checkout code
@@ -126,7 +126,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26'
 
       - name: Cache Go modules
         uses: actions/cache@v4
@@ -200,7 +200,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: '1.26'
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
@@ -235,6 +235,9 @@ jobs:
           echo "Built binaries:"
           ls -lh bin/ 2>/dev/null || echo "No binaries in bin/ directory"
 
+      - name: Run example end-to-end tests
+        run: make -C examples test
+
   all-checks-passed:
     name: All Checks Passed
     needs: [lint-and-format, test, build, build-examples]
@@ -247,5 +250,5 @@ jobs:
           echo "- Linting: ✓"
           echo "- Unit tests: ✓"
           echo "- Build test: ✓"
-          echo "- Example builds: ✓"
+          echo "- Example builds and end-to-end tests: ✓"
 

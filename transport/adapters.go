@@ -8,6 +8,7 @@
 package transport
 
 import (
+	"encoding/binary"
 	"net"
 
 	"github.com/google/gopacket/layers"
@@ -58,12 +59,19 @@ func IsQUICInitialPacket(payload []byte) bool {
 	if len(payload) < 5 {
 		return false
 	}
-	// QUIC long header: first bit is 1, second bit is 1 for long header
-	// Initial packet type: 0x00 in bits 4-5
+	// The fixed bit may be greased (RFC 9287); only the header-form bit is
+	// required here. QUIC v2 assigns a different type value to Initial.
 	headerByte := payload[0]
 	isLongHeader := (headerByte & 0x80) != 0
 	packetType := (headerByte & 0x30) >> 4
-	return isLongHeader && packetType == 0x00
+	version := binary.BigEndian.Uint32(payload[1:5])
+	if !isLongHeader || version == 0 {
+		return false
+	}
+	if version == 0x6b3343cf { // QUIC v2, RFC 9369
+		return packetType == 0x01
+	}
+	return packetType == 0x00
 }
 
 // IPv4Adapter 适配 IPv4 层

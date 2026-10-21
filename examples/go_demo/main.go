@@ -9,33 +9,38 @@ package main
 
 import (
 	"flag"
+	"io"
 	"log"
 	"os"
 
-	"github.com/cfc4n/ecapture_decryptor"
-	"github.com/cfc4n/ecapture_decryptor/types"
+	decryptor "github.com/gojue/ecapture_decryptor"
+	"github.com/gojue/ecapture_decryptor/types"
 )
 
 func main() {
 	pcapfile := flag.String("pcap", "", "pcap file")
-	sslkeylog := flag.String("sslkeylog", "", "sslkeylog file")
+	sslkeylog := flag.String("sslkeylog", "", "SSL keylog file (optional for pcapng with DSB)")
 	harOutput := flag.String("har", "", "output HAR file path (optional)")
 	jsonOutput := flag.String("json", "", "output JSON file path (optional)")
 	verbose := flag.Bool("v", false, "verbose")
 	flag.Parse()
 
-	if *pcapfile == "" || *sslkeylog == "" {
-		log.Println("Usage: ecapture_decryptor -pcap <file> -sslkeylog <file> [-har <output>] [-json <output>] [-v]")
+	if *pcapfile == "" {
+		log.Println("Usage: ecapture_decryptor -pcap <file> [-sslkeylog <file>] [-har <output>] [-json <output>] [-v]")
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	// 打开 SSL keylog 文件
-	keylogFile, err := os.Open(*sslkeylog)
-	if err != nil {
-		log.Fatalf("Failed to open sslkeylog file: %v", err)
+	// 有外部 SSLKEYLOG 时加载它；否则从 pcapng 的 DSB 读取密钥。
+	var keylogReader io.Reader
+	if *sslkeylog != "" {
+		keylogFile, err := os.Open(*sslkeylog)
+		if err != nil {
+			log.Fatalf("Failed to open sslkeylog file: %v", err)
+		}
+		defer func() { _ = keylogFile.Close() }()
+		keylogReader = keylogFile
 	}
-	defer func() { _ = keylogFile.Close() }()
 
 	// 打开 pcap 文件
 	pcapFile, err := os.Open(*pcapfile)
@@ -68,7 +73,7 @@ func main() {
 		log.Printf("Starting decryption: pcap=%s, keylog=%s", *pcapfile, *sslkeylog)
 	}
 
-	err = ecapture_decryptor.DecryptPcapFile(keylogFile, pcapFile, packetChan)
+	err = decryptor.DecryptPcapFile(keylogReader, pcapFile, packetChan)
 	if err != nil {
 		log.Fatalf("Decryption failed: %v", err)
 	}

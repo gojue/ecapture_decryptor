@@ -14,7 +14,7 @@ else
 endif
 
 HEADER := libecapture_decryptor.h
-PKG_PATH := github.com/cfc4n/ecapture_decryptor
+PKG_PATH := github.com/gojue/ecapture_decryptor
 
 # Default target
 all: build-static

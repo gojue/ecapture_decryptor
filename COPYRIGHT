@@ -49,7 +49,7 @@ When using this library, you must include:
   "This software uses the ecapture_decryptor library
    Copyright (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com)
    Licensed for Non-Commercial Use
-   https://github.com/cfc4n/ecapture_decryptor"
+   https://github.com/gojue/ecapture_decryptor"
 
 ================================================================================
 COMMERCIAL LICENSING
@@ -73,5 +73,5 @@ For complete license terms, see:
   - LICENSE (Main License)
   - LICENSE-BINARY (Binary Library License)
 
-Project: https://github.com/cfc4n/ecapture_decryptor
+Project: https://github.com/gojue/ecapture_decryptor
 

@@ -7,7 +7,7 @@ This directory contains C language examples demonstrating how to use the `libeca
 1. Build the static library first:
 ```bash
 cd ../..
-make build-lib
+make build-static
 ```
 
 This generates (following standard library layout):
@@ -50,6 +50,12 @@ Decrypt a pcap file to JSON format:
 ./offline_decryption traffic.pcap sslkey.log output.json
 ```
 
+With an embedded TLS DSB, omit the external key log:
+
+```bash
+./offline_decryption traffic-with-dsb.pcapng output.json
+```
+
 Example with test data:
 ```bash
 ./offline_decryption \
@@ -73,6 +79,12 @@ tcpdump -i eth0 -w - | ./stream_decryption sslkey.log output.json
 tcpdump -i eth0 -w - 'port 443' | ./stream_decryption sslkey.log output.json
 ```
 
+For a pcapng stream with an embedded DSB:
+
+```bash
+cat traffic-with-dsb.pcapng | ./stream_decryption output.json
+```
+
 ### 3. Live Capture (API Demo)
 
 Demonstrates the live capture API (requires pcap library integration):
@@ -81,16 +93,15 @@ Demonstrates the live capture API (requires pcap library integration):
 ./live_capture_simple en0 sslkey.log output.json 30
 ```
 
-**Note**: The live capture feature requires pcap library integration in the Go implementation. This demo shows the API usage pattern.
+**Note**: Live capture still requires pcap library integration in the Go implementation.
+The demo reports this error and exits with a nonzero status instead of claiming
+that an empty output file was captured.
 
 ## Running Tests
 
 ```bash
-# Test offline decryption
-make test
-
-# Test stream decryption
-make test-stream
+# From the repository root, build and verify all examples with real pcapng fixtures
+make -C examples test
 ```
 
 ## API Functions
@@ -107,14 +118,14 @@ Returns the library version string. Remember to call `FreeString()` on the resul
 ```c
 int DecryptPcapToFile(
     char* pcapPath,
-    char* keylogPath,
+    char* keylogPath,   // NULL or "" uses pcapng DSB
     char* outputPath,
     char* format,        // "json"
     char* errorBuf,
     int errorBufLen
 );
 ```
-Decrypts a pcap file and writes JSON output.
+Decrypts a capture file and writes JSON output. For pcapng files, secrets can come from the external key log, an embedded TLS DSB, or both.
 
 **Returns:**
 - `0` - Success
@@ -128,9 +139,9 @@ Decrypts a pcap file and writes JSON output.
 ### DecryptPcapStreamToFile()
 ```c
 int DecryptPcapStreamToFile(
-    char* keylogPath,
+    char* keylogPath,   // NULL or "" uses pcapng DSB
     char* outputPath,
-    int maxPackets,      // 0 = unlimited
+    int maxPackets,      // maximum output messages; 0 = unlimited
     char* errorBuf,
     int errorBufLen
 );
@@ -241,7 +252,7 @@ The JSON output contains an array of decrypted packets:
 ```
 ld: library not found for -lecapture_decryptor
 ```
-Solution: Run `make build-lib` in the root directory first.
+Solution: Run `make build-static` in the root directory first.
 
 **Undefined symbols error:**
 ```

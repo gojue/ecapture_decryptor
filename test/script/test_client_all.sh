@@ -7,7 +7,7 @@
 # tcpdump -i any -w /tmp/capture.pcap port 443 &
 set -e
 
-HOST="local.koujue.cc"
+HOST="local.ecapture.cc"
 PORT="443"
 URL="https://${HOST}"
 

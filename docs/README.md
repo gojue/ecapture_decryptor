@@ -128,8 +128,8 @@
 如果你在使用文档时遇到问题：
 
 - 📧 Email: cfc4n.cs@gmail.com
-- 🐛 Issues: https://github.com/cfc4n/ecapture_decryptor/issues
-- 💬 Discussions: https://github.com/cfc4n/ecapture_decryptor/discussions
+- 🐛 Issues: https://github.com/gojue/ecapture_decryptor/issues
+- 💬 Discussions: https://github.com/gojue/ecapture_decryptor/discussions
 
 ---
 

@@ -24,7 +24,7 @@
 
 ### 步骤 2: 在主仓库添加 Secret
 
-在 **主仓库** (cfc4n/ecapture_decryptor):
+在 **主仓库** (gojue/ecapture_decryptor):
 
 1. Settings → Secrets and variables → Actions
 2. 新建 Secret:
@@ -33,7 +33,7 @@
 
 ### 步骤 3: 配置镜像仓库地址
 
-在 **主仓库** (cfc4n/ecapture_decryptor):
+在 **主仓库** (gojue/ecapture_decryptor):
 
 1. Settings → Secrets and variables → Actions → Variables 标签
 2. 新建 Variable:
@@ -110,7 +110,7 @@ MIRROR_REPO_TOKEN = ghp_xxxxxxxxxxxxxxxxxxxx
 ```
 
 发布 `v1.2.3` 后，产物会出现在：
-- 主仓库: `https://github.com/cfc4n/ecapture_decryptor/releases/tag/v1.2.3`
+- 主仓库: `https://github.com/gojue/ecapture_decryptor/releases/tag/v1.2.3`
 - 镜像仓库: `https://github.com/gojue/ecapture_decryptor/releases/tag/v1.2.3`
 
 ## 更多详情

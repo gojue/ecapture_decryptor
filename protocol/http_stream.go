@@ -11,10 +11,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/cfc4n/ecapture_decryptor/types"
+	"github.com/gojue/ecapture_decryptor/types"
 )
 
 // HTTPStreamParser assembles complete HTTP/1.x messages on one TLS connection.
@@ -106,7 +107,7 @@ func (p *HTTPStreamParser) parseRequests() {
 			at = time.Now()
 		}
 		if p.packetChan != nil {
-			packet := types.NewDecryptedPacket(types.TransportProtocolTCP, "http/1.1", "request", raw, at, p.connectionInfo)
+			packet := types.NewDecryptedPacket(types.TransportProtocolTCP, strings.ToLower(req.Proto), "request", raw, at, p.connectionInfo)
 			packet.WithMetadata("method", req.Method).
 				WithMetadata("url", req.URL.String()).
 				WithMetadata("host", req.Host).
@@ -147,7 +148,7 @@ func (p *HTTPStreamParser) parseResponses(final bool) {
 			at = time.Now()
 		}
 		if p.packetChan != nil {
-			packet := types.NewDecryptedPacket(types.TransportProtocolTCP, "http/1.1", "response", raw, at, p.connectionInfo)
+			packet := types.NewDecryptedPacket(types.TransportProtocolTCP, strings.ToLower(resp.Proto), "response", raw, at, p.connectionInfo)
 			packet.WithMetadata("status", resp.StatusCode).
 				WithMetadata("host", req.Host).
 				WithMetadata("headers", resp.Header)

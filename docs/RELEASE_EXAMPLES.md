@@ -34,7 +34,7 @@ git tag v1.0.1
 git push origin main --tags
 
 # 7. GitHub Actions 自动发布完成！
-# 访问: https://github.com/cfc4n/ecapture_decryptor/releases
+# 访问: https://github.com/gojue/ecapture_decryptor/releases
 ```
 
 ---
@@ -256,8 +256,8 @@ sha256sum "ecapture_decryptor-${VERSION}-${PLATFORM}.tar.gz" \
 
 ```bash
 # 1. 下载发布包
-wget https://github.com/cfc4n/ecapture_decryptor/dist/download/v1.1.0/ecapture_decryptor-v1.1.0-darwin-arm64.tar.gz
-wget https://github.com/cfc4n/ecapture_decryptor/dist/download/v1.1.0/ecapture_decryptor-v1.1.0-darwin-arm64.tar.gz.sha256
+wget https://github.com/gojue/ecapture_decryptor/dist/download/v1.1.0/ecapture_decryptor-v1.1.0-darwin-arm64.tar.gz
+wget https://github.com/gojue/ecapture_decryptor/dist/download/v1.1.0/ecapture_decryptor-v1.1.0-darwin-arm64.tar.gz.sha256
 
 # 2. 验证校验和
 sha256sum -c ecapture_decryptor-v1.1.0-darwin-arm64.tar.gz.sha256
@@ -335,13 +335,13 @@ gh workflow run release.yml
 
 ```bash
 # 1. 验证 GitHub Release 页面
-open https://github.com/cfc4n/ecapture_decryptor/releases
+open https://github.com/gojue/ecapture_decryptor/releases
 
 # 2. 验证下载链接
-curl -I https://github.com/cfc4n/ecapture_decryptor/dist/download/v1.1.0/...
+curl -I https://github.com/gojue/ecapture_decryptor/dist/download/v1.1.0/...
 
 # 3. 检查统计数据
-gh api repos/cfc4n/ecapture_decryptor/dist/latest
+gh api repos/gojue/ecapture_decryptor/dist/latest
 
 # 4. 更新项目主页
 vim README.md

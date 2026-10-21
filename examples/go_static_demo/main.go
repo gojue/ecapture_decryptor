@@ -18,10 +18,11 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 
-	"github.com/cfc4n/ecapture_decryptor"
-	"github.com/cfc4n/ecapture_decryptor/types"
+	decryptor "github.com/gojue/ecapture_decryptor"
+	"github.com/gojue/ecapture_decryptor/types"
 )
 
 const version = "ecapture_decryptor v2.0.0 (Go Static Demo)"
@@ -29,7 +30,7 @@ const version = "ecapture_decryptor v2.0.0 (Go Static Demo)"
 func main() {
 	// Command line flags
 	pcapFile := flag.String("pcap", "", "Path to pcap file (required)")
-	keylogFile := flag.String("keylog", "", "Path to SSL keylog file (required)")
+	keylogFile := flag.String("keylog", "", "Path to SSL keylog file (optional for pcapng with DSB)")
 	outputFile := flag.String("output", "output.json", "Path to output JSON file")
 	format := flag.String("format", "json", "Output format (only 'json' supported)")
 	showVersion := flag.Bool("version", false, "Show library version")
@@ -43,8 +44,8 @@ func main() {
 	}
 
 	// Validate required arguments
-	if *pcapFile == "" || *keylogFile == "" {
-		_, _ = fmt.Fprintf(os.Stderr, "Error: Both -pcap and -keylog flags are required\n\n")
+	if *pcapFile == "" {
+		_, _ = fmt.Fprintf(os.Stderr, "Error: -pcap is required\n\n")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -54,9 +55,11 @@ func main() {
 		_, _ = fmt.Fprintf(os.Stderr, "Error: Pcap file not found: %s\n", *pcapFile)
 		os.Exit(1)
 	}
-	if _, err := os.Stat(*keylogFile); os.IsNotExist(err) {
-		_, _ = fmt.Fprintf(os.Stderr, "Error: Keylog file not found: %s\n", *keylogFile)
-		os.Exit(1)
+	if *keylogFile != "" {
+		if _, err := os.Stat(*keylogFile); os.IsNotExist(err) {
+			_, _ = fmt.Fprintf(os.Stderr, "Error: Keylog file not found: %s\n", *keylogFile)
+			os.Exit(1)
+		}
 	}
 
 	// Validate format
@@ -74,13 +77,17 @@ func main() {
 	fmt.Printf("  Output file: %s\n", *outputFile)
 	fmt.Printf("  Format:      %s\n", *format)
 
-	// Open keylog file
-	keylogFd, err := os.Open(*keylogFile)
-	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "\n❌ ERROR: Failed to open keylog file: %v\n", err)
-		os.Exit(1)
+	// An omitted keylog uses secrets in the pcapng DSB.
+	var keylogReader io.Reader
+	if *keylogFile != "" {
+		keylogFd, err := os.Open(*keylogFile)
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "\n❌ ERROR: Failed to open keylog file: %v\n", err)
+			os.Exit(1)
+		}
+		defer func() { _ = keylogFd.Close() }()
+		keylogReader = keylogFd
 	}
-	defer func() { _ = keylogFd.Close() }()
 
 	// Open pcap file
 	pcapFd, err := os.Open(*pcapFile)
@@ -103,7 +110,7 @@ func main() {
 	}()
 
 	// Decrypt using the Go API (same as the C library internally uses)
-	err = ecapture_decryptor.DecryptPcapFile(keylogFd, pcapFd, packetChan)
+	err = decryptor.DecryptPcapFile(keylogReader, pcapFd, packetChan)
 	close(packetChan)
 	<-doneChan
 

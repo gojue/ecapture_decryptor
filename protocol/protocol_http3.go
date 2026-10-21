@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cfc4n/ecapture_decryptor/types"
+	"github.com/gojue/ecapture_decryptor/types"
 )
 
 // HTTP/3 帧类型
@@ -160,7 +160,8 @@ type HTTP3StreamParser struct {
 	maxTableCapacity   uint64
 
 	// 流状态
-	streams map[uint64]*http3Stream
+	streams     map[uint64]*http3Stream
+	quicStreams map[uint64]*http3QUICStream
 
 	// 时间戳
 	packetTime time.Time
@@ -223,6 +224,7 @@ func newHTTP3StreamParserInternal(ci types.ConnectionKey, packetChan chan *types
 		serverDynamicTable: make([]qpackEntry, 0),
 		maxTableCapacity:   4096,
 		streams:            make(map[uint64]*http3Stream),
+		quicStreams:        make(map[uint64]*http3QUICStream),
 	}
 }
 

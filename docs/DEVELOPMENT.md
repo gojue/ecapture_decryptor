@@ -25,7 +25,7 @@
 
 ```bash
 # 克隆项目
-git clone https://github.com/cfc4n/ecapture_decryptor.git
+git clone https://github.com/gojue/ecapture_decryptor.git
 cd ecapture_decryptor
 
 # 安装 Go 依赖
@@ -311,7 +311,7 @@ golangci-lint run
 // protocol/protocol_grpc.go
 package protocol
 
-import "github.com/cfc4n/ecapture_decryptor/types"
+import "github.com/gojue/ecapture_decryptor/types"
 
 type GRPCParser struct {
     // 状态
@@ -460,7 +460,7 @@ git clone https://github.com/YOUR_USERNAME/ecapture_decryptor.git
 cd ecapture_decryptor
 
 # 添加上游仓库
-git remote add upstream https://github.com/cfc4n/ecapture_decryptor.git
+git remote add upstream https://github.com/gojue/ecapture_decryptor.git
 ```
 
 ### 2. 创建分支
@@ -580,7 +580,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: '1.26'
       - run: make test
       - run: make lint
 ```
@@ -702,8 +702,8 @@ Closes #123
 ## 📞 获取帮助
 
 - 📧 Email: cfc4n.cs@gmail.com
-- 🐛 Issues: https://github.com/cfc4n/ecapture_decryptor/issues
-- 💬 Discussions: https://github.com/cfc4n/ecapture_decryptor/discussions
+- 🐛 Issues: https://github.com/gojue/ecapture_decryptor/issues
+- 💬 Discussions: https://github.com/gojue/ecapture_decryptor/discussions
 
 ---
 
