@@ -1,3 +1,16 @@
+# v1.2.0 (2026-10-22)
+
+## What's Changed
+* Decrypt QUIC v1 traffic from UDP captures and reconstruct HTTP/3 requests and responses as `DecryptedPacket` results.
+* Load TLS secrets from an external SSLKEYLOG, pcapng Decryption Secrets Blocks (DSBs), or both; allow pcapng decryption without a separate key log in the Go and C APIs and examples.
+* Improve HAR export by pairing HTTP/2 and HTTP/3 messages by stream ID, producing HTTPS URLs, and handling gzip and binary response bodies.
+* Add real pcapng fixtures and integration tests for HTTP/1.0, HTTP/1.1, HTTP/2, and HTTP/3 with external key logs and embedded DSBs.
+* Change the Go module path from `github.com/cfc4n/ecapture_decryptor` to `github.com/gojue/ecapture_decryptor`; consumers must update their imports.
+
+**Full Changelog**: https://github.com/gojue/ecapture_decryptor/compare/v1.1.0...8b659be74e1bdac43e72848506f593ced7ff44e2
+
+<hr>
+
 # v1.1.0 (2026-10-19)
 
 ## What's Changed
