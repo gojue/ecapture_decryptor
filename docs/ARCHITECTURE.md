@@ -30,6 +30,93 @@ ecapture_decryptor 采用**分层架构**设计，每层职责清晰，模块解
 
 ---
 
+## 🔄 架构图
+
+### 数据流架构
+
+```mermaid
+flowchart TD
+    Pcapng["pcapng 文件或输入流"] --> NgReader["pcapngBlockReader / pcapgo.NgReader"]
+    Pcap["传统 pcap 文件（兼容路径）"] --> PcapReader["pcapgo.Reader"]
+    NgReader -->|DSB| KeyLog["KeyLogStore<br/>SSLKEYLOG 密钥"]
+    External["外部 SSLKEYLOG 文件"] --> KeyLog
+    NgReader -->|网络包| Decoder["gopacket 网络层解析"]
+    PcapReader -->|网络包| Decoder
+    Decoder --> Tracker["连接跟踪与分流"]
+    Tracker -->|TCP| TCP["TCP 流重组"]
+    TCP --> TLS["TLS 记录解密"]
+    Tracker -->|UDP| QUIC["QUIC 包解密与 STREAM 重组"]
+    KeyLog --> TLS
+    KeyLog --> QUIC
+    TLS --> HTTP["HTTP/1.0、HTTP/1.1、HTTP/2<br/>或 WebSocket 解析"]
+    QUIC --> HTTP3["HTTP/3 / QPACK 解析"]
+    HTTP --> Packet["DecryptedPacket"]
+    HTTP3 --> Packet
+    Packet --> Output["Go channel / 流式 emit 回调"]
+    Output --> Custom["调用方自定义处理"]
+    Output --> HAR["examples/go_demo：HAR"]
+    Output --> JSON["示例程序 / C API：JSON"]
+
+    style Pcapng fill:#e1f5ff
+    style Pcap fill:#e1f5ff
+    style KeyLog fill:#f3e5f5
+    style Packet fill:#fff4e1
+    style Output fill:#e8f5e9
+```
+
+核心 SDK 输出 `DecryptedPacket`；HAR 与 JSON 由调用方或示例程序生成。
+`DecryptPcapFile` 支持传统 pcap 文件，并从外部 SSLKEYLOG 获取密钥。
+`DecryptPcapngStream` 使用输入流中的 DSB，`DecryptLiveTraffic` 接受调用方提供的抓包流。
+
+### 分层架构
+
+```mermaid
+flowchart TB
+    GoApp["Go 调用方"] --> GoAPI["Go API：DecryptPcapFile / DecryptWithConfig<br/>DecryptLiveTraffic / DecryptPcapngStream"]
+    CApp["C/C++ 调用方"] --> CAPI["capi/：C ABI"]
+    CAPI --> GoAPI
+
+    subgraph Core["根包：解密流程编排"]
+        Engine["DecryptorEngine / DecryptorFactory<br/>连接跟踪与 TCP 重组"]
+        Capture["pcapgo / gopacket<br/>pcapng 块读取与 DSB 提取"]
+    end
+    subgraph Crypto["crypto/：密钥与密码学"]
+        KeyLog["KeyLogStore"]
+        Cipher["TLS RecordDecryptor / 密码套件配置"]
+    end
+    subgraph Transport["transport/：传输解密"]
+        TLS["TLSDecryptor"]
+        QUIC["QUICDecryptor"]
+    end
+    subgraph Protocol["protocol/：应用协议解析"]
+        HTTP["HTTP/1.x / HTTP/2 / WebSocket"]
+        HTTP3["HTTP/3 / QPACK"]
+    end
+    Packet["types/：DecryptedPacket 输出模型"]
+
+    GoAPI --> Engine
+    Engine --> Capture
+    Capture -->|DSB| KeyLog
+    GoAPI -->|外部 SSLKEYLOG，文件或配置 API| KeyLog
+    Engine --> TLS
+    Engine --> QUIC
+    KeyLog --> TLS
+    KeyLog --> QUIC
+    Cipher --> TLS
+    TLS --> HTTP
+    QUIC --> HTTP3
+    HTTP --> Packet
+    HTTP3 --> Packet
+
+    style Core fill:#e3f2fd
+    style Crypto fill:#fce4ec
+    style Transport fill:#fff3e0
+    style Protocol fill:#e8f5e9
+    style Packet fill:#fff4e1
+```
+
+---
+
 ## 🏗️ 模块设计
 
 ### 1. 公开 API 层

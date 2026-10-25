@@ -1,0 +1,234 @@
+<p align="center">
+  <strong>eCapture Decryptor</strong><br />
+  使用 SSLKEYLOG 密钥或 pcapng 内嵌的 TLS Decryption Secrets Block（DSB）解密 pcapng 中 TLS/QUIC 流量的 Go 语言库。
+</p>
+
+<p align="center">
+  <a href="./README.md">English</a> · <strong>汉字</strong><br />
+  <a href="https://github.com/gojue/ecapture_decryptor/releases"><img alt="最新版本" src="https://img.shields.io/github/v/release/gojue/ecapture_decryptor?display_name=tag&include_prereleases&sort=semver" /></a>
+  <a href="https://pkg.go.dev/github.com/gojue/ecapture_decryptor"><img alt="Go 参考文档" src="https://pkg.go.dev/badge/github.com/gojue/ecapture_decryptor.svg" /></a>
+</p>
+
+> [!NOTE]
+> 仓库名为 `ecapture_decryptor`，Go 模块路径为 `github.com/gojue/ecapture_decryptor`；根包、C 库文件和发布压缩包均沿用 `ecapture_decryptor` 名称。
+
+----
+
+<!-- MarkdownTOC autolink="true" -->
+- [简介](#简介)
+- [特性](#特性)
+- [快速开始](#快速开始)
+  - [安装](#安装)
+  - [解密 pcapng 文件](#解密-pcapng-文件)
+  - [增量 pcapng + DSB](#增量-pcapng--dsb)
+  - [基本使用](#基本使用)
+- [使用方式](#使用方式)
+- [构建](#构建)
+- [架构](#架构)
+- [文档](#文档)
+- [许可证](#许可证)
+- [贡献](#贡献)
+- [致谢](#致谢)
+<!-- /MarkdownTOC -->
+
+# 简介
+
+eCapture Decryptor 解密 pcapng 文件中捕获的 TLS 与 QUIC 流量。TLS 密钥可来自独立的 SSLKEYLOG 文件、pcapng 内嵌的 TLS Decryption Secrets Block（DSB），或同时使用两种来源。
+
+SDK 只负责解密与协议解析，不强制输出格式。结果以 `DecryptedPacket` 结构输出，由调用方自由处理（JSON、HAR、流式输出等）。
+
+# 特性
+
+- 🔓 **解密 TLS/QUIC 流量**：支持外部 SSLKEYLOG 文件和 pcapng 内嵌 DSB
+- 🌐 **多协议支持**：HTTP/1.0、HTTP/1.1、HTTP/2、HTTP/3、WebSocket
+- 📦 **灵活输出**：输出 `DecryptedPacket` 结构，由调用方自由处理
+- 🔧 **多种使用方式**：Go 库、静态链接库（`.a`）、命令行工具
+- 🎯 **职责清晰**：只负责解密和协议解析，不强制输出格式
+
+### QUIC / HTTP/3 输入要求
+
+解密 HTTP/3 需要包含客户端 Initial（其中有 ClientHello）的双向 UDP 抓包，以及匹配该连接的 TLS 1.3 SSLKEYLOG。密钥可作为外部文件传入，也可放在 pcapng 的 DSB 中。解析器按 QUIC 连接、包号和 STREAM 偏移重组数据，再按 HTTP/3 请求流输出 `http/3` 的 `DecryptedPacket`。
+
+仓库中的 [Linux HTTP/3 抓包](test/fixtures/http3_capture/README.md)与 [Linux HTTP/1.x 和 HTTP/2 抓包](test/fixtures/http_tcp_capture/README.md)由 `tcpdump` 和 eCapture 实际捕获，覆盖外部密钥、内嵌 DSB 和 DSB 文件的流式读取。当前端到端测试覆盖 QUIC v1；v2 和 draft-29 的密钥派生已实现，但尚无真实抓包测试。HTTP/3 头部解析支持 QPACK 静态表和字面量；使用动态表的连接、QUIC 密钥更新和连接迁移尚未覆盖。
+
+# 快速开始
+
+## 安装
+
+```bash
+go get github.com/gojue/ecapture_decryptor
+```
+
+## 解密 pcapng 文件
+
+`DecryptPcapFile` 的 `keylogReader` 可以为 `nil`，此时从 pcapng 的 DSB 读取密钥；传入 SSLKEYLOG 文件读取器时，也会读取 pcapng 中的 DSB。两个来源可以同时使用。
+
+```go
+// 仅使用 pcapng 内嵌的 DSB。
+err := ecapture_decryptor.DecryptPcapFile(nil, pcapngFile, packetChan)
+
+// 使用外部 SSLKEYLOG 文件；pcapng 内若有 DSB 也会一并加载。
+err = ecapture_decryptor.DecryptPcapFile(keylogFile, pcapngFile, packetChan)
+```
+
+## 增量 pcapng + DSB
+
+`DecryptPcapngStream(ctx, input, emit)` 从持续增长的 pcapng `io.ReadCloser` 读取完整块，并在 DSB 到达时立即加载 NSS Key Log 密钥。DSB 可以晚于握手、应用数据，甚至最后一个网络包。SDK 按 TCP 序号重组、去重，并输出完整的 HTTP/1.1 或 HTTP/2 请求/响应；`emit` 返回错误会停止读取并返回该错误。取消 `ctx` 会关闭 `input`，以解除阻塞读取。调用方应按需给 `input` 配置能够被 `Close` 中断的实现，例如 `io.PipeReader` 或网络连接。
+
+```go
+err := ecapture_decryptor.DecryptPcapngStream(ctx, input, func(message *types.DecryptedPacket) error {
+    // message.Data 是完整 HTTP 消息；Metadata 包含 host / authority 和 stream_id。
+    return handle(message)
+})
+```
+
+eCapture 集成及其源码和二进制分发（含商业使用）适用 [LICENSE](LICENSE) 中的 **eCapture Integration Exception**。其他 SDK 用途仍按原有授权条款处理。
+
+## 基本使用
+
+```go
+package main
+
+import (
+    "log"
+    "os"
+
+    "github.com/gojue/ecapture_decryptor"
+    "github.com/gojue/ecapture_decryptor/types"
+)
+
+func main() {
+    keylog, _ := os.Open("sslkey.log")
+    pcap, _ := os.Open("traffic.pcap")
+    defer keylog.Close()
+    defer pcap.Close()
+
+    // 创建 channel 接收解密的包
+    packetChan := make(chan *types.DecryptedPacket, 100)
+
+    // 处理解密的包
+    go func() {
+        for packet := range packetChan {
+            log.Printf("[%s] %s: %d bytes",
+                packet.Protocol,   // "http/1.1"、"http/2" 等
+                packet.Direction,  // "request" 或 "response"
+                len(packet.Data))  // 解密后的数据
+        }
+    }()
+
+    // 解密
+    err := ecapture_decryptor.DecryptPcapFile(keylog, pcap, packetChan)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    close(packetChan)
+}
+```
+
+# 使用方式
+
+公开 API 位于根包：
+
+- `DecryptPcapFile(keylogReader, pcapFileHandle, packetChan)` — 解密 pcap/pcapng 文件
+- `DecryptLiveTraffic(keylogReader, pcapHandle, packetChan)` — 解密实时/流式 pcap 数据源
+- `DecryptPcapngStream(ctx, input, emit)` — 流式解密持续增长的 pcapng（含延迟 DSB）
+- `DecryptWithConfig(config)` / `NewDecryptorConfig()` — 基于 Builder 模式的高级配置
+
+[命令行示例](examples/go_demo/README.md)（`bin/ecapture_decryptor`）演示了离线解密与 JSON/HAR 导出：
+
+```bash
+./bin/ecapture_decryptor -pcap traffic.pcapng -sslkeylog sslkey.log -v
+./bin/ecapture_decryptor -pcap traffic-with-dsb.pcapng -json output.json
+./bin/ecapture_decryptor -pcap traffic.pcapng -sslkeylog sslkey.log -har output.har
+```
+
+完整的 API 参考、`DecryptedPacket` 模型、协议元数据以及 C/C++ 用法，请参阅：
+
+- **[API 参考](docs/API.md)** — 完整的 Go API、数据类型和元数据格式
+- **[C/C++ 示例](examples/c_demo/README.md)** — 静态库用法、C API 函数和编译参数
+
+# 构建
+
+```bash
+make build-static                  # 静态链接库 (.a)
+make build-shared                  # 动态链接库 (.dylib / .so)
+make -C examples/go_demo build     # Go 命令行示例
+make -C examples/c_demo all        # C 示例程序
+make test                          # 运行测试
+make clean                         # 清理构建产物
+```
+
+构建产物包括 `bin/ecapture_decryptor`（命令行工具）、`lib/libecapture_decryptor.a`（静态库）、`lib/libecapture_decryptor.dylib`/`.so`（动态库）、`include/libecapture_decryptor.h`（C 头文件）以及 C 示例程序。默认构建已应用 `-s -w` 与 `-trimpath` 以减小二进制体积。
+
+详见 **[Makefile 指南](docs/MAKEFILE_GUIDE.md)** 与 **[开发指南](docs/DEVELOPMENT.md)**。
+
+# 架构
+
+SDK 采用分层结构：公开 API（`api.go` / `factory.go`）→ 协议解析（`protocol/`）→ 传输层解密（`transport/`，TLS/QUIC）→ 密码学（`crypto/`，密钥管理）→ 数据包捕获（`gopacket`）。核心 SDK 输出 `DecryptedPacket`，HAR 与 JSON 输出由调用方或示例程序生成。
+
+详见 **[架构文档](docs/ARCHITECTURE.md)**，了解分层设计、模块职责、数据流与设计原则。
+
+# 文档
+
+- **[文档索引](docs/README.md)** — 面向用户、开发者和维护者的导航
+- **[CHANGELOG.md](CHANGELOG.md)** — 版本变更历史
+- **[API 参考](docs/API.md)** · **[架构文档](docs/ARCHITECTURE.md)** · **[开发指南](docs/DEVELOPMENT.md)** · **[Makefile 指南](docs/MAKEFILE_GUIDE.md)**
+- **[发布指南](docs/RELEASE_GUIDE.md)** · **[发布快速参考](docs/RELEASE_QUICKREF.md)** · **[发布示例](docs/RELEASE_EXAMPLES.md)**
+
+# 许可证
+
+### ⚠️ 双重许可模式
+
+本项目采用**双重许可模式**：
+
+#### 1. 源代码许可
+
+**版权所有 © 2024-2026 CFC4N (cfc4n.cs@gmail.com)。保留所有权利。**
+
+源代码为**专有软件**，未经明确书面许可，**禁止任何形式的使用、复制、修改或分发**。查看源代码不授予任何使用权限。
+
+#### 2. 二进制库许可
+
+**版权所有 © 2024-2026 CFC4N (cfc4n.cs@gmail.com)。保留所有权利。**
+
+编译后的二进制库（`.a`、`.so`、`.dylib`）仅可用于**非商业用途**：个人使用、研究和教育、评估和测试，以及与非商业应用程序链接。商业使用需要单独许可；禁止反向工程、修改、重新分发修改版本以及删除版权声明。
+
+#### 署名要求
+
+```
+本软件使用 eCapture Decryptor 库
+版权所有 (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com)
+授权用于非商业用途
+https://github.com/gojue/ecapture_decryptor
+```
+
+#### 商业许可
+
+如需商业使用，请发送邮件至 **cfc4n.cs@gmail.com**，主题为 `Commercial License Inquiry - eCapture Decryptor`。
+
+- **[LICENSE](LICENSE)** — 完整许可证（中英文）
+- **[LICENSE-BINARY](LICENSE-BINARY)** — 二进制库许可证（中英文）
+- **[COPYRIGHT](COPYRIGHT)** — 版权声明
+- **[许可摘要](docs/LICENSE-SUMMARY.md)** — 快速参考
+
+# 贡献
+
+由于源代码为专有软件，暂不接受外部贡献。如有问题或建议，欢迎提交 Issue。
+
+# 致谢
+
+本项目基于以下优秀的开源项目：
+
+- [gopacket](https://github.com/google/gopacket) - 数据包处理
+- Go 标准库的 `crypto/tls` 包
+
+---
+
+> [!IMPORTANT]
+> 1. 使用本工具需要有合法的 SSLKEYLOG 文件。
+> 2. 请确保你有权限解密目标流量。
+> 3. 遵守所有适用的法律法规。
+> 4. 商业使用需要获得单独授权。
+
+**版权所有 © 2024-2026 CFC4N。保留所有权利。**
