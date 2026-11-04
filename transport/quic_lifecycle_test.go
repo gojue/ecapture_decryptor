@@ -193,10 +193,10 @@ func TestQUICCompletedStreamCountIsBounded(t *testing.T) {
 	q, _ := newQUICOutputTest(t, types.DecryptOptions{OnDiagnostic: func(d types.Diagnostic) {
 		diagnostics = append(diagnostics, d)
 	}})
-	// Completed unidirectional streams retain de-duplication markers even when
-	// the HTTP/3 parser does not consume them. They still consume the quota.
+	// Completed unknown HTTP/3 unidirectional streams retain de-duplication
+	// markers and still consume the quota.
 	for i := 0; i < maxQUICStreams; i++ {
-		if err := q.feedQUICStream(uint64(i*4+2), 0, nil, true, true, time.Time{}); err != nil {
+		if err := q.feedQUICStream(uint64(i*4+2), 0, []byte{0x21}, true, true, time.Time{}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -335,4 +335,39 @@ func TestQUICCIDLimitsAndOutOfOrderRetirement(t *testing.T) {
 	if len(bounded.flow.cids[0]) != maxQUICConnectionIDs {
 		t.Fatal("CID cap exceeded")
 	}
+}
+
+func TestQUICQPACKWaitDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var diagnostics []types.Diagnostic
+		q, _ := newQUICOutputTest(t, types.DecryptOptions{KeyWaitTimeout: 10 * time.Second, OnDiagnostic: func(d types.Diagnostic) { diagnostics = append(diagnostics, d) }})
+		// Server SETTINGS: capacity 220, two blocked streams; client HEADERS waits
+		// for two inserts. No key update, packet, or EOF is needed to enforce expiry.
+		if err := q.feedQUICStream(3, 0, []byte{0, 4, 5, 1, 0x40, 220, 7, 2}, false, false, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if err := q.feedQUICStream(0, 0, []byte{1, 6, 3, 0x81, 0xd1, 0xd7, 0x10, 0x11}, true, true, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- q.Decrypt() }()
+		synctest.Wait()
+		time.Sleep(9 * time.Second)
+		q.keyLog.AddSecret("CLIENT_TRAFFIC_SECRET_0", "aabb", []byte{1})
+		synctest.Wait()
+		select {
+		case err := <-done:
+			t.Fatalf("early exit: %v", err)
+		default:
+		}
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if err := <-done; err == nil {
+			t.Fatal("blocked QPACK succeeded")
+		}
+		if len(diagnostics) != 1 || diagnostics[0].Stage != "protocol" || diagnostics[0].Code != "parse_timeout" {
+			t.Fatal(diagnostics)
+		}
+		assertQUICReleased(t, q)
+	})
 }

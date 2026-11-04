@@ -45,7 +45,7 @@ var qpackStaticTable = []struct {
 }{
 	{":authority", ""},
 	{":path", "/"},
-	{":age", "0"},
+	{"age", "0"},
 	{"content-disposition", ""},
 	{"content-length", "0"},
 	{"cookie", ""},
@@ -162,6 +162,11 @@ type HTTP3StreamParser struct {
 	// 流状态
 	streams     map[uint64]*http3Stream
 	quicStreams map[uint64]*http3QUICStream
+	quicUni     map[uint64]*http3UniStream
+	quicState   [2]http3Direction
+	quicPush    map[uint64]*http3Push
+	quicErr     error
+	quicClosed  bool
 
 	// 时间戳
 	packetTime time.Time
@@ -225,6 +230,8 @@ func newHTTP3StreamParserInternal(ci types.ConnectionKey, packetChan chan *types
 		maxTableCapacity:   4096,
 		streams:            make(map[uint64]*http3Stream),
 		quicStreams:        make(map[uint64]*http3QUICStream),
+		quicUni:            make(map[uint64]*http3UniStream),
+		quicPush:           make(map[uint64]*http3Push),
 	}
 }
 
@@ -661,7 +668,7 @@ func (p *HTTP3StreamParser) Flush() {
 // Close 关闭解析器
 func (p *HTTP3StreamParser) Close() error {
 	p.Flush()
-	return nil
+	return p.closeHTTP3()
 }
 
 // Ensure interface is implemented

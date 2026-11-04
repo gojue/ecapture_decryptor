@@ -147,3 +147,18 @@ func TestPairHTTPPacketsMatchesHTTP1ByConnectionAndHTTP2ByStream(t *testing.T) {
 		}
 	}
 }
+
+func TestHARHTTP3UsesFinalResponse(t *testing.T) {
+	connection := types.ConnectionKey{SrcPort: 12345, DstPort: 443, Proto: "udp"}
+	packet := func(direction string) *types.DecryptedPacket {
+		return types.NewDecryptedPacket("udp", "http/3", direction, nil, time.Time{}, connection).WithMetadata("stream_id", uint64(0))
+	}
+	request := packet("request")
+	info := packet("response").WithMetadata("kind", "informational").WithMetadata("status", 103)
+	push := packet("response").WithMetadata("kind", "push_response")
+	final := packet("response").WithMetadata("status", 200)
+	pairs := pairHTTPPackets([]*types.DecryptedPacket{request, info, push, final})
+	if len(pairs) != 1 || pairs[0].Response != final {
+		t.Fatal("HAR paired informational/push as final response")
+	}
+}

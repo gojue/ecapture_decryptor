@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"reflect"
 	"strings"
@@ -482,6 +483,204 @@ func TestQUICLifecycleCaptureAPIs(t *testing.T) {
 					reference = data
 				} else if !reflect.DeepEqual(reference, data) {
 					t.Fatal("raw/messages or file/stream results differ")
+				}
+			})
+		}
+	}
+}
+
+func TestHTTP3DynamicCaptureAPIs(t *testing.T) {
+	const base = "test/testdata/http3_dynamic_aioquic"
+	capture, clientKeys, serverKeys := quicDSBBlocks(t, base+".pcapng", base+".keys")
+	keylog, err := os.ReadFile(base + ".keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsb := bytes.Join([][]byte{capture, clientKeys, serverKeys}, nil)
+	type semantic struct {
+		Metadata map[string]interface{}
+		Body     string
+	}
+	var reference map[string]semantic
+	for _, raw := range []bool{false, true} {
+		for _, mode := range []string{"external", "seek_dsb", "nonseek_dsb", "late_dsb"} {
+			t.Run(fmt.Sprintf("raw=%v/%s", raw, mode), func(t *testing.T) {
+				var output []*types.DecryptedPacket
+				if mode == "late_dsb" {
+					synctest.Test(t, func(t *testing.T) {
+						stream := newQUICLiveStream(t, raw)
+						stream.write(t, capture)
+						synctest.Wait()
+						if len(stream.packets) != 0 {
+							t.Fatal("output without secrets")
+						}
+						stream.write(t, clientKeys)
+						synctest.Wait()
+						stream.assertOpen(t)
+						stream.write(t, serverKeys)
+						synctest.Wait()
+						stream.assertOpen(t)
+						count := len(stream.packets)
+						if count < 20 {
+							t.Fatalf("dynamic output delayed until EOF: %d", count)
+						}
+						stream.write(t, clientKeys)
+						stream.write(t, serverKeys)
+						synctest.Wait()
+						if len(stream.packets) != count {
+							t.Fatal("duplicate DSB repeated output")
+						}
+						if err := stream.writer.Close(); err != nil {
+							t.Fatal(err)
+						}
+						synctest.Wait()
+						if err := <-stream.done; err != nil {
+							t.Fatal(err)
+						}
+						if len(stream.packets) != count {
+							t.Fatal("output delayed until EOF")
+						}
+						output = stream.packets
+					})
+				} else {
+					var input io.Reader = bytes.NewReader(dsb)
+					var secrets io.Reader
+					if mode == "external" {
+						input = bytes.NewReader(capture)
+						secrets = bytes.NewReader(keylog)
+					} else if mode == "nonseek_dsb" {
+						input = bytes.NewBuffer(dsb)
+					}
+					ch := make(chan *types.DecryptedPacket)
+					done := make(chan struct{})
+					go func() {
+						defer close(done)
+						for p := range ch {
+							output = append(output, p)
+						}
+					}()
+					err := DecryptWithConfig(NewDecryptorConfig().WithPcapReader(input).WithSSLKeyLog(secrets).WithPacketChan(ch).
+						WithOptions(types.DecryptOptions{RawChunks: raw}).WithLogger(log.New(io.Discard, "", 0)))
+					close(ch)
+					<-done
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				messages := make(map[string][]*types.DecryptedPacket)
+				if raw {
+					parsers := make(map[string]*protocol.HTTP3StreamParser)
+					channels := make(map[string]chan *types.DecryptedPacket)
+					offsets := make(map[string]uint64)
+					ended := make(map[string]bool)
+					resets := 0
+					for _, p := range output {
+						conn := p.ConnectionID()
+						id := p.Metadata["stream_id"].(uint64)
+						key := fmt.Sprintf("%s/%d/%s", conn, id, p.Direction)
+						if parsers[conn] == nil {
+							channels[conn] = make(chan *types.DecryptedPacket, 32)
+							parsers[conn] = protocol.NewHTTP3StreamParser(types.ConnectionKey{}, channels[conn])
+						}
+						if ended[key] {
+							t.Fatal("bytes after stream completion", key)
+						}
+						if p.Metadata["kind"] == "stream_reset" {
+							resets++
+							ended[key] = true
+							if p.Metadata["error_code"] != uint64(0x10c) || id != 12 || p.Direction != "response" {
+								t.Fatal(p.Metadata)
+							}
+							if err := parsers[conn].ResetQUICStream(id, false); err != nil {
+								t.Fatal(err)
+							}
+							continue
+						}
+						if p.Metadata["offset"] != offsets[key] {
+							t.Fatal("noncontiguous raw output", key)
+						}
+						offsets[key] += uint64(len(p.Data))
+						ended[key] = p.Metadata["end"] == true
+						if err := parsers[conn].FeedQUICStream(id, p.Direction == "request", p.Data, ended[key], p.Timestamp); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if resets != 2 {
+						t.Fatalf("resets=%d", resets)
+					}
+					for conn, p := range parsers {
+						if err := p.Close(); err != nil {
+							t.Fatal(err)
+						}
+						close(channels[conn])
+						for m := range channels[conn] {
+							messages[conn] = append(messages[conn], m)
+						}
+					}
+				} else {
+					for _, p := range output {
+						messages[p.ConnectionID()] = append(messages[p.ConnectionID()], p)
+					}
+				}
+				if len(messages) != 2 {
+					t.Fatalf("connections=%d", len(messages))
+				}
+				got := make(map[string]semantic)
+				labels := make(map[string]bool)
+				for conn, packets := range messages {
+					if len(packets) != 10 {
+						t.Fatalf("connection messages=%d, want 10", len(packets))
+					}
+					label := ""
+					for _, p := range packets {
+						if p.Direction == "request" {
+							label = strings.Split(p.Metadata["path"].(string), "/")[1]
+							break
+						}
+					}
+					if label != "alpha" && label != "beta" || labels[label] {
+						t.Fatal("connection isolation", label)
+					}
+					labels[label] = true
+					for _, p := range packets {
+						id := p.Metadata["stream_id"].(uint64)
+						kind, _ := p.Metadata["kind"].(string)
+						key := fmt.Sprintf("%s/%d/%s/%s", conn, id, p.Direction, kind)
+						if _, exists := got[key]; exists {
+							t.Fatal("duplicate event", key)
+						}
+						parts := bytes.SplitN(p.Data, []byte("\r\n\r\n"), 2)
+						if len(parts) != 2 {
+							t.Fatal("message framing")
+						}
+						body := string(parts[1])
+						headers := p.Metadata["headers"].(http.Header)
+						if p.Direction == "request" {
+							suffix := map[uint64]string{0: "warmup", 4: "one", 8: "two", 12: "reset"}[id]
+							if suffix == "" || p.Metadata["path"] != "/"+label+"/"+suffix || p.Metadata["method"] != "GET" || p.Metadata["authority"] != "localhost" || headers.Get("x-fixture-token") != strings.Repeat(label, 16) || body != "" {
+								t.Fatal("request", p.Metadata, body)
+							}
+						} else if kind == "informational" {
+							if (id != 4 && id != 8) || p.Metadata["status"] != 103 || headers.Get("link") != "</asset>; rel=preload" || body != "" {
+								t.Fatal("informational", p.Metadata)
+							}
+						} else if kind == "push_response" {
+							if p.Metadata["push_id"] != uint64(0) || p.Metadata["parent_stream_id"] != uint64(4) || id != 15 || p.Metadata["path"] != "/"+label+"/asset" || body != "asset "+label || p.Metadata["status"] != 200 {
+								t.Fatal("push", p.Metadata, body)
+							}
+						} else {
+							suffix := map[uint64]string{0: "warmup", 4: "one", 8: "two"}[id]
+							if suffix == "" || kind != "" || p.Metadata["status"] != 200 || body != "reply /"+label+"/"+suffix || headers.Get("x-fixture-token") != strings.Repeat(label, 16) || headers.Get("x-finished") != "" || p.Metadata["trailers"].(http.Header).Get("x-finished") != label {
+								t.Fatal("final", p.Metadata, body)
+							}
+						}
+						got[key] = semantic{p.Metadata, body}
+					}
+				}
+				if reference == nil {
+					reference = got
+				} else if !reflect.DeepEqual(reference, got) {
+					t.Fatal("field semantics/body/stream/direction differ across APIs or raw reconstruction")
 				}
 			})
 		}

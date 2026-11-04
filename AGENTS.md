@@ -72,7 +72,7 @@ pcap/pcapng + 外部 SSLKEYLOG / 内嵌 DSB
 - 保持现有缓存上限和关闭语义；退出需释放路由、队列、解析器引用与连接额度，正常 EOF 需处理已缓冲数据。不得通过删除限制、无界等待或持有路由锁执行阻塞关闭修复问题。
 - `DecryptedPacket.Data` 带 `json:"-"`：直接 JSON 编码不会自动携带明文正文。Go CLI 的显式转换器与 C API 的 JSON 输出行为不同，修改时同时检查消费者预期。
 
-HTTP/3 需要包含客户端 Initial/ClientHello 的双向 UDP 抓包和匹配 TLS 1.3 secrets。真实夹具验证 QUIC v1/v2 的 AES-128-GCM 双向多次 Key Update；AES-256-GCM/ChaCha20 更新仅有向量和状态测试，draft-29 未通过真实抓包验证。QUIC 每方向保留当前/上一代及下一代候选，详见 `docs/API.md`。独立 aioquic 夹具覆盖 v1/v2 × 三套件的握手/应用解密、CID 轮换/迁移、Retry/VN 和 accepted/rejected 0-RTT（不扩大 Key Update 的实测套件范围）；零长度 CID 仅在唯一原 tuple 路由，early data 输出边界见 API 文档。QPACK 以静态表和 literal 为支持范围；不要宣称已支持动态表、TLS KeyUpdate、DATAGRAM、RESET 或 STARTTLS。C 的 `DecryptLiveTrafficToFile` 网卡接入仍是占位实现，E2E 验证其错误路径。
+HTTP/3 需要包含客户端 Initial/ClientHello 的双向 UDP 抓包和匹配 TLS 1.3 secrets。真实夹具验证 QUIC v1/v2 的 AES-128-GCM 双向多次 Key Update；AES-256-GCM/ChaCha20 更新仅有向量和状态测试，draft-29 未通过真实抓包验证。QUIC 每方向保留当前/上一代及下一代候选，详见 `docs/API.md`。独立 aioquic 夹具覆盖 v1/v2 × 三套件的握手/应用解密、CID 轮换/迁移、Retry/VN 和 accepted/rejected 0-RTT（不扩大 Key Update 的实测套件范围）；零长度 CID 仅在唯一原 tuple 路由，early data 输出边界见 API 文档。HTTP/3 已支持有界动态 QPACK、控制流、1xx/final/trailers、push 和 RESET_STREAM；双向动态 QPACK 的独立真实夹具使用 QUIC v1。decoder feedback 仅被动读取，不发送 ACK；消息与资源契约见 API 文档。不要宣称已支持 TLS KeyUpdate、DATAGRAM 或 STARTTLS。C 的 `DecryptLiveTrafficToFile` 网卡接入仍是占位实现，E2E 验证其错误路径。
 
 ## 编译环境与命令
 

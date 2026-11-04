@@ -147,21 +147,25 @@ raw 事件复用 `DecryptedPacket`：`Protocol` 为 `tls` 或 `quic`，`Data` �
 
 | 字段 | 类型和含义 |
 | --- | --- |
-| `kind` | `stream_chunk`，或不携带数据的 `stream_end` |
+| `kind` | `stream_chunk`，或不携带数据的 `stream_end` / QUIC `stream_reset` |
 | `offset` | `uint64`，TLS 按连接/方向，QUIC 按连接/方向/stream 的字节偏移 |
-| `end` | `bool`，QUIC 表示连续数据到达 FIN；TLS 表示捕获输入结束 |
+| `end` | `bool`，QUIC 表示连续数据到达 FIN 或收到 RESET_STREAM；TLS 表示捕获输入结束 |
 | `stream_id` | QUIC 的 `uint64` stream ID；TLS 不设置 |
+| `error_code` | 仅 `stream_reset`，`uint64` 应用错误码；此时 `offset` 是最终大小，不保证此前所有字节都已捕获 |
 
 chunk 边界不是应用消息边界，raw 与应用解析互斥，不依赖 ALPN 或自动识别。
 TLS 终止错误时保留已认证字节并返回错误，不发送正常结束标记；捕获结束本身
 不证明应用消息完整。QUIC 只输出连续 STREAM 字节，已知 offset 缺口在关闭时报错。
-不支持 DATAGRAM 输出、RESET、TLS KeyUpdate 或 STARTTLS；QUIC Key Update、
+RESET_STREAM 释放该方向的重组和解析缓存，保留有界终止标记以去重；它不伪装为完整 HTTP 消息。
+0-RTT RESET 使用下述接受/拒绝规则和独立 early 空间，raw reset 同样带阶段/接受状态。
+STOP_SENDING 只表示请求对端停止，不能替代 RESET 或 FIN。
+不支持 DATAGRAM 输出、TLS KeyUpdate 或 STARTTLS；QUIC Key Update、
 CID/Retry/VN 和 0-RTT 支持范围见下节。现有 QUIC 16 MiB stream offset 上限仍适用。
 
 `Diagnostic` 仅含连接标识、传输、阶段和固定原因码，不含底层错误字符串。
 典型原因包括 `waiting_secret`、`missing_secret`、`missing_client_hello`、
 `unsupported_version`、`unsupported_cipher`、`authentication_failed`、
-`unsupported_protocol`、`parse_failed`、`truncated_record`、`incomplete_stream`
+`unsupported_protocol`、`parse_failed`、`parse_timeout`、`truncated_record`、`incomplete_stream`
 和 `resource_limit`。`waiting_secret` 表示暂时等待，并非最终失败；只有 application
 secret 时，无法区分仅含加密握手的记录与缺少正确密钥的应用记录，终止时报告
 `no_authenticated_application_data`，不直接判定认证失败。
@@ -513,7 +517,7 @@ for packet := range packetChan {
     "path": "/path",              // 请求路径
     "authority": "example.com",   // :authority 伪头
     "scheme": "https",            // :scheme 伪头
-    "headers": http.Header{...},  // 所有头部（QPACK 解码后）
+    "headers": http.Header{...},  // 普通头部，不含伪头和 trailers
 }
 ```
 
@@ -521,10 +525,24 @@ for packet := range packetChan {
 ```go
 {
     "stream_id": 0,               // QUIC 流 ID
-    "status": "200",              // :status 伪头
-    "headers": http.Header{...},  // 所有头部（QPACK 解码后）
+    "status": 200,                // int，:status 伪头
+    "headers": http.Header{...},  // 普通头部，不含伪头和 trailers
 }
 ```
+
+连接内的 client/server QPACK 动态表相互独立，控制流、encoder/decoder 流、请求流与 push 流分别处理。支持静态表、字面量、Huffman、动态插入/复制/淘汰及相对和 post-base 引用。HEADERS 等待 encoder 指令时保留冻结的 Required Insert Count；插入到达后立即恢复，不等下一业务包或 EOF。对端 SETTINGS 迟到时按原顺序有界重放待处理数据。SDK 被动观察 decoder feedback 的指令格式，不发送 ACK、不驱动对端，也不依据抓包到达顺序验证 ACK 所对应的发送端引用生命周期。
+
+- 完整请求、最终响应在该方向 FIN 时输出。`Data` 保持 HTTP/3 文本头 + `\r\n\r\n` + 精确 body 字节；`headers` 只包含普通初始头部。
+- 1xx（不含非法的 101）立即以 `kind="informational"`、`status` 为 `int` 输出，保留原 `stream_id`；不会占用最终响应。`trailers` 为单独的 `http.Header`，只在存在非空 trailers 时设置，不合并进 `headers` 或 `Data`。
+- push 响应使用 `kind="push_response"`、实际 push `stream_id`、`push_id`、`parent_stream_id`；`method/path/scheme/authority/promise_headers` 描述关联 PUSH_PROMISE 请求。push 字节可先于 promise/授权到达，但关联完整后才交付。push 的 1xx 仍为 `informational` 并携带 push 标识。相同 promise 去重，取消/RESET 丢弃未完成响应。
+- CLI HAR 配对只使用普通请求和最终响应；信息响应与 push 不冒充原请求的最终响应。JSON/SDK 消费者可以按上述 `kind` 区分；`Data` 的 JSON 排除规则不变。
+- SETTINGS 必须是控制流首帧，拒绝重复控制/QPACK 流、重复/保留 SETTINGS、非法帧位置及关键流关闭。未知合法帧/单向流跳过；不按其声明长度分配内存。
+
+上限：每方向实际动态表 64 KiB、每个解码字段节 64 KiB（按 name + value + 32 计）/1024 字段；每方向最多 64 条阻塞流，同时受对端 SETTINGS 限制。解析器最多保留 1024 个流标记、128 个 push；每个未关联 push 最多 16 个信息响应；待 SETTINGS 重放每方向最多 4096 个片段。连接内消息/流缓冲和待重放字节共 32 MiB，单消息/底层 QUIC stream offset 仍为 16 MiB。超限返回终止错误并报告 `protocol/resource_limit`，不跳过失败断言或扩大缓存。
+
+QPACK、SETTINGS 和消息顺序错误报告 `protocol/parse_failed`，不归为密码学认证失败。阻塞压缩/未关联 push 使用实际时间的 `KeyWaitTimeout`，逾期报告 `protocol/parse_timeout`；EOF 尚有不完整状态也返回错误。RESET、取消和关闭释放等待数据，正常结束仅保留有界去重/关联信息；输出继续遵守串行背压。缺失必要 encoder 历史或 SETTINGS 的片段捕获不能保证动态解码。扩展 CONNECT、长流增量输出以及 DATAGRAM 不在此支持范围。
+
+独立 `http3_dynamic_aioquic` 夹具及 [复现步骤](../test/fixtures/http3_capture/README.md#dynamic-qpack-and-message-state-fixture) 覆盖 QUIC v1、两条连接、双向动态表、延迟/拆分 encoder、103→200→trailers、push/reset；v2 的动态 HTTP/3 组合和 0-RTT RESET 尚无真实夹具，后者仅有状态回归。
 
 ### WebSocket
 
@@ -553,7 +571,7 @@ for packet := range packetChan {
 |------|---------------|----------|------|
 | HTTP/1.1 | `http/1.1` | ✅ 完整 | 包括 chunked 编码 |
 | HTTP/2 | `http/2` | ✅ 完整 | 帧解析、流重组 |
-| HTTP/3 | `http/3` | ✅ 完整 | QUIC + QPACK |
+| HTTP/3 | `http/3` | ✅ 有界消息解析 | QUIC + 动态 QPACK；边界见上节 |
 | WebSocket | `websocket` | ✅ 完整 | 包括分片消息 |
 
 ---
