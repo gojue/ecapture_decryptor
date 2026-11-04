@@ -155,8 +155,8 @@ raw 事件复用 `DecryptedPacket`：`Protocol` 为 `tls` 或 `quic`，`Data` �
 chunk 边界不是应用消息边界，raw 与应用解析互斥，不依赖 ALPN 或自动识别。
 TLS 终止错误时保留已认证字节并返回错误，不发送正常结束标记；捕获结束本身
 不证明应用消息完整。QUIC 只输出连续 STREAM 字节，已知 offset 缺口在关闭时报错。
-不新增 DATAGRAM、RESET、KeyUpdate、0-RTT 或 STARTTLS 支持；现有 QUIC 16 MiB
-stream offset 上限仍适用。
+不支持 DATAGRAM 输出、RESET、TLS KeyUpdate、0-RTT 或 STARTTLS；QUIC Key Update
+支持范围见下节。现有 QUIC 16 MiB stream offset 上限仍适用。
 
 `Diagnostic` 仅含连接标识、传输、阶段和固定原因码，不含底层错误字符串。
 典型原因包括 `waiting_secret`、`missing_secret`、`missing_client_hello`、
@@ -166,6 +166,31 @@ stream offset 上限仍适用。
 secret 时，无法区分仅含加密握手的记录与缺少正确密钥的应用记录，终止时报告
 `no_authenticated_application_data`，不直接判定认证失败。
 诊断用于解释输出缺失，不保证每个包一条，也不替代函数返回的终止错误。
+
+---
+
+#### QUIC Key Update
+
+QUIC v1/v2 的两个方向独立跟踪 application 密钥代次，支持 phase `0→1→0` 及后续更新。
+只需提供匹配的 `CLIENT_TRAFFIC_SECRET_0` / `SERVER_TRAFFIC_SECRET_0`；无需持续导入
+后续 secret。v1 使用 `quic ku`，v2 使用 `quicv2 ku`；header protection key 不变，
+包号不重置。只有 AEAD 认证成功且 phase/包号满足代次顺序时才推进状态或输出。
+
+每方向只尝试当前代、上一代和下一代候选，最多三代；尚未确认套件时最多有
+AES-128 / ChaCha20 两组候选。下一代派生结果会缓存，坏包不导致重复派生。
+上一代只接受比当前代已认证最小包号更早的包；更旧代在下一次成功换代时淘汰，
+全部状态在连接退出时释放。该保留策略按代次数量限制，不模拟端点的 ACK/PTO。
+待密钥队列按方向和加密级别保留输入顺序，避免密钥在重试途中到达时跳过旧代包。
+
+不会无限追算漏掉的代次；捕获缺失整个中间代、已淘汰旧代、错误 secret、篡改
+phase 或密文均可能导致 `decrypt/authentication_failed`，并保留终止错误。
+此诊断不声称能区分丢包、过旧包和坏密钥。raw/messages、文件和非 seekable 流式
+入口使用同一状态机，既有背压、缓存、等待期限和错误返回契约不变。
+
+真实 loopback 抓包验证 v1/v2 × AES-128-GCM 的双向多次更新；AES-256-GCM 和
+ChaCha20-Poly1305 由独立固定派生向量及状态测试覆盖，未宣称真实套件全矩阵通过。
+生成器修正、实际换代证据及命令见 [HTTP/3 fixture 说明](../test/fixtures/http3_capture/README.md#key-update-fixtures)。
+TLS 1.3 的 KeyUpdate 属于另一个协议状态机，本次没有新增其支持。
 
 ---
 

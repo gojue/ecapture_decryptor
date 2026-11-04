@@ -117,3 +117,114 @@ The two tcpdump fixtures use their matching checked-in NSS SSLKEYLOG files.
 The eCapture fixtures embed the Go TLS secrets as DSB blocks, so the SDK tests
 do not use their separate keylog files. eCapture may record both directions of
 loopback packets; the SDK test checks that each HTTP/3 message is emitted once.
+
+## Key Update fixtures
+
+`http3_keyupdate_v{1,2}.pcapng` and their matching `.keys` files were generated
+independently of eCapture on Linux ARM64 with Go 1.26.0, quic-go v0.59.1 and
+`dumpcap` on loopback. They contain 12 POSTs to `/update/0` through `/update/11`,
+each with `"payload-"` repeated 300 times. Each response is exactly
+`"POST /update/N " + requestBody`. ALPN is `h3`; ServerHello in both captures
+selects `TLS_AES_128_GCM_SHA256` (`0x1301`). Wire versions are `0x00000001` and
+`0x6b3343cf`. There are 148 / 144 captured packets respectively, with no capture
+drops. No external service, probe or private capture is needed.
+
+The generator now selects v1 by default, accepts `QUIC_VERSION=1|2`, and has a
+`client-updates` workload. It writes endpoint qlogs when `QLOGDIR` is set.
+The SDK tests compare bodies and header metadata semantically, raw bytes
+exactly, and replay both external keys and late DSBs without waiting for EOF.
+
+For compact fixtures, the **temporary generator dependency copy** changes
+`FirstKeyUpdateInterval` from 100 to 10 and `KeyUpdateInterval` from 100000 to
+10. This leaves real UDP, TLS, packet protection, acknowledgments and stream
+handling in quic-go. The module cache and both checked-in `go.mod` files stay
+unchanged.
+
+A separate generator defect was found during this validation: quic-go v0.59.1
+`internal/handshake/updatable_aead.go:getNextTrafficSecret` always uses
+`quic ku`, including v2. The uncorrected v2 capture failed at its first update.
+The temporary copy used for the committed v2 fixture selects `quicv2 ku` for
+v2, as required by [RFC 9369 §3.3.2](https://www.rfc-editor.org/rfc/rfc9369.html#section-3.3.2).
+The SDK does not accept the incorrect label as a fallback. The v1 fixture
+needs only the interval changes. These are explicitly patched quic-go capture
+results, not claims of unmodified quic-go v2 interoperability.
+
+To reproduce, run from this directory, using Go 1.26 and an installed dumpcap:
+
+```sh
+export GOWORK=off
+export FIXTURE_TMP="$(mktemp -d)"
+go mod download
+cp go.mod "$FIXTURE_TMP/fixture.mod"
+cp go.sum "$FIXTURE_TMP/fixture.sum"
+python3 - <<'PY'
+import os, pathlib, shutil, subprocess
+root = pathlib.Path(os.environ["FIXTURE_TMP"])
+source = subprocess.check_output(
+    ["go", "list", "-m", "-f", "{{.Dir}}", "github.com/quic-go/quic-go"], text=True).strip()
+copy = root / "quic-go"
+shutil.copytree(source, copy)
+p = copy / "internal/handshake/updatable_aead.go"
+p.chmod(0o644)
+s = p.read_text().replace("var FirstKeyUpdateInterval uint64 = 100",
+                          "var FirstKeyUpdateInterval uint64 = 10")
+old = 'return hkdfExpandLabel(hash, ts, []byte{}, "quic ku", hash.Size())'
+assert old in s
+s = s.replace(old, '''label := "quic ku"
+    if a.version == protocol.Version2 { label = "quicv2 ku" }
+    return hkdfExpandLabel(hash, ts, []byte{}, label, hash.Size())''')
+p.write_text(s)
+p = copy / "internal/protocol/params.go"
+p.chmod(0o644)
+p.write_text(p.read_text().replace("const KeyUpdateInterval = 100 * 1000",
+                                   "const KeyUpdateInterval = 10"))
+PY
+go mod edit -modfile="$FIXTURE_TMP/fixture.mod" \
+  -replace "github.com/quic-go/quic-go=$FIXTURE_TMP/quic-go"
+go build -modfile="$FIXTURE_TMP/fixture.mod" -o "$FIXTURE_TMP/http3-traffic" .
+
+for version in 1 2; do
+  export QUIC_VERSION="$version" QUIC_GO_DISABLE_GSO=true
+  export QLOGDIR="$FIXTURE_TMP/qlog-v$version"
+  mkdir "$QLOGDIR"
+  "$FIXTURE_TMP/http3-traffic" server 44433 > "$FIXTURE_TMP/server-v$version.log" 2>&1 &
+  server_pid=$!
+  sudo dumpcap -i lo -f 'udp port 44433' -a duration:6 -w - \
+    > "$FIXTURE_TMP/http3_keyupdate_v$version.pcapng" \
+    2> "$FIXTURE_TMP/dumpcap-v$version.log" &
+  capture_pid=$!
+  sleep 1
+  SSLKEYLOGFILE="$FIXTURE_TMP/http3_keyupdate_v$version.keys" \
+    "$FIXTURE_TMP/http3-traffic" client-updates 44433
+  wait "$capture_pid"
+  kill "$server_pid"
+  wait "$server_pid" || true
+ done
+```
+
+Check `security:key_updated` events and actual `transport:packet_sent` header
+`key_phase_bit` values in **both** endpoint qlogs. Merely lowering the interval
+is not evidence of an update. The committed captures' qlogs yielded these
+first three sending generations (inclusive packet numbers):
+
+| Version / sender | Generation 0, phase 0 | Generation 1, phase 1 | Generation 2, phase 0 | Last observed generation |
+| --- | --- | --- | --- | --- |
+| v1 client | 0–9 | 10–16 | 17–26 | 8 |
+| v1 server | 0–9 | 10–19 | 20–29 | 8 |
+| v2 client | 0–9 | 10–15 | 16–24 | 7 |
+| v2 server | 0–7 | 8–17 | 18–27 | 7 |
+
+The transport regression also decrypts these captures and asserts the final
+8/7 generations in each direction. SDK regressions require all 24 complete
+messages, their stream IDs, directions and exact bodies, plus file/stream raw
+byte equivalence. Independent Python HMAC/HKDF expectations in
+`transport/quic_decryptor_test.go` cover v1/v2 × AES-128/AES-256/ChaCha20;
+only AES-128 has real-traffic update coverage here. CID migration, Retry,
+0-RTT and the full D04.5 traffic matrix remain separate tasks.
+
+SHA-256 of the committed captures:
+
+```text
+bb79dfa129da4bbb0f0f783809715fa69fa57b35b0648522943ef200a6f33840  http3_keyupdate_v1.pcapng
+9e5201ec0f6c4331076b48c5da9409ce0f5bdc2e388de41c25d1b4ae82d067b1  http3_keyupdate_v2.pcapng
+```

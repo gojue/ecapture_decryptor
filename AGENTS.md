@@ -72,7 +72,7 @@ pcap/pcapng + 外部 SSLKEYLOG / 内嵌 DSB
 - 保持现有缓存上限和关闭语义；退出需释放路由、队列、解析器引用与连接额度，正常 EOF 需处理已缓冲数据。不得通过删除限制、无界等待或持有路由锁执行阻塞关闭修复问题。
 - `DecryptedPacket.Data` 带 `json:"-"`：直接 JSON 编码不会自动携带明文正文。Go CLI 的显式转换器与 C API 的 JSON 输出行为不同，修改时同时检查消费者预期。
 
-HTTP/3 需要包含客户端 Initial/ClientHello 的双向 UDP 抓包和匹配 TLS 1.3 secrets。真实夹具验证 QUIC v1；v2/draft-29 有密钥派生代码，不代表已通过真实抓包验证。QPACK 以静态表和 literal 为支持范围；不要宣称已支持动态表、连接迁移、KeyUpdate、0-RTT、DATAGRAM、RESET 或 STARTTLS。C 的 `DecryptLiveTrafficToFile` 网卡接入仍是占位实现，E2E 验证其错误路径。
+HTTP/3 需要包含客户端 Initial/ClientHello 的双向 UDP 抓包和匹配 TLS 1.3 secrets。真实夹具验证 QUIC v1/v2 的 AES-128-GCM 双向多次 Key Update；AES-256-GCM/ChaCha20 更新仅有向量和状态测试，draft-29 未通过真实抓包验证。QUIC 每方向保留当前/上一代及下一代候选，详见 `docs/API.md`。QPACK 以静态表和 literal 为支持范围；不要宣称已支持动态表、连接迁移、TLS KeyUpdate、0-RTT、DATAGRAM、RESET 或 STARTTLS。C 的 `DecryptLiveTrafficToFile` 网卡接入仍是占位实现，E2E 验证其错误路径。
 
 ## 编译环境与命令
 
@@ -131,7 +131,7 @@ go test -run 'TestDecryptTCPHTTPCaptures|TestDecryptHTTP3QUICCapture|TestDecrypt
 
 关键回归入口还包括 `quic_late_dsb_test.go`、`raw_stream_test.go`、`connection_routing_test.go`、`lifecycle_test.go` 和 `transport/*_lifecycle_test.go`。E2E 默认在临时目录生成产物并自动删除；需保留输出时使用 `python3 examples/test_e2e.py --output-dir test/result`。避免运行会重写已跟踪 `examples/go_static_demo/output_go_static.json` 的单示例 test 目标。
 
-CI 在 Ubuntu/macOS 上运行 `go test -v -race -coverprofile=coverage.out -covermode=atomic ./...`、静态/动态库构建和示例 E2E，并检查 gofmt、goimports、golangci-lint。局部代码修改只格式化涉及的 Go 文件；根 `make fmt` 会写整个仓库。`make check` 的格式检查只打印差异，不能仅凭退出码断言格式正确；要确认格式工具输出为空。`make tools` 使用 `@latest`，并非固定版本环境。
+CI 在 Ubuntu/macOS 上运行 `go test -v -race -coverprofile=coverage.out -covermode=atomic ./...`、静态/动态库构建和示例 E2E，并检查 gofmt、goimports、golangci-lint。局部代码修改只格式化涉及的 Go 文件；根 `make fmt` 会写整个仓库。`make check` 的格式检查只打印差异，不能仅凭退出码断言格式正确；要确认格式工具输出为空。`make tools` 固定 goimports v0.49.0、golangci-lint v1.64.8，以 `CGO_ENABLED=0` 构建工具；SDK 的 race/C 构建仍需 CGO。
 
 ## Linux VM 与真实夹具
 

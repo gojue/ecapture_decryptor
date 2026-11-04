@@ -80,8 +80,8 @@ check:
 # Install development tools
 tools:
 	@echo "Installing development tools..."
-	go install golang.org/x/tools/cmd/goimports@latest
-	go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+	CGO_ENABLED=0 go install golang.org/x/tools/cmd/goimports@v0.49.0
+	CGO_ENABLED=0 go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8
 	@echo "✓ Tools installed"
 
 # Release management
