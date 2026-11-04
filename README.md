@@ -76,6 +76,11 @@ err = ecapture_decryptor.DecryptPcapFile(keylogFile, pcapngFile, packetChan)
 
 `DecryptPcapngStream(ctx, input, emit)` reads complete blocks from a growing pcapng `io.ReadCloser` and loads NSS Key Log keys as soon as a DSB arrives. The DSB may appear after the handshake, the application data, or even after the last network packet. The SDK reassembles and deduplicates by TCP sequence number and emits complete HTTP/1.1 or HTTP/2 request/response pairs; an error returned by `emit` stops reading and is propagated. Cancelling `ctx` closes `input` to unblock reads. Callers should provide an `input` implementation that can be interrupted by `Close`, such as an `io.PipeReader` or a network connection.
 
+QUIC also retries buffered packets when matching secrets arrive, so a DSB after
+the last UDP packet can produce HTTP/3 messages or raw STREAM chunks while the
+input stays open. Existing pending-packet limits and missing-secret errors at
+close still apply.
+
 ```go
 err := ecapture_decryptor.DecryptPcapngStream(ctx, input, func(message *types.DecryptedPacket) error {
     // message.Data is the complete HTTP message; Metadata contains host/authority and stream_id.

@@ -201,10 +201,16 @@ func (q *QUICDecryptor) SetPacketTime(t time.Time) {
 // Decrypt starts the QUIC decryption process
 func (q *QUICDecryptor) Decrypt() error {
 	q.logger.Printf("QUIC decryption started for %s", q.connectionInfo)
+	updates := q.keyLog.Updates()
 	for {
 		select {
 		case <-q.wake:
 			q.drainQUICInput()
+		case <-updates:
+			// Resubscribe before looking up keys: a concurrent DSB must wake the
+			// next select even if it arrives during this retry.
+			updates = q.keyLog.Updates()
+			q.retryQUICPacketsWithNewKeys()
 		case <-q.closeCh:
 			q.drainQUICInput()
 			q.retryDeferredQUICPackets() // DSB may have arrived after the last packet.

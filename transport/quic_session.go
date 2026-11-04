@@ -110,6 +110,10 @@ func (q *QUICDecryptor) processQUICDatagram(datagram quicDatagram) {
 			q.flow.pendingBytes += len(packet.data)
 		}
 	}
+	q.retryQUICPacketsWithNewKeys()
+}
+
+func (q *QUICDecryptor) retryQUICPacketsWithNewKeys() {
 	if len(q.flow.pending) != 0 {
 		initialReady := q.clientInitialKeys != nil && !q.flow.initialRetried
 		var secrets *crypto.TLSSecrets
