@@ -8,6 +8,7 @@ package transport
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
@@ -50,11 +51,12 @@ type TLSDecryptor struct {
 	handshakeMu              sync.RWMutex // Protects handshake-related fields
 
 	// For ordered output - separate queues for requests and responses
-	requestQueue  []*DecryptedData // Queue for client requests
-	responseQueue []*DecryptedData // Queue for server responses
-	seqNum        uint64           // Global sequence number
-	outputDone    chan struct{}
-	queueMu       sync.Mutex // Mutex for queue operations
+	requestQueue       []*DecryptedData // Queue for client requests
+	responseQueue      []*DecryptedData // Queue for server responses
+	responseQueueBytes int
+	seqNum             uint64 // Global sequence number
+	outputDone         chan struct{}
+	queueMu            sync.Mutex // Mutex for queue operations
 
 	// Client state for inline decryption
 	clientEncryptionStarted bool
@@ -72,7 +74,9 @@ type TLSDecryptor struct {
 
 	// Close protection
 	closeOnce       sync.Once
+	stopInputOnce   sync.Once
 	isClosed        atomic.Bool // Track if connection is closed to suppress spurious errors
+	aborted         atomic.Bool // Resource/deadline failure must not be drained as a clean EOF.
 	closeSignal     chan struct{}
 	clientProcessMu sync.Mutex
 	serverProcessMu sync.Mutex
@@ -84,11 +88,12 @@ type TLSDecryptor struct {
 	parser types.StreamParserInterface
 
 	// Protocol detection
-	protocolDetected bool
-	sniffBuffer      []byte
-	pendingResponses [][]byte
-	protocolMu       sync.RWMutex                // Serializes parser feeds and protects detection state.
-	packetChan       chan *types.DecryptedPacket // 解密包输出通道
+	protocolDetected     bool
+	sniffBuffer          []byte
+	pendingResponses     [][]byte
+	pendingResponseBytes int
+	protocolMu           sync.RWMutex                // Serializes parser feeds and protects detection state.
+	packetChan           chan *types.DecryptedPacket // 解密包输出通道
 
 	// Packet timestamp from pcap
 	packetTime time.Time
@@ -98,6 +103,11 @@ type TLSDecryptor struct {
 	errMu      sync.Mutex
 	decryptErr error
 }
+
+const (
+	tlsPendingResponseLimit = 8 << 20
+	tlsPendingResponseCount = 64 << 10
+)
 
 // SetOptions must be called before feeding or decrypting the connection.
 func (td *TLSDecryptor) SetOptions(options types.DecryptOptions) { td.options = options }
@@ -191,9 +201,15 @@ func (td *TLSDecryptor) queueRequest(data []byte) {
 		for _, response := range td.pendingResponses {
 			td.parser.FeedResponse(response)
 		}
+	}
+	if td.protocolDetected {
 		td.pendingResponses = nil
+		td.pendingResponseBytes = 0
 	}
 	td.protocolMu.Unlock()
+	if td.packetChan != nil {
+		return // Library output is owned by the parser, not the stdout queues.
+	}
 
 	td.queueMu.Lock()
 	defer td.queueMu.Unlock()
@@ -227,12 +243,27 @@ func (td *TLSDecryptor) queueResponse(data []byte) {
 	} else if !td.protocolDetected && td.packetChan != nil {
 		// Decryption can finish on the server side before the client request
 		// selects a protocol parser. Preserve these bytes in record order.
+		if len(data) > tlsPendingResponseLimit-td.pendingResponseBytes || len(td.pendingResponses) >= tlsPendingResponseCount {
+			td.protocolMu.Unlock()
+			td.recordFailure("input", "resource_limit", errors.New("TLS pending response buffer limit exceeded"))
+			td.abortInput()
+			return
+		}
 		td.pendingResponses = append(td.pendingResponses, bytes.Clone(data))
+		td.pendingResponseBytes += len(data)
 	}
 	td.protocolMu.Unlock()
+	if td.packetChan != nil {
+		return
+	}
 
 	td.queueMu.Lock()
 	defer td.queueMu.Unlock()
+	if !td.hasSeenRequest && (len(data) > tlsPendingResponseLimit-td.responseQueueBytes || len(td.responseQueue) >= tlsPendingResponseCount) {
+		td.recordFailure("input", "resource_limit", errors.New("TLS response output queue limit exceeded"))
+		td.abortInput()
+		return
+	}
 
 	td.seqNum++
 	td.responseQueue = append(td.responseQueue, &DecryptedData{
@@ -240,6 +271,7 @@ func (td *TLSDecryptor) queueResponse(data []byte) {
 		SeqNum:    td.seqNum,
 		IsRequest: false,
 	})
+	td.responseQueueBytes += len(data)
 
 	// Flush output
 	td.flushOutput()
@@ -251,6 +283,7 @@ func (td *TLSDecryptor) flushOutput() {
 	// First, output all pending requests
 	for len(td.requestQueue) > 0 {
 		req := td.requestQueue[0]
+		td.requestQueue[0] = nil
 		td.requestQueue = td.requestQueue[1:]
 		td.writeOutput(req)
 	}
@@ -263,7 +296,9 @@ func (td *TLSDecryptor) flushOutput() {
 	// Then output all pending responses
 	for len(td.responseQueue) > 0 {
 		resp := td.responseQueue[0]
+		td.responseQueue[0] = nil
 		td.responseQueue = td.responseQueue[1:]
+		td.responseQueueBytes -= len(resp.Data)
 		td.writeOutput(resp)
 	}
 }
@@ -335,6 +370,7 @@ func (td *TLSDecryptor) FeedClient(data []byte) error {
 			return nil // Silently ignore write to closed pipe (connection already closed)
 		}
 		td.recordFailure("input", "resource_limit", err)
+		td.abortInput()
 		return err
 	}
 	// Try to decrypt available records inline
@@ -357,6 +393,7 @@ func (td *TLSDecryptor) FeedServer(data []byte) error {
 			return nil // Silently ignore write to closed pipe (connection already closed)
 		}
 		td.recordFailure("input", "resource_limit", err)
+		td.abortInput()
 		return err
 	}
 	// Try to decrypt available records inline
@@ -375,6 +412,9 @@ func (td *TLSDecryptor) processClientRecords() {
 	td.clientProcessMu.Lock()
 	defer td.clientProcessMu.Unlock()
 	for {
+		if td.aborted.Load() {
+			return
+		}
 		record := td.clientIn.TryReadRecord()
 		if record == nil {
 			return
@@ -452,6 +492,9 @@ func (td *TLSDecryptor) processServerRecords() {
 	td.serverProcessMu.Lock()
 	defer td.serverProcessMu.Unlock()
 	for {
+		if td.aborted.Load() {
+			return
+		}
 		record := td.serverIn.TryReadRecord()
 		if record == nil {
 			return
@@ -548,12 +591,25 @@ func (td *TLSDecryptor) CloseServer() error {
 	return nil
 }
 
-func (td *TLSDecryptor) Close() error {
-	td.closeOnce.Do(func() {
+// stopInput only unblocks readers. It must not acquire processing/parser locks:
+// callers include the handshake timer and a feed that reached a resource limit.
+func (td *TLSDecryptor) stopInput() {
+	td.stopInputOnce.Do(func() {
 		td.isClosed.Store(true) // Mark as closed before closing streams
 		close(td.closeSignal)
 		_ = td.clientIn.Close()
 		_ = td.serverIn.Close()
+	})
+}
+
+func (td *TLSDecryptor) abortInput() {
+	td.aborted.Store(true)
+	td.stopInput()
+}
+
+func (td *TLSDecryptor) Close() error {
+	td.closeOnce.Do(func() {
+		td.stopInput()
 		// Process any remaining records
 		td.handshakeMu.RLock()
 		complete := td.handshakeComplete
@@ -567,7 +623,7 @@ func (td *TLSDecryptor) Close() error {
 		parser := td.parser
 		td.protocolMu.RUnlock()
 
-		if parser != nil {
+		if parser != nil && !td.aborted.Load() {
 			parser.Flush()
 		}
 		// Final flush of any remaining queued data
@@ -580,11 +636,35 @@ func (td *TLSDecryptor) Close() error {
 }
 
 func (td *TLSDecryptor) Decrypt() error {
-	defer func() { _ = td.Close() }()
+	defer func() {
+		_ = td.Close()
+		td.releaseBuffers()
+	}()
 
-	// Parse handshake to get cipher suite and secrets
-	if err := td.parseHandshake(); err != nil {
-		return fmt.Errorf("parse handshake: %w", err)
+	// One deadline includes missing/partial hellos as well as missing secrets.
+	timeout := td.options.SecretWaitTimeout()
+	deadline := time.Now().Add(timeout)
+	var expired atomic.Bool
+	timerDone := make(chan struct{})
+	timer := time.AfterFunc(timeout, func() {
+		expired.Store(true)
+		td.abortInput()
+		close(timerDone)
+	})
+	err := td.parseHandshake()
+	if !timer.Stop() {
+		<-timerDone
+	}
+	if expired.Load() || !time.Now().Before(deadline) {
+		td.abortInput()
+		err = fmt.Errorf("TLS handshake/key wait exceeded %s: %w", timeout, context.DeadlineExceeded)
+		td.recordFailure("keys", "key_wait_timeout", err)
+	}
+	if err != nil {
+		td.errMu.Lock()
+		failure := td.decryptErr
+		td.errMu.Unlock()
+		return errors.Join(fmt.Errorf("parse handshake: %w", err), failure)
 	}
 	// Feed may have queued encrypted records while waiting for a late DSB.
 	// Drain them immediately; subsequent Feed calls use the same direction lock.
@@ -642,7 +722,7 @@ func (td *TLSDecryptor) Decrypt() error {
 	td.protocolMu.RUnlock()
 	// Close can run before this goroutine finishes draining queued TLS records.
 	// Flush again after the drain so close-delimited HTTP/1.0 bodies are emitted.
-	if parser != nil {
+	if parser != nil && !td.aborted.Load() {
 		parser.Flush()
 	}
 	if errorParser, ok := parser.(interface{ Err() error }); ok {
@@ -653,6 +733,28 @@ func (td *TLSDecryptor) Decrypt() error {
 	td.errMu.Lock()
 	defer td.errMu.Unlock()
 	return td.decryptErr
+}
+
+// releaseBuffers runs only after Decrypt has finished and Close has joined feeds.
+// Releasing earlier would discard bytes needed by EOF/late-DSB final draining.
+func (td *TLSDecryptor) releaseBuffers() {
+	td.clientProcessMu.Lock()
+	defer td.clientProcessMu.Unlock()
+	td.serverProcessMu.Lock()
+	defer td.serverProcessMu.Unlock()
+	td.clientIn.Discard()
+	td.serverIn.Discard()
+	td.protocolMu.Lock()
+	td.parser = nil
+	td.sniffBuffer = nil
+	td.pendingResponses = nil
+	td.pendingResponseBytes = 0
+	td.protocolMu.Unlock()
+	td.queueMu.Lock()
+	td.requestQueue = nil
+	td.responseQueue = nil
+	td.responseQueueBytes = 0
+	td.queueMu.Unlock()
 }
 
 // waitForClientClose waits for client stream to close and processes remaining records
@@ -704,7 +806,7 @@ func (td *TLSDecryptor) parseHandshake() error {
 			return len(s.ClientTrafficSecret) != 0 && len(s.ServerTrafficSecret) != 0
 		}
 		return len(s.MasterSecret) != 0
-	}, td.closeSignal, 30*time.Second)
+	}, td.closeSignal, td.options.SecretWaitTimeout())
 	if err != nil {
 		td.options.Report(td.ConnectionInfo, "keys", "missing_secret")
 		return fmt.Errorf("wait for TLS secrets: %w", err)

@@ -9,11 +9,16 @@ import (
 	"github.com/gojue/ecapture_decryptor/types"
 )
 
-const maxQUICStreamBytes = 16 << 20
+const (
+	maxQUICStreamBytes     = 16 << 20
+	maxQUICStreams         = 1024
+	maxQUICPendingSegments = 64 << 10
+)
 
 var (
-	errQUICStreamLimit = errors.New("QUIC stream exceeds size limit")
-	errQUICBufferLimit = errors.New("QUIC stream reassembly buffer exceeds limit")
+	errQUICStreamLimit      = errors.New("QUIC stream exceeds size limit")
+	errQUICBufferLimit      = errors.New("QUIC stream reassembly buffer exceeds limit")
+	errQUICStreamCountLimit = errors.New("QUIC stream count limit exceeded")
 )
 
 type quicStreamKey struct {
@@ -49,8 +54,8 @@ func (s *quicStreamAssembler) push(offset uint64, data []byte, fin bool) ([][]by
 		if s.pending == nil {
 			s.pending = make(map[uint64][]byte)
 		}
-		if old := s.pending[offset]; len(old) < len(data) {
-			if s.pendingBytes-len(old)+len(data) > maxQUICStreamBytes {
+		if old, exists := s.pending[offset]; len(old) < len(data) {
+			if !exists && len(s.pending) >= maxQUICPendingSegments || s.pendingBytes-len(old)+len(data) > maxQUICStreamBytes {
 				return nil, false, errQUICBufferLimit
 			}
 			s.pendingBytes += len(data) - len(old)
@@ -310,6 +315,10 @@ func (q *QUICDecryptor) feedQUICStream(id, offset uint64, data []byte, fin, isCl
 	key := quicStreamKey{id: id, isClient: isClient}
 	stream := q.flow.streams[key]
 	if stream == nil {
+		if len(q.flow.streams) >= maxQUICStreams {
+			q.reportQUICReassemblyError(errQUICStreamCountLimit)
+			return errQUICStreamCountLimit
+		}
 		stream = &quicStreamAssembler{}
 		q.flow.streams[key] = stream
 	}
@@ -348,8 +357,10 @@ func (q *QUICDecryptor) feedQUICStream(id, offset uint64, data []byte, fin, isCl
 
 func (q *QUICDecryptor) reportQUICReassemblyError(err error) {
 	code := "invalid_stream"
-	if errors.Is(err, errQUICStreamLimit) || errors.Is(err, errQUICBufferLimit) {
+	if errors.Is(err, errQUICStreamLimit) || errors.Is(err, errQUICBufferLimit) || errors.Is(err, errQUICStreamCountLimit) {
 		code = "resource_limit"
+		q.flow.terminalErr = err
+		_ = q.Close()
 	}
 	q.options.Report(q.connectionInfo, "reassembly", code)
 }

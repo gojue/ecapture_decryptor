@@ -78,8 +78,10 @@ err = ecapture_decryptor.DecryptPcapFile(keylogFile, pcapngFile, packetChan)
 
 QUIC also retries buffered packets when matching secrets arrive, so a DSB after
 the last UDP packet can produce HTTP/3 messages or raw STREAM chunks while the
-input stays open. Existing pending-packet limits and missing-secret errors at
-close still apply.
+input stays open. Handshake/key waits default to 30 seconds, idle connections
+to five minutes, and concurrent decryptors to 1024 (including closing workers).
+See the [API contract](docs/API.md#decryptpcapngstreamwithoptions--withoptions)
+for options, fixed buffer limits, diagnostics and output backpressure.
 
 ```go
 err := ecapture_decryptor.DecryptPcapngStream(ctx, input, func(message *types.DecryptedPacket) error {

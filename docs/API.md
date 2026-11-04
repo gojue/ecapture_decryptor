@@ -108,13 +108,38 @@ err := ecapture_decryptor.DecryptPcapngStreamWithOptions(ctx, input, emit, optio
 ```
 
 `input` 必须支持通过 `Close` 中断读取。`emit` 串行执行；其错误停止输入并返回。
-诊断回调可能并发执行，必须及时返回，不应回调解密引擎。
+诊断回调可能并发执行，必须及时返回，不应回调解密引擎。输出保持背压；调用方
+必须消费 packet channel，并让 `emit` 返回，超时和取消不能中断调用方阻塞的回调。
 
 QUIC 的待解密包会由密钥更新唤醒重试，不需要新的 UDP 包或输入 EOF；这同样
-适用于末尾才到达的 DSB。尚未获得所需密钥的包继续等待，仍受原有缓存上限和
+适用于末尾才到达的 DSB。尚未获得所需密钥的包继续等待，受下述期限、缓存上限和
 关闭时错误检查约束。底层 `crypto.KeyLogStore.Updates()` 返回当前广播通道快照：
 添加密钥会关闭该通道。调用方应先订阅、再读取密钥；收到通知后先重新订阅、
 再重读，避免错过并发更新。通知可能属于其他连接或重复密钥，不等同于目标密钥已就绪。
+
+`DecryptOptions` 的资源选项对文件和流式入口均有效，非正值采用默认值：
+
+| 选项 | 默认值与行为 |
+| --- | --- |
+| `KeyWaitTimeout` | 30 秒。TLS 从解密启动起限制握手与密钥获取的总时间；QUIC 从首个缺密钥包入队计时，待解密队列清空后才重置。部分或重复密钥不延期 |
+| `IdleTimeout` | 5 分钟。按实际时间回收没有输入包的连接；抓包时间戳不驱动期限。正常 EOF/取消后的排空不计空闲超时 |
+| `MaxConnections` | 1024。包含已关闭但尚未结束的解密 goroutine；完成清理后释放额度，超限的新连接被拒绝 |
+
+等待超时报告 `keys/key_wait_timeout`，空闲回收报告 `input/idle_timeout`；并发
+上限报告 `input/connection_limit`（每引擎一次）。这些情况会保留终止错误。
+连接退出后释放路由、缓存和解析器引用；正常 EOF 仍先处理已缓冲数据和末尾 DSB。
+
+固定缓存边界：TLS 每方向输入 8 MiB，server-first 和旧 stdout 响应队列各
+8 MiB / 65,536 块；QUIC 输入及待密钥队列各 32 MiB / 65,536 包，每连接最多
+1,024 个方向化 stream 状态（含完成标记）。TCP 每方向乱序重组保持 4 MiB，
+QUIC 每个 STREAM/CRYPTO assembler 保持 16 MiB，两者各最多 65,536 个乱序片段。
+超限报告 `resource_limit` 并终止该连接。这些是各组件上限，不是整个引擎的统一
+内存预算；现有应用 parser 上限继续有效。
+
+keylog 的 `Write` / `LoadFromReader` 导入每行最多 4096 字节（LF 前）、最多
+16,384 个 client random、16 MiB secret 字节；超限返回不含内容的
+`crypto.ErrKeyLogResourceLimit`，已导入密钥保留，未完成行释放。同 key 更新按
+字节增量计费。兼容入口 `AddSecret` 信任调用方管理内存，不应用导入上限。
 
 raw 事件复用 `DecryptedPacket`：`Protocol` 为 `tls` 或 `quic`，`Data` 是
 已认证的原始字节；`Direction=request/response` 分别表示客户端到服务端、

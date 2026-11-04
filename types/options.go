@@ -3,7 +3,9 @@
 
 package types
 
-// DecryptOptions controls application output without changing packet decryption.
+import "time"
+
+// DecryptOptions controls output and connection resource boundaries.
 type DecryptOptions struct {
 	// RawChunks emits authenticated TLS bytes or QUIC STREAM chunks instead of
 	// parsed application messages. Chunk boundaries are not message boundaries.
@@ -11,6 +13,36 @@ type DecryptOptions struct {
 	// OnDiagnostic receives payload-free connection diagnostics. Calls may be
 	// concurrent; the callback must return promptly and must not call the engine.
 	OnDiagnostic func(Diagnostic)
+	// KeyWaitTimeout bounds handshake/key acquisition in wall-clock time.
+	// Non-positive values use 30 seconds.
+	KeyWaitTimeout time.Duration
+	// IdleTimeout reclaims connections without input packets in wall-clock time.
+	// Non-positive values use five minutes; capture timestamps do not drive it.
+	IdleTimeout time.Duration
+	// MaxConnections bounds concurrent decryptors, including closing generations.
+	// Non-positive values use 1024.
+	MaxConnections int
+}
+
+func (o DecryptOptions) SecretWaitTimeout() time.Duration {
+	if o.KeyWaitTimeout > 0 {
+		return o.KeyWaitTimeout
+	}
+	return 30 * time.Second
+}
+
+func (o DecryptOptions) ConnectionIdleTimeout() time.Duration {
+	if o.IdleTimeout > 0 {
+		return o.IdleTimeout
+	}
+	return 5 * time.Minute
+}
+
+func (o DecryptOptions) ConnectionLimit() int {
+	if o.MaxConnections > 0 {
+		return o.MaxConnections
+	}
+	return 1024
 }
 
 // Diagnostic identifies the stage and reason for incomplete or failed output.

@@ -31,7 +31,11 @@ const (
 	QUICPacketTypeHandshake = 0x02
 	QUICPacketTypeRetry     = 0x03
 	QUICPacketType1RTT      = 0x04
+	maxQUICBufferedBytes    = 32 << 20
+	maxQUICQueuedPackets    = 64 << 10
 )
+
+var errQUICInputLimit = errors.New("QUIC input buffer limit exceeded")
 
 // QUIC v1 Initial salt (RFC 9001)
 var quicV1InitialSalt = []byte{
@@ -65,6 +69,8 @@ type QUICDecryptor struct {
 	packetTime     time.Time
 	wake           chan struct{}
 	input          []quicDatagram
+	inputBytes     int
+	inputErr       error
 	flow           *quicFlowState
 	options        types.DecryptOptions
 	packetChan     chan *types.DecryptedPacket
@@ -199,20 +205,79 @@ func (q *QUICDecryptor) SetPacketTime(t time.Time) {
 }
 
 // Decrypt starts the QUIC decryption process
-func (q *QUICDecryptor) Decrypt() error {
+func (q *QUICDecryptor) Decrypt() (result error) {
 	q.logger.Printf("QUIC decryption started for %s", q.connectionInfo)
+	var keyTimer *time.Timer
+	var keyTimeout <-chan time.Time
+	var keyDeadline time.Time
+	defer func() {
+		if keyTimer != nil {
+			keyTimer.Stop()
+		}
+		_ = q.Close()
+		q.mu.Lock()
+		q.input = nil
+		q.inputBytes = 0
+		result = errors.Join(result, q.inputErr)
+		q.mu.Unlock()
+		q.flow = newQUICFlowState()
+		q.http3Parser = nil
+		q.clientInitialKeys, q.serverInitialKeys = nil, nil
+		q.destConnID = nil
+	}()
 	updates := q.keyLog.Updates()
 	for {
+		q.mu.Lock()
+		inputFailed := q.inputErr != nil
+		q.mu.Unlock()
+		if inputFailed {
+			return nil // The deferred cleanup preserves the queue error.
+		}
+		if q.flow.terminalErr != nil {
+			return q.flow.terminalErr
+		}
+		if q.flow.pendingSince.IsZero() {
+			if keyTimer != nil {
+				keyTimer.Stop()
+			}
+			keyTimeout, keyDeadline = nil, time.Time{}
+		} else {
+			deadline := q.flow.pendingSince.Add(q.options.SecretWaitTimeout())
+			if !deadline.After(time.Now()) {
+				q.options.Report(q.connectionInfo, "keys", "key_wait_timeout")
+				return errors.New("timed out waiting for QUIC secrets")
+			}
+			if !deadline.Equal(keyDeadline) {
+				if keyTimer == nil {
+					keyTimer = time.NewTimer(time.Until(deadline))
+				} else {
+					keyTimer.Reset(time.Until(deadline))
+				}
+				keyTimeout, keyDeadline = keyTimer.C, deadline
+			}
+		}
 		select {
 		case <-q.wake:
-			q.drainQUICInput()
+			q.drainQUICInput(true)
 		case <-updates:
 			// Resubscribe before looking up keys: a concurrent DSB must wake the
 			// next select even if it arrives during this retry.
 			updates = q.keyLog.Updates()
 			q.retryQUICPacketsWithNewKeys()
+		case <-keyTimeout:
+			q.options.Report(q.connectionInfo, "keys", "key_wait_timeout")
+			return errors.New("timed out waiting for QUIC secrets")
 		case <-q.closeCh:
-			q.drainQUICInput()
+			q.drainQUICInput(false)
+			q.mu.Lock()
+			inputFailed = q.inputErr != nil
+			q.mu.Unlock()
+			if inputFailed {
+				return nil
+			}
+			if q.flow.terminalErr != nil {
+				return q.flow.terminalErr
+			}
 			q.retryDeferredQUICPackets() // DSB may have arrived after the last packet.
 			if len(q.flow.pending) != 0 {
 				if len(q.flow.clientRandom) == 0 {
@@ -243,18 +308,23 @@ func (q *QUICDecryptor) Decrypt() error {
 	}
 }
 
-func (q *QUICDecryptor) drainQUICInput() {
+func (q *QUICDecryptor) drainQUICInput(stopAtDeadline bool) {
 	for {
 		q.mu.Lock()
-		if len(q.input) == 0 {
+		if len(q.input) == 0 || q.inputErr != nil {
 			q.mu.Unlock()
 			return
 		}
 		item := q.input[0]
 		q.input[0] = quicDatagram{}
 		q.input = q.input[1:]
+		q.inputBytes -= len(item.data)
 		q.mu.Unlock()
 		q.processQUICDatagram(item)
+		if q.flow.terminalErr != nil || stopAtDeadline && !q.flow.pendingSince.IsZero() &&
+			time.Since(q.flow.pendingSince) >= q.options.SecretWaitTimeout() {
+			return
+		}
 	}
 }
 
@@ -315,11 +385,25 @@ func (q *QUICDecryptor) FeedServer(data []byte) error {
 
 func (q *QUICDecryptor) queueQUICDatagram(data []byte, isClient bool) error {
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	if q.isClosed {
+		q.mu.Unlock()
 		return io.ErrClosedPipe
 	}
+	if len(data) == 0 {
+		q.mu.Unlock()
+		return nil
+	}
+	if len(data) > maxQUICBufferedBytes-q.inputBytes || len(q.input) >= maxQUICQueuedPackets {
+		q.inputErr = errQUICInputLimit
+		q.isClosed = true
+		q.mu.Unlock()
+		q.options.Report(q.connectionInfo, "input", "resource_limit")
+		_ = q.Close()
+		return errQUICInputLimit
+	}
 	q.input = append(q.input, quicDatagram{data: append([]byte(nil), data...), isClient: isClient, at: q.packetTime})
+	q.inputBytes += len(data)
+	q.mu.Unlock()
 	select {
 	case q.wake <- struct{}{}:
 	default:
