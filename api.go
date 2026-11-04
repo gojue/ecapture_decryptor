@@ -135,6 +135,7 @@ type DecryptorEngine struct {
 	factory        *DecryptorFactory
 	conntrack      map[string]types.Decryptor
 	tcpFlows       map[string]*tcpConnection
+	quic           *quicRouter
 	nextGeneration uint64
 	connections    sync.WaitGroup
 	mu             sync.RWMutex // protects conntrack
@@ -345,6 +346,7 @@ func (e *DecryptorEngine) waitForAllConnections() {
 	e.mu.Unlock()
 	e.closeAllConnections()
 	e.connections.Wait()
+	e.expireQUICPending(time.Now(), true)
 	e.logger.Println("All connections finished")
 }
 
@@ -388,6 +390,10 @@ func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.Tr
 		FD:          0,
 		ProcessName: "decryptor",
 	}
+	if key.Proto == types.TransportProtocolUDP {
+		e.handleQUICPacket(key, transportLayer.GetPayload(), packetTime)
+		return
+	}
 	rkey := key.Reverse()
 	baseKey := key.String()
 	reverseKey := rkey.String()
@@ -418,10 +424,6 @@ func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.Tr
 		if newConnection && ct != nil && flow != nil && flow.hasClientSYN && flow.clientSYNSeq == tcp.Seq {
 			return // A duplicated loopback SYN belongs to the existing TCP flow.
 		}
-	} else if key.Proto == types.TransportProtocolUDP {
-		// QUIC retransmits Initial packets in both directions. They belong to
-		// the existing flow rather than starting a new TCP-style generation.
-		newConnection = newConnection && ct == nil
 	}
 	if newConnection {
 		if ct != nil {
@@ -477,15 +479,6 @@ func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.Tr
 			e.active--
 			e.mu.Unlock()
 		}()
-		// Unlike a TCP SYN, a QUIC Initial datagram carries encrypted handshake
-		// data. The decryptor must receive the packet that created the flow.
-		if key.Proto == types.TransportProtocolUDP && len(transportLayer.GetPayload()) > 0 {
-			ct.SetPacketTime(packetTime)
-			if err := ct.FeedClient(transportLayer.GetPayload()); err != nil {
-				e.recordConnectionError(fmt.Errorf("feed QUIC connection %s: %w", ct.GetAddr(), err))
-				_ = ct.Close()
-			}
-		}
 		return
 	}
 	if ct == nil {

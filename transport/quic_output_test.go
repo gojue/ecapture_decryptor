@@ -6,6 +6,7 @@ package transport
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -235,4 +236,156 @@ func TestQUICRawIncompleteStreamDiagnosticOnClose(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestQUICEarlyDataAcceptanceAndReplay(t *testing.T) {
+	for _, raw := range []bool{false, true} {
+		for _, status := range []string{"accepted", "rejected", "unknown"} {
+			t.Run(fmt.Sprintf("raw=%v/%s", raw, status), func(t *testing.T) {
+				q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: raw})
+				// A literal/static QPACK GET request, duplicated across encryption levels.
+				data := []byte{1, 5, 0, 0, 0xd1, 0xd7, 0xc1}
+				frame := append([]byte{0x0f, 0, 0, byte(len(data))}, data...)
+				if err := q.parseQUICFrames(frame, quicLevelEarly, true, time.Time{}); err != nil {
+					t.Fatal(err)
+				}
+				if len(out) != 0 {
+					t.Fatal("early data emitted before acceptance was known")
+				}
+				if status != "unknown" {
+					ee := []byte{8, 0, 0, 2, 0, 0}
+					if status == "accepted" {
+						ee = []byte{8, 0, 0, 6, 0, 4, 0, 42, 0, 0}
+					}
+					// Deliberately reordered CRYPTO fragments.
+					if err := q.observeServerCrypto(quicLevelHandshake, 3, ee[3:]); err != nil {
+						t.Fatal(err)
+					}
+					if len(out) != 0 {
+						t.Fatal("partial handshake confirmed early data")
+					}
+					if err := q.observeServerCrypto(quicLevelHandshake, 0, ee[:3]); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := q.finishQUICEarly(); err == nil {
+					t.Fatal("unknown acceptance was not returned")
+				}
+				if err := q.parseQUICFrames(frame, quicLevelApplication, true, time.Time{}); err != nil {
+					t.Fatal(err)
+				}
+				if err := q.parseQUICFrames(frame, quicLevelApplication, true, time.Time{}); err != nil {
+					t.Fatal(err)
+				}
+				want := 1
+				if raw && status != "accepted" {
+					want = 2
+				}
+				if len(out) != want {
+					t.Fatalf("outputs=%d want=%d", len(out), want)
+				}
+				if raw {
+					p := <-out
+					if p.Metadata["encryption_level"] != "0rtt" || p.Metadata["early_data"] != status || !bytes.Equal(p.Data, data) {
+						t.Fatalf("early metadata %v", p.Metadata)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestQUICEarlyPacketNumberAndMissingSecret(t *testing.T) {
+	for _, version := range []uint32{quicVersion1, quicVersion2} {
+		q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true})
+		q.version = version
+		key, _ := deriveQUICKeys(bytes.Repeat([]byte{7}, 32), version, quicAES128)
+		q.flow.keys[0][quicLevelEarly] = []*QUICKeys{key}
+		q.flow.keys[0][quicLevelApplication] = []*QUICKeys{key}
+		q.flow.early.status = "accepted"
+		early := quicLongTestPacket(t, version, QUICPacketType0RTT, nil, nil, nil, key, 255, []byte{0x0e, 0, 0, 3, 'a', 'b', 'c'})
+		if _, err := q.processQUICPacket(early, true, time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		later := quicKeyPhasePacket(t, key, 256, 0, []byte{0x0f, 0, 3, 3, 'd', 'e', 'f'})
+		if _, err := q.processQUICPacket(later, true, time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		if q.flow.largest[0][quicLevelApplication] != 256 || len(out) != 2 {
+			t.Fatal("0/1-RTT did not share PN space")
+		}
+		rejected, _ := newQUICOutputTest(t, types.DecryptOptions{})
+		rejected.version = version
+		rejected.flow.early.status = "rejected"
+		rejected.flow.keys[0][quicLevelEarly] = []*QUICKeys{key}
+		rejected.flow.keys[0][quicLevelApplication] = []*QUICKeys{key}
+		if _, err := rejected.processQUICPacket(early, true, time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		ping := quicKeyPhasePacket(t, key, 256, 0, []byte{1, 0, 0})
+		if _, err := rejected.processQUICPacket(ping, true, time.Time{}); err != nil || rejected.flow.largest[0][quicLevelApplication] != 256 {
+			t.Fatal("rejected authenticated 0-RTT did not advance shared PN", err)
+		}
+		missing, _ := newQUICOutputTest(t, types.DecryptOptions{})
+		missing.version = version
+		if pending, err := missing.processQUICPacket(early, true, time.Time{}); err != nil || !pending {
+			t.Fatal("missing early key was not deferred")
+		}
+		missing.flow.early.status = "rejected"
+		if pending, err := missing.processQUICPacket(early, true, time.Time{}); err != nil || pending {
+			t.Fatal("rejected early ciphertext blocked replay")
+		}
+	}
+}
+
+func TestQUICRejectedEarlyWithoutSecretClearsPending(t *testing.T) {
+	q, _ := newQUICOutputTest(t, types.DecryptOptions{})
+	q.version = quicVersion1
+	key, _ := deriveQUICKeys(bytes.Repeat([]byte{5}, 32), quicVersion1, quicAES128)
+	early := quicLongTestPacket(t, quicVersion1, QUICPacketType0RTT, nil, nil, nil, key, 0, []byte{0x0b, 0, 3, 'a', 'b', 'c'})
+	q.processQUICDatagram(quicDatagram{data: early.data, isClient: true})
+	if len(q.flow.pending) != 1 {
+		t.Fatal("missing secret was not queued")
+	}
+	if err := q.observeServerCrypto(quicLevelHandshake, 0, []byte{8, 0, 0, 2, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	q.retryQUICPacketsWithNewKeys()
+	if len(q.flow.pending) != 0 || !q.flow.pendingSince.IsZero() {
+		t.Fatal("rejected early data still requires a secret")
+	}
+}
+
+func TestQUICRejectedEarlyAtEOF(t *testing.T) {
+	q, _ := newQUICOutputTest(t, types.DecryptOptions{})
+	q.version = quicVersion1
+	key, _ := deriveQUICKeys(bytes.Repeat([]byte{5}, 32), quicVersion1, quicAES128)
+	early := quicLongTestPacket(t, quicVersion1, QUICPacketType0RTT, nil, nil, nil, key, 0, []byte{0x0b, 0, 3, 'a', 'b', 'c'})
+	handshake := quicLongTestPacket(t, quicVersion1, QUICPacketTypeHandshake, nil, nil, nil, key, 0, []byte{6, 0, 6, 8, 0, 0, 2, 0, 0})
+	q.processQUICDatagram(quicDatagram{data: early.data, isClient: true})
+	q.processQUICDatagram(quicDatagram{data: handshake.data})
+	if len(q.flow.pending) != 2 {
+		t.Fatal("setup did not defer early data and handshake")
+	}
+	q.flow.keys[1][quicLevelHandshake] = []*QUICKeys{key}
+	_ = q.Close()
+	if err := q.Decrypt(); err != nil {
+		t.Fatal("rejected early data still required secret at EOF", err)
+	}
+	assertQUICReleased(t, q)
+}
+
+func TestQUICRejectedRawGapAtEOF(t *testing.T) {
+	q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true})
+	q.flow.early.status = "rejected"
+	if err := q.feedQUICEarly(0, 3, []byte("suffix"), true, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	_ = q.Close()
+	if err := q.Decrypt(); err == nil {
+		t.Fatal("rejected raw gap silently discarded")
+	}
+	if len(out) != 0 {
+		t.Fatal("non-contiguous early raw bytes emitted")
+	}
+	assertQUICReleased(t, q)
 }

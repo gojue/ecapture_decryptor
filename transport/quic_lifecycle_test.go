@@ -249,3 +249,90 @@ func TestQUICStreamPendingSegmentLimit(t *testing.T) {
 		t.Fatal("filling the gap retained pending segments or their byte budget")
 	}
 }
+
+func TestQUICEarlyAcceptanceDeadlineReleasesState(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true, KeyWaitTimeout: 5 * time.Second})
+		q.version = quicVersion1
+		key, _ := deriveQUICKeys(bytes.Repeat([]byte{4}, 32), quicVersion1, quicAES128)
+		q.flow.keys[0][quicLevelEarly] = []*QUICKeys{key}
+		packet := quicLongTestPacket(t, quicVersion1, QUICPacketType0RTT, nil, nil, nil, key, 0, []byte{0x0b, 0, 3, 'a', 'b', 'c'})
+		if err := q.FeedClient(packet.data); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- q.Decrypt() }()
+		defer func() { _ = q.Close(); synctest.Wait() }()
+		synctest.Wait()
+		if len(out) != 0 {
+			t.Fatal("early data escaped acceptance wait")
+		}
+		time.Sleep(5 * time.Second)
+		synctest.Wait()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("unknown acceptance returned success")
+			}
+		default:
+			t.Fatal("acceptance wait did not expire")
+		}
+		if len(out) != 1 || (<-out).Metadata["early_data"] != "unknown" {
+			t.Fatal("raw unknown output was lost")
+		}
+		assertQUICReleased(t, q)
+		if len(q.flow.early.frames) != 0 || len(q.flow.early.streams) != 0 || q.routingHandler != nil || q.flow.handshake.retry != nil {
+			t.Fatal("handshake/early/routing state retained")
+		}
+	})
+}
+
+func TestQUICCIDLimitsAndOutOfOrderRetirement(t *testing.T) {
+	q, _ := newQUICOutputTest(t, types.DecryptOptions{})
+	var adds, retires int
+	q.SetConnectionIDHandler(func(_ []byte, _ bool, retire bool) ([]QUICRoutedPacket, error) {
+		if retire {
+			retires++
+		} else {
+			adds++
+		}
+		return nil, nil
+	})
+	if err := q.retireQUICCID(4, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.observeQUICCID(4, 0, []byte{4}, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if adds != 0 {
+		t.Fatal("reordered NEW resurrected retired CID")
+	}
+	for seq := uint64(5); seq < 1000; seq++ {
+		cid := []byte{byte(seq >> 8), byte(seq)}
+		if err := q.observeQUICCID(seq, seq, cid, nil, false); err != nil {
+			t.Fatal(err)
+		}
+		if len(q.flow.cids[1]) != 1 {
+			t.Fatal("retire_prior_to did not compact history")
+		}
+	}
+	if retires != adds-1 {
+		t.Fatal("CID index retirement missing")
+	}
+	before := adds
+	if err := q.observeQUICCID(999, 0, []byte("conflict"), nil, false); err == nil || adds != before {
+		t.Fatal("conflicting sequence installed")
+	}
+	bounded, _ := newQUICOutputTest(t, types.DecryptOptions{})
+	for seq := uint64(0); seq < maxQUICConnectionIDs; seq++ {
+		if err := bounded.observeQUICCID(seq, 0, []byte{byte(seq)}, nil, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := bounded.observeQUICCID(maxQUICConnectionIDs, 0, []byte{0xff}, nil, true); err == nil || bounded.flow.terminalErr == nil {
+		t.Fatal("CID resource bound was not terminal")
+	}
+	if len(bounded.flow.cids[0]) != maxQUICConnectionIDs {
+		t.Fatal("CID cap exceeded")
+	}
+}

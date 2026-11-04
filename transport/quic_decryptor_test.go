@@ -503,3 +503,187 @@ func TestQUICKeyUpdateCapturedGenerations(t *testing.T) {
 		})
 	}
 }
+
+// Protected synthetic inputs exercise state transitions; real packet fixtures
+// are captured from an independent endpoint (never produced by this helper).
+func quicLongTestPacket(t *testing.T, version uint32, typ uint8, dcid, scid, token []byte, key *QUICKeys, pn uint64, plain []byte) quicPacket {
+	t.Helper()
+	wireType := typ
+	if version == quicVersion2 {
+		wireType = (typ + 1) % 4
+	}
+	header := []byte{0xc0 | wireType<<4, byte(version >> 24), byte(version >> 16), byte(version >> 8), byte(version), byte(len(dcid))}
+	header = append(header, dcid...)
+	header = append(header, byte(len(scid)))
+	header = append(header, scid...)
+	if typ == QUICPacketTypeInitial {
+		header = append(header, byte(len(token)))
+		header = append(header, token...)
+	}
+	for len(plain) < 3 {
+		plain = append(plain, 0)
+	}
+	n := len(plain) + 17
+	header = append(header, 0x40|byte(n>>8), byte(n))
+	pnOffset := len(header)
+	header = append(header, byte(pn))
+	nonce := bytes.Clone(key.iv)
+	for i := 0; i < 8; i++ {
+		nonce[len(nonce)-1-i] ^= byte(pn >> (8 * i))
+	}
+	data := append(header, key.aead.Seal(nil, nonce, plain, header)...)
+	mask, err := key.headerMask(data[pnOffset+4 : pnOffset+20])
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[0] ^= mask[0] & 0x0f
+	data[pnOffset] ^= mask[1]
+	packets, err := splitQUICDatagram(data)
+	if err != nil || len(packets) != 1 {
+		t.Fatalf("test packet: %v", err)
+	}
+	return packets[0]
+}
+
+func TestQUICRetryEpochAndIntegrity(t *testing.T) {
+	for _, vector := range []string{
+		"ff000000010008f067a5502a4262b5746f6b656e04a265ba2eff4d829058fb3f0f2496ba",
+		"cf6b3343cf0008f067a5502a4262b5746f6b656ec8646ce8bfe33952d955543665dcc7b6",
+	} {
+		packets, err := splitQUICDatagram(mustDecodeHex(t, vector))
+		if err != nil {
+			t.Fatal(err)
+		}
+		retry := packets[0]
+		t.Run(fmt.Sprintf("%x", retry.version), func(t *testing.T) {
+			q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true})
+			original := mustDecodeHex(t, "8394c8f03e515708")
+			client, _ := quicInitialKeys(retry.version, original)
+			// Incomplete CRYPTO from the old epoch must not poison the new one.
+			old := quicLongTestPacket(t, retry.version, QUICPacketTypeInitial, original, nil, nil, client, 10, []byte{6, 2, 3, 9, 9, 9})
+			if pending, err := q.processQUICPacket(old, true, time.Time{}); err != nil || pending {
+				t.Fatal(pending, err)
+			}
+			bad := retry
+			bad.data = bytes.Clone(retry.data)
+			bad.data[len(bad.data)-1] ^= 1
+			if _, err := q.processQUICPacket(bad, false, time.Time{}); err == nil || q.flow.handshake.retry != nil {
+				t.Fatal("forged Retry changed state")
+			}
+			if !validQUICRetry(retry, original) || validQUICRetry(retry, []byte("wrong")) {
+				t.Fatal("RFC Retry integrity vector")
+			}
+			if _, err := q.processQUICPacket(retry, false, time.Time{}); err != nil {
+				t.Fatal(err)
+			}
+			if q.destConnID[0] != original[0] {
+				t.Fatal("Retry changed keys before new Initial")
+			}
+			newKey, _ := quicInitialKeys(retry.version, retry.scid)
+			newInitial := quicLongTestPacket(t, retry.version, QUICPacketTypeInitial, retry.scid, nil, []byte("token"), newKey, 11, []byte{6, 0, 3, 1, 0, 0})
+			if pending, err := q.processQUICPacket(newInitial, true, time.Time{}); err != nil || pending {
+				t.Fatal(pending, err)
+			}
+			if q.flow.clientCrypto.next != 3 || q.flow.clientCrypto.pendingBytes != 0 || q.flow.largest[0][0] != 11 {
+				t.Fatal("Retry did not isolate CRYPTO or preserved wrong PN")
+			}
+			for _, p := range []quicPacket{old, retry, newInitial} {
+				if _, err := q.processQUICPacket(p, p.packetType != QUICPacketTypeRetry, time.Time{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if q.flow.clientCrypto.next != 3 || q.flow.largest[0][0] != 11 || len(out) != 0 {
+				t.Fatal("duplicate or old epoch polluted new state")
+			}
+		})
+	}
+}
+
+func TestQUICVersionNegotiationObservation(t *testing.T) {
+	q, _ := newQUICOutputTest(t, types.DecryptOptions{})
+	dcid, scid := []byte("destination"), []byte("client")
+	key, _ := quicInitialKeys(quicVersion2, dcid)
+	initial := quicLongTestPacket(t, quicVersion2, QUICPacketTypeInitial, dcid, scid, nil, key, 0, []byte{1, 0, 0})
+	if _, err := q.processQUICPacket(initial, true, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	vn := append([]byte{0x80, 0, 0, 0, 0, byte(len(scid))}, scid...)
+	vn = append(vn, byte(len(dcid)))
+	vn = append(vn, dcid...)
+	vn = append(vn, 0, 0, 0, 1)
+	ps, err := splitQUICDatagram(vn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.processQUICPacket(ps[0], false, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if q.version != quicVersion2 {
+		t.Fatal("unauthenticated VN selected version")
+	}
+	bad := ps[0]
+	bad.data = append(bytes.Clone(vn), 1)
+	if _, err := q.processQUICPacket(bad, false, time.Time{}); err == nil {
+		t.Fatal("truncated VN accepted")
+	}
+	key, _ = quicInitialKeys(quicVersion1, dcid)
+	selected := quicLongTestPacket(t, quicVersion1, QUICPacketTypeInitial, dcid, scid, nil, key, 0, []byte{1, 0, 0})
+	corrupt := selected
+	corrupt.data = bytes.Clone(selected.data)
+	corrupt.data[len(corrupt.data)-1] ^= 1
+	if _, err := q.processQUICPacket(corrupt, true, time.Time{}); err == nil || q.version != quicVersion2 {
+		t.Fatal("forged version switch")
+	}
+	if _, err := q.processQUICPacket(selected, true, time.Time{}); err != nil || q.version != quicVersion1 {
+		t.Fatal(err)
+	}
+	q.flow.handshake.confirmed = true
+	if _, err := q.processQUICPacket(initial, true, time.Time{}); err == nil || q.version != quicVersion1 {
+		t.Fatal("confirmed version overwritten")
+	}
+}
+
+// Independently generated by aioquic 1.3.0 / OpenSSL. Secret=00..1f (AES256:
+// 00..2f), header=410100, PN=256, plaintext=0b0003616263. These are algorithm
+// vectors, not synthetic network fixtures. RFC vectors above cover Initial/Retry.
+func TestQUICPacketProtectionMatrix(t *testing.T) {
+	for _, tc := range []struct {
+		version             uint32
+		suite               quicCipherSuite
+		key, iv, hp, packet string
+	}{
+		{quicVersion1, quicAES128, "924edab0f23acc302f67ebab959e97e5", "b5a994a325d611a996d7df60", "0e5f49a9b9f1a5d81ae752524e7d6807", "519230bf79e6f776d5fa87b5f494d29aaf96f4f83c08afcc7c"},
+		{quicVersion1, quicAES256, "95c517eea81b6469ff8f27a065fd04c1a27b3023591b93e273a9df5f921d1f68", "a8d8316bf5bb0bbfa74cbf17", "307135de335efef95873468a03d3dfa1e38050df7cc6ab7f22fd7aced73b66e5", "479d1c78928f79bc32a1527ee47180ef196dd2b37f4f67cace"},
+		{quicVersion1, quicChaCha20, "815f0e136e5f9deef859fcde089e84f7c81626812030170d3540a032b7384fc3", "b5a994a325d611a996d7df60", "6cb5082df70d1a1beff93094c2b19694932e770c3915b749293f8085fe956054", "5b0de8de84189819da82db8b75d66716e5c93717850f0784e3"},
+		{quicVersion2, quicAES128, "9b75a79c01efd41fbfc3905d64a2f3a5", "ee842bc8fd496a925b823e4d", "d26f46d9e885c3f8eaa12ec15f9ade44", "44be186abce65e61c9be14772f8a52a0134cd6f3814a72cc65"},
+		{quicVersion2, quicAES256, "14e4a47ecdc8b1251dc9b79bc1a7e2d1ca02ed74bb2681f2ed84b86917dfa814", "ae59bef75ac7aeb9ab58ef0f", "d2b9adbe4cceb2b521e5f06c660c6619a99b5fad02c1e5af86b56e8e0190ec91", "57096b7f493233863aa83497425858fed242379ff04e794965"},
+		{quicVersion2, quicChaCha20, "e3178bfd6b0b4016547a454ae5f81a405d5ca0a204c03ea605c60a87fa234215", "ee842bc8fd496a925b823e4d", "532eb17892a5943f5b3c2a9f2973979cb2db42ab1b3cfab2845d828adb8f515e", "5cd35628c81f3c25c087e42cdc4f037a49b6f1c44241fbcb82"},
+	} {
+		t.Run(fmt.Sprintf("%x/%d", tc.version, tc.suite), func(t *testing.T) {
+			size := 32
+			if tc.suite == quicAES256 {
+				size = 48
+			}
+			secret := make([]byte, size)
+			for i := range secret {
+				secret[i] = byte(i)
+			}
+			key, err := deriveQUICKeys(secret, tc.version, tc.suite)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(key.key, mustDecodeHex(t, tc.key)) || !bytes.Equal(key.iv, mustDecodeHex(t, tc.iv)) || !bytes.Equal(key.hp, mustDecodeHex(t, tc.hp)) {
+				t.Fatal("key/IV/HP independent vector mismatch")
+			}
+			packet := quicPacket{data: mustDecodeHex(t, tc.packet), packetType: QUICPacketType1RTT}
+			plain, pn, first, err := decryptQUICPacket(packet, key, 0, 255, true)
+			if err != nil || pn != 256 || first != 0x41 || !bytes.Equal(plain, mustDecodeHex(t, "0b0003616263")) {
+				t.Fatalf("packet vector pn=%d first=%x err=%v", pn, first, err)
+			}
+			packet.data[len(packet.data)-1] ^= 1
+			if plain, _, _, err := decryptQUICPacket(packet, key, 0, 255, true); err == nil || len(plain) != 0 {
+				t.Fatal("bad tag emitted bytes")
+			}
+		})
+	}
+}
