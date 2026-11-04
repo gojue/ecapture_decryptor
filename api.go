@@ -141,7 +141,11 @@ type DecryptorEngine struct {
 	logger         *log.Logger
 	errMu          sync.Mutex
 	connectionErrs []error
-	missingStarts  int // Packet reader owns this bounded diagnostic counter.
+	missingStarts  int                  // Packet reader owns this bounded diagnostic counter.
+	active         int                  // Includes closing generations, protected by mu.
+	lastActivity   map[string]time.Time // Wall-clock input activity, protected by mu.
+	draining       bool                 // EOF/cancellation is already closing all connections; protected by mu.
+	limitReported  bool                 // Packet reader owns admission diagnostics.
 }
 
 func (e *DecryptorEngine) recordConnectionError(err error) {
@@ -164,6 +168,8 @@ func (e *DecryptorEngine) connectionError() error {
 // Run 运行解密引擎
 func (e *DecryptorEngine) Run() error {
 	e.logger.Println("DecryptorEngine.Run() started")
+	stopReaper := e.startIdleReaper()
+	defer stopReaper()
 
 	// 首先尝试使用 pcapng reader（它也支持提取解密密钥）
 	e.logger.Println("Attempting to open as pcapng format...")
@@ -334,6 +340,9 @@ func (e *DecryptorEngine) processLegacyPcap() error {
 // waitForAllConnections 等待所有连接处理完成，带超时保护
 func (e *DecryptorEngine) waitForAllConnections() {
 	e.logger.Println("Waiting for all connections to finish...")
+	e.mu.Lock()
+	e.draining = true
+	e.mu.Unlock()
 	e.closeAllConnections()
 	e.connections.Wait()
 	e.logger.Println("All connections finished")
@@ -388,7 +397,7 @@ func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.Tr
 	var flow *tcpConnection
 	var connectionMapKey string
 
-	e.mu.RLock()
+	e.mu.Lock()
 	if existingCt, ok := e.conntrack[baseKey]; ok {
 		ct = existingCt
 		connectionMapKey = baseKey
@@ -398,7 +407,10 @@ func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.Tr
 		connectionMapKey = reverseKey
 	}
 	flow = e.tcpFlows[connectionMapKey]
-	e.mu.RUnlock()
+	if ct != nil && e.lastActivity != nil {
+		e.lastActivity[connectionMapKey] = time.Now()
+	}
+	e.mu.Unlock()
 
 	newConnection := transportLayer.IsSYN()
 	if tcp, ok := transportLayer.(*transport.TCPAdapter); ok {
@@ -416,6 +428,15 @@ func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.Tr
 			_ = ct.Close() // A fresh SYN starts a new generation of this tuple.
 		}
 		e.mu.Lock()
+		if e.active >= e.factory.options.ConnectionLimit() {
+			e.mu.Unlock()
+			if !e.limitReported {
+				e.limitReported = true
+				e.factory.options.Report(key, "input", "connection_limit")
+				e.recordConnectionError(errors.New("active connection limit exceeded"))
+			}
+			return
+		}
 		e.nextGeneration++
 		key.Generation = e.nextGeneration
 		e.mu.Unlock()
@@ -432,6 +453,11 @@ func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.Tr
 		e.mu.Lock()
 		e.conntrack[baseKey] = ct
 		e.tcpFlows[baseKey] = flow
+		if e.lastActivity == nil {
+			e.lastActivity = make(map[string]time.Time)
+		}
+		e.lastActivity[baseKey] = time.Now()
+		e.active++
 		e.connections.Add(1)
 		e.mu.Unlock()
 		go func() {
@@ -446,7 +472,9 @@ func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.Tr
 			if e.conntrack[baseKey] == ct {
 				delete(e.conntrack, baseKey)
 				delete(e.tcpFlows, baseKey)
+				delete(e.lastActivity, baseKey)
 			}
+			e.active--
 			e.mu.Unlock()
 		}()
 		// Unlike a TCP SYN, a QUIC Initial datagram carries encrypted handshake
@@ -487,7 +515,7 @@ func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.Tr
 		var err error
 		chunks, err = direction.Push(seq, payload)
 		if err != nil {
-			e.factory.options.Report(ct.GetAddr(), "reassembly", "invalid_stream")
+			e.factory.options.Report(ct.GetAddr(), "reassembly", "resource_limit")
 			e.logger.Printf("TCP reassembly failed for %s: %v", ct.GetAddr(), err)
 			e.recordConnectionError(fmt.Errorf("reassemble TCP connection %s: %w", ct.GetAddr(), err))
 			_ = ct.Close()
@@ -511,7 +539,12 @@ func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.Tr
 			return
 		}
 	}
-	if transportLayer.IsFIN() {
+	if tcp, ok := transportLayer.(*transport.TCPAdapter); ok && tcp.RST {
+		// End both byte streams but preserve the bounded wait for a late DSB.
+		// Close also cancels key acquisition and is reserved for engine shutdown.
+		_ = ct.CloseClient()
+		_ = ct.CloseServer()
+	} else if transportLayer.IsFIN() {
 		if isReverse {
 			_ = ct.CloseServer()
 		} else {
@@ -522,10 +555,13 @@ func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.Tr
 
 // closeAllConnections closes all tracked connections
 func (e *DecryptorEngine) closeAllConnections() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
+	e.mu.RLock()
+	connections := make([]types.Decryptor, 0, len(e.conntrack))
 	for _, dec := range e.conntrack {
+		connections = append(connections, dec)
+	}
+	e.mu.RUnlock()
+	for _, dec := range connections {
 		_ = dec.Close()
 	}
 }

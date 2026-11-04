@@ -17,14 +17,25 @@ import (
 	"time"
 )
 
+const (
+	maxKeyLogLineBytes   = 4096
+	maxKeyLogEntries     = 16384
+	maxKeyLogSecretBytes = 16 << 20
+)
+
+// ErrKeyLogResourceLimit reports a Write or LoadFromReader import limit without
+// including any keylog contents in the error.
+var ErrKeyLogResourceLimit = errors.New("keylog import resource limit exceeded")
+
 // KeyLogStore stores TLS secrets from NSS key log format
 type KeyLogStore struct {
 	mu sync.RWMutex
 	// Map from client random (hex) to secrets
 	secrets map[string]*TLSSecrets
 	// buffer for partial lines when used as an io.Writer
-	partial bytes.Buffer
-	updated chan struct{}
+	partial     bytes.Buffer
+	secretBytes int
+	updated     chan struct{}
 }
 
 /*
@@ -67,121 +78,138 @@ func NewKeyLogStoreFromReader(f io.Reader) (*KeyLogStore, error) {
 	return kl, nil
 }
 
-// LoadFromReader scans the reader line-by-line and adds secrets found in NSS keylog format.
+// LoadFromReader scans NSS keylog lines with the same import limits as Write.
+// Unlike Write, a final line without a newline is also processed.
 func (kl *KeyLogStore) LoadFromReader(f io.Reader) error {
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, maxKeyLogLineBytes+1), maxKeyLogLineBytes+1)
+	scanner.Split(func(data []byte, atEOF bool) (int, []byte, error) {
+		end := bytes.IndexByte(data, '\n')
+		if end < 0 {
+			end = len(data)
+		}
+		if end > maxKeyLogLineBytes {
+			return 0, nil, ErrKeyLogResourceLimit
+		}
+		return bufio.ScanLines(data, atEOF)
+	})
 	for scanner.Scan() {
-		line := scanner.Text()
-		kl.parseLine(line)
+		kl.mu.Lock()
+		err := kl.parseLineLocked(scanner.Text())
+		kl.mu.Unlock()
+		if err != nil {
+			return err
+		}
 	}
 	return scanner.Err()
 }
 
 // AddSecret adds a parsed secret to the store. clientRandomHex should be the hex representation
 // of the client random (as found in NSS key log files). The function is concurrency-safe.
+// This compatibility entry point trusts the caller to bound memory use and does
+// not apply import limits. Use Write or LoadFromReader for bounded imports with
+// explicit errors. Unsupported labels are ignored without creating an entry.
 func (kl *KeyLogStore) AddSecret(label string, clientRandomHex string, secret []byte) {
-	if clientRandomHex == "" || len(secret) == 0 {
-		return
-	}
-	key := strings.ToLower(clientRandomHex)
-	secret = append([]byte(nil), secret...)
 	kl.mu.Lock()
 	defer kl.mu.Unlock()
-	if kl.secrets[key] == nil {
-		kl.secrets[key] = &TLSSecrets{}
-	}
+	_ = kl.addSecretLocked(label, clientRandomHex, secret, false)
+}
 
+func (kl *KeyLogStore) addSecretLocked(label, clientRandomHex string, secret []byte, limited bool) error {
+	if clientRandomHex == "" || len(secret) == 0 {
+		return nil
+	}
+	key := strings.ToLower(clientRandomHex)
 	s := kl.secrets[key]
-	switch label {
-	case "CLIENT_TRAFFIC_SECRET_0":
-		s.ClientTrafficSecret = secret
-	case "SERVER_TRAFFIC_SECRET_0":
-		s.ServerTrafficSecret = secret
-	case "CLIENT_HANDSHAKE_TRAFFIC_SECRET":
-		s.ClientHandshakeTrafficSecret = secret
-	case "SERVER_HANDSHAKE_TRAFFIC_SECRET":
-		s.ServerHandshakeTrafficSecret = secret
-	case "CLIENT_RANDOM":
-		s.MasterSecret = secret
-	case "CLIENT_EARLY_TRAFFIC_SECRET":
-		s.ClientEarlyTrafficSecret = secret
-	case "EXPORTER_SECRET":
-		s.ExporterSecret = secret
-
-	// QUIC specific labels
-	case "QUIC_CLIENT_EARLY_TRAFFIC_SECRET":
-		s.ClientEarlyTrafficSecret = secret
-	case "QUIC_CLIENT_HANDSHAKE_TRAFFIC_SECRET":
-		s.ClientHandshakeTrafficSecret = secret
-	case "QUIC_SERVER_HANDSHAKE_TRAFFIC_SECRET":
-		s.ServerHandshakeTrafficSecret = secret
-	case "QUIC_CLIENT_TRAFFIC_SECRET_0":
-		s.ClientTrafficSecret = secret
-	case "QUIC_SERVER_TRAFFIC_SECRET_0":
-		s.ServerTrafficSecret = secret
+	if s == nil {
+		s = &TLSSecrets{}
 	}
+	var target *[]byte
+	switch label {
+	case "CLIENT_TRAFFIC_SECRET_0", "QUIC_CLIENT_TRAFFIC_SECRET_0":
+		target = &s.ClientTrafficSecret
+	case "SERVER_TRAFFIC_SECRET_0", "QUIC_SERVER_TRAFFIC_SECRET_0":
+		target = &s.ServerTrafficSecret
+	case "CLIENT_HANDSHAKE_TRAFFIC_SECRET", "QUIC_CLIENT_HANDSHAKE_TRAFFIC_SECRET":
+		target = &s.ClientHandshakeTrafficSecret
+	case "SERVER_HANDSHAKE_TRAFFIC_SECRET", "QUIC_SERVER_HANDSHAKE_TRAFFIC_SECRET":
+		target = &s.ServerHandshakeTrafficSecret
+	case "CLIENT_RANDOM":
+		target = &s.MasterSecret
+	case "CLIENT_EARLY_TRAFFIC_SECRET", "QUIC_CLIENT_EARLY_TRAFFIC_SECRET":
+		target = &s.ClientEarlyTrafficSecret
+	case "EXPORTER_SECRET":
+		target = &s.ExporterSecret
+	default:
+		return nil
+	}
+	delta := len(secret) - len(*target)
+	if limited && (kl.secrets[key] == nil && len(kl.secrets) >= maxKeyLogEntries ||
+		delta > 0 && delta > maxKeyLogSecretBytes-kl.secretBytes) {
+		return ErrKeyLogResourceLimit
+	}
+	*target = bytes.Clone(secret)
+	kl.secretBytes += delta
 	kl.secrets[key] = s
 	close(kl.updated)
 	kl.updated = make(chan struct{})
+	return nil
 }
 
-// Write implements io.Writer to accept streaming keylog data. It buffers incomplete lines.
+// Write accepts streaming NSS keylog data, buffering incomplete lines. Imports
+// allow at most 4096 bytes before each LF, 16384 distinct client randoms and
+// 16 MiB of stored secret bytes. Existing entries may still be updated at the
+// entry limit; byte growth is checked by replacement delta. Resource failures
+// return ErrKeyLogResourceLimit and discard partial input, without deleting
+// previously imported secrets. A batch may contain any number of bounded lines.
 func (kl *KeyLogStore) Write(p []byte) (n int, err error) {
-	// Append to partial buffer and extract complete lines.
 	kl.mu.Lock()
 	defer kl.mu.Unlock()
-	n = len(p)
-	if n == 0 {
-		return 0, nil
-	}
-	kl.partial.Write(p)
-
-	var lines []string
-	for {
-		data := kl.partial.Bytes()
-		idx := bytes.IndexByte(data, '\n')
-		if idx == -1 {
+	for len(p) > 0 {
+		end := bytes.IndexByte(p, '\n')
+		length := end
+		if length < 0 {
+			length = len(p)
+		}
+		if length > maxKeyLogLineBytes-kl.partial.Len() {
+			kl.partial = bytes.Buffer{}
+			return n, ErrKeyLogResourceLimit
+		}
+		kl.partial.Write(p[:length])
+		n += length
+		p = p[length:]
+		if end < 0 {
 			break
 		}
-		line := string(data[:idx])
-		// remove processed line including the newline
-		kl.partial.Next(idx + 1)
-		// strip optional CR
-		if len(line) > 0 && line[len(line)-1] == '\r' {
-			line = line[:len(line)-1]
+		n++
+		p = p[1:]
+		if err := kl.parseLineLocked(kl.partial.String()); err != nil {
+			kl.partial = bytes.Buffer{}
+			return n, err
 		}
-		lines = append(lines, line)
+		kl.partial.Reset()
 	}
-	// We released processing of lines while still holding lock, but actual parsing
-	// (which uses AddSecret) will also lock; to avoid double-locking issues, we
-	// copy lines out and process them after releasing the lock.
-	kl.mu.Unlock()
-	for _, line := range lines {
-		kl.parseLine(line)
-	}
-	kl.mu.Lock()
-	// leave any remaining partial data in the buffer
 	return n, nil
 }
 
-// parseLine parses a single keylog line and adds the secret if valid.
-func (kl *KeyLogStore) parseLine(raw string) {
+// parseLineLocked ignores malformed lines and reports bounded-import failures.
+func (kl *KeyLogStore) parseLineLocked(raw string) error {
 	line := strings.TrimSpace(raw)
 	if line == "" || strings.HasPrefix(line, "#") {
-		return
+		return nil
 	}
 	fields := strings.Fields(line)
 	if len(fields) != 3 {
-		return
+		return nil
 	}
 	label := fields[0]
 	clientRandom := fields[1]
 	secretHex := fields[2]
 	secret, err := hex.DecodeString(secretHex)
 	if err != nil {
-		return
+		return nil
 	}
-	kl.AddSecret(label, clientRandom, secret)
+	return kl.addSecretLocked(label, clientRandom, secret, true)
 }
 
 func (kl *KeyLogStore) GetSecrets(clientRandom []byte) *TLSSecrets {
@@ -233,6 +261,14 @@ func (kl *KeyLogStore) WaitForSecrets(clientRandom []byte, ready func(*TLSSecret
 		select {
 		case <-updated:
 		case <-stop:
+			// The final DSB and EOF may make both channels ready together.
+			// Recheck published keys once, without extending the wait.
+			kl.mu.RLock()
+			secrets = cloneSecrets(kl.secrets[key])
+			kl.mu.RUnlock()
+			if ready(secrets) {
+				return secrets, nil
+			}
 			return nil, io.ErrClosedPipe
 		case <-timer.C:
 			return nil, errors.New("timed out waiting for TLS secrets")

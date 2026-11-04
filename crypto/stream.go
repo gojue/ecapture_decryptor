@@ -157,3 +157,11 @@ func (sb *StreamBuffer) Len() int {
 	defer sb.mu.Unlock()
 	return sb.buf.Len()
 }
+
+// Discard releases buffered storage after the closed stream has been drained.
+// Close itself preserves unread bytes for final record processing.
+func (sb *StreamBuffer) Discard() {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	sb.buf = bytes.Buffer{}
+}

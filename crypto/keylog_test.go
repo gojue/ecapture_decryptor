@@ -3,6 +3,8 @@ package crypto
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -161,4 +163,149 @@ func TestWaitForSecretsLateAndMissing(t *testing.T) {
 	if _, err := store.WaitForSecrets([]byte{9}, ready, stop, time.Second); err == nil {
 		t.Fatal("closed connection did not interrupt missing-secret wait")
 	}
+}
+
+func TestWaitForSecretsFinalUpdateAndEOF(t *testing.T) {
+	// Exercise either select outcome when the last DSB and EOF become ready
+	// after the initial snapshot. Neither outcome may lose the published key.
+	for i := 0; i < 128; i++ {
+		store := NewKeyLogStore()
+		stop := make(chan struct{})
+		first := true
+		secrets, err := store.WaitForSecrets([]byte{1}, func(secrets *TLSSecrets) bool {
+			if first {
+				first = false
+				store.AddSecret("CLIENT_RANDOM", "01", []byte{2})
+				close(stop)
+			}
+			return secrets != nil && len(secrets.MasterSecret) != 0
+		}, stop, time.Second)
+		if err != nil || secrets == nil || !bytes.Equal(secrets.MasterSecret, []byte{2}) {
+			t.Fatalf("final secret was lost at EOF: %v", err)
+		}
+	}
+}
+
+func TestKeyLogImportLineLimit(t *testing.T) {
+	store := NewKeyLogStore()
+	if n, err := store.Write(bytes.Repeat([]byte{'#'}, maxKeyLogLineBytes)); err != nil || n != maxKeyLogLineBytes {
+		t.Fatalf("partial line at limit: n=%d err=%v", n, err)
+	}
+	if n, err := store.Write([]byte("x\n")); !errors.Is(err, ErrKeyLogResourceLimit) || n != 0 {
+		t.Fatalf("oversized split line: n=%d err=%v", n, err)
+	}
+	if store.partial.Len() != 0 || store.partial.Cap() != 0 {
+		t.Fatal("oversized partial line retained storage")
+	}
+	if _, err := store.Write([]byte("CLIENT_RANDOM 01 02\n")); err != nil || store.GetSecrets([]byte{1}) == nil {
+		t.Fatalf("valid import after discarded partial line: %v", err)
+	}
+	for _, streaming := range []bool{false, true} {
+		for _, ending := range []string{"", "\n", "\r\n"} {
+			// The limit counts bytes before LF, including an optional CR.
+			length := maxKeyLogLineBytes
+			if ending == "\r\n" {
+				length--
+			}
+			content := strings.Repeat("#", length) + ending
+			if err := importTestKeyLog(NewKeyLogStore(), content, streaming); err != nil {
+				t.Fatalf("streaming=%v: line at limit rejected: %v", streaming, err)
+			}
+			if err := importTestKeyLog(NewKeyLogStore(), "#"+content, streaming); !errors.Is(err, ErrKeyLogResourceLimit) {
+				t.Fatalf("streaming=%v: oversized line error=%v", streaming, err)
+			}
+		}
+	}
+}
+
+func TestKeyLogImportLargeBatchAndEntryLimit(t *testing.T) {
+	var batch strings.Builder
+	for i := 0; i < maxKeyLogEntries; i++ {
+		fmt.Fprintf(&batch, "CLIENT_RANDOM %04x 01\n", i)
+	}
+	for _, streaming := range []bool{false, true} {
+		t.Run(fmt.Sprintf("streaming=%v", streaming), func(t *testing.T) {
+			store := NewKeyLogStore()
+			if err := importTestKeyLog(store, batch.String(), streaming); err != nil {
+				t.Fatal(err)
+			}
+			if len(store.secrets) != maxKeyLogEntries {
+				t.Fatal("valid multi-line batch larger than the line limit was truncated")
+			}
+			if err := importTestKeyLog(store, "CLIENT_RANDOM 0000 0203\nSERVER_TRAFFIC_SECRET_0 0000 04\n", streaming); err != nil {
+				t.Fatalf("existing entry update at limit: %v", err)
+			}
+			got := store.GetSecrets([]byte{0, 0})
+			if !bytes.Equal(got.MasterSecret, []byte{2, 3}) || !bytes.Equal(got.ServerTrafficSecret, []byte{4}) ||
+				len(store.secrets) != maxKeyLogEntries {
+				t.Fatal("existing entry was not updated at the entry limit")
+			}
+			updates := store.Updates()
+			if err := importTestKeyLog(store, "UNKNOWN_LABEL ffff 01\n", streaming); err != nil {
+				t.Fatalf("unknown label allocated an entry: %v", err)
+			}
+			if err := importTestKeyLog(store, "CLIENT_RANDOM ffff 01\n", streaming); !errors.Is(err, ErrKeyLogResourceLimit) {
+				t.Fatalf("new entry beyond limit: %v", err)
+			}
+			if store.GetSecrets([]byte{0xff, 0xff}) != nil || len(store.secrets) != maxKeyLogEntries {
+				t.Fatal("failed import changed the store")
+			}
+			select {
+			case <-updates:
+				t.Fatal("ignored or rejected input notified secret subscribers")
+			default:
+			}
+			if store.partial.Cap() != 0 {
+				t.Fatal("failed import retained partial storage")
+			}
+			// Direct callers retain the original trusted-input compatibility path.
+			store.AddSecret("CLIENT_RANDOM", "ffff", []byte{9})
+			if got := store.GetSecrets([]byte{0xff, 0xff}); got == nil || !bytes.Equal(got.MasterSecret, []byte{9}) {
+				t.Fatal("AddSecret silently discarded a valid key beyond the import limit")
+			}
+			store.AddSecret("UNKNOWN_LABEL", "eeee", []byte{1})
+			if len(store.secrets) != maxKeyLogEntries+1 {
+				t.Fatal("unknown AddSecret label created an empty entry")
+			}
+		})
+	}
+}
+
+func TestKeyLogImportSecretBytesLimitAndReplacement(t *testing.T) {
+	store := NewKeyLogStore()
+	// Seed through the trusted API to reach the byte limit without a huge batch.
+	store.AddSecret("CLIENT_TRAFFIC_SECRET_0", "01", make([]byte, maxKeyLogSecretBytes))
+	for _, streaming := range []bool{false, true} {
+		if err := importTestKeyLog(store, "CLIENT_RANDOM 02 01\n", streaming); !errors.Is(err, ErrKeyLogResourceLimit) {
+			t.Fatalf("streaming=%v: secret byte limit error=%v", streaming, err)
+		}
+	}
+	if len(store.secrets) != 1 || store.secretBytes != maxKeyLogSecretBytes {
+		t.Fatal("rejected secret changed byte accounting or allocated an entry")
+	}
+	store.AddSecret("SERVER_TRAFFIC_SECRET_0", "01", []byte{2})
+	if store.secretBytes != maxKeyLogSecretBytes+1 || len(store.secrets["01"].ServerTrafficSecret) != 1 {
+		t.Fatal("trusted AddSecret failed beyond the byte limit")
+	}
+	if _, err := store.Write([]byte("SERVER_TRAFFIC_SECRET_0 01 03\n")); err != nil {
+		t.Fatalf("non-growing replacement rejected after trusted addition: %v", err)
+	}
+	if err := store.LoadFromReader(strings.NewReader("QUIC_CLIENT_TRAFFIC_SECRET_0 01 04")); err != nil {
+		t.Fatalf("shrinking replacement: %v", err)
+	}
+	got := store.GetSecrets([]byte{1})
+	if store.secretBytes != 2 || !bytes.Equal(got.ClientTrafficSecret, []byte{4}) || !bytes.Equal(got.ServerTrafficSecret, []byte{3}) {
+		t.Fatal("replacement did not charge only the difference in secret bytes")
+	}
+	if _, err := store.Write([]byte("CLIENT_RANDOM 02 05\n")); err != nil {
+		t.Fatalf("freed secret capacity was not reusable: %v", err)
+	}
+}
+
+func importTestKeyLog(store *KeyLogStore, content string, streaming bool) error {
+	if streaming {
+		_, err := store.Write([]byte(content))
+		return err
+	}
+	return store.LoadFromReader(strings.NewReader(content))
 }

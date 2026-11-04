@@ -40,6 +40,8 @@ type quicFlowState struct {
 	haveLargest    [2][3]bool
 	pending        []quicDeferredPacket
 	pendingBytes   int
+	pendingSince   time.Time
+	terminalErr    error
 	errors         []error
 	lastSecrets    *crypto.TLSSecrets
 	initialRetried bool
@@ -100,12 +102,24 @@ func (q *QUICDecryptor) processQUICDatagram(datagram quicDatagram) {
 		deferred, err := q.processQUICPacket(packet, datagram.isClient, datagram.at)
 		if err != nil {
 			q.appendQUICError(err)
-		} else if deferred {
-			if q.flow.pendingBytes+len(packet.data) > 32<<20 {
-				q.options.Report(q.connectionInfo, "reassembly", "resource_limit")
-				q.appendQUICError(errors.New("QUIC deferred packet buffer exceeds 32 MiB"))
-				continue
+			if q.flow.terminalErr != nil {
+				return
 			}
+		} else if deferred {
+			if len(packet.data) > maxQUICBufferedBytes-q.flow.pendingBytes || len(q.flow.pending) >= maxQUICQueuedPackets {
+				q.flow.terminalErr = errors.New("QUIC deferred packet buffer limit exceeded")
+				q.options.Report(q.connectionInfo, "reassembly", "resource_limit")
+				q.appendQUICError(q.flow.terminalErr)
+				_ = q.Close()
+				return
+			}
+			if q.flow.pendingSince.IsZero() {
+				q.flow.pendingSince = time.Now()
+			}
+			// Retain only this packet, not the entire coalesced/padded datagram.
+			packet.data = bytes.Clone(packet.data)
+			packet.dcid = bytes.Clone(packet.dcid)
+			packet.scid = bytes.Clone(packet.scid)
 			q.flow.pending = append(q.flow.pending, quicDeferredPacket{packet: packet, isClient: datagram.isClient, at: datagram.at})
 			q.flow.pendingBytes += len(packet.data)
 		}
@@ -147,10 +161,16 @@ func (q *QUICDecryptor) retryDeferredQUICPackets() {
 		pending, err := q.processQUICPacket(item.packet, item.isClient, item.at)
 		if err != nil {
 			q.appendQUICError(err)
+			if q.flow.terminalErr != nil {
+				return
+			}
 		} else if pending {
 			q.flow.pending = append(q.flow.pending, item)
 			q.flow.pendingBytes += len(item.packet.data)
 		}
+	}
+	if len(q.flow.pending) == 0 {
+		q.flow.pendingSince = time.Time{}
 	}
 }
 

@@ -16,18 +16,32 @@ import (
 )
 
 type routingDecryptor struct {
-	addr    types.ConnectionKey
-	mu      sync.Mutex
-	client  [][]byte
-	server  [][]byte
-	closed  chan struct{}
-	closeMu sync.Once
+	addr                       types.ConnectionKey
+	mu                         sync.Mutex
+	client                     [][]byte
+	server                     [][]byte
+	closed                     chan struct{}
+	closeMu                    sync.Once
+	clientClosed, serverClosed bool
 }
 
-func (d *routingDecryptor) Decrypt() error               { <-d.closed; return nil }
-func (d *routingDecryptor) SetPacketTime(time.Time)      {}
-func (d *routingDecryptor) CloseClient() error           { return nil }
-func (d *routingDecryptor) CloseServer() error           { return nil }
+func (d *routingDecryptor) Decrypt() error          { <-d.closed; return nil }
+func (d *routingDecryptor) SetPacketTime(time.Time) {}
+func (d *routingDecryptor) CloseClient() error      { return d.closeDirection(true) }
+func (d *routingDecryptor) CloseServer() error      { return d.closeDirection(false) }
+func (d *routingDecryptor) closeDirection(client bool) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if client {
+		d.clientClosed = true
+	} else {
+		d.serverClosed = true
+	}
+	if d.clientClosed && d.serverClosed {
+		return d.Close()
+	}
+	return nil
+}
 func (d *routingDecryptor) GetAddr() types.ConnectionKey { return d.addr }
 func (d *routingDecryptor) Close() error {
 	d.closeMu.Do(func() { close(d.closed) })

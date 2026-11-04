@@ -5,7 +5,10 @@ package ecapture_decryptor
 
 import "fmt"
 
-const maxOutOfOrderBytes = 4 << 20
+const (
+	maxOutOfOrderBytes    = 4 << 20
+	maxOutOfOrderSegments = 65536
+)
 
 // tcpDirection assembles payloads by TCP sequence number. Signed differences
 // implement the normal TCP serial-number comparison within a 2 GiB window.
@@ -33,13 +36,14 @@ func (d *tcpDirection) Push(seq uint32, payload []byte) ([][]byte, error) {
 	}
 	var ready [][]byte
 	if int32(seq-d.next) > 0 {
-		if old := d.pending[seq]; len(old) >= len(payload) {
+		old, exists := d.pending[seq]
+		if len(old) >= len(payload) {
 			return nil, nil
 		}
-		if d.pendingBytes-len(d.pending[seq])+len(payload) > maxOutOfOrderBytes {
+		if !exists && len(d.pending) >= maxOutOfOrderSegments || d.pendingBytes-len(old)+len(payload) > maxOutOfOrderBytes {
 			return nil, fmt.Errorf("TCP reassembly pending limit exceeded")
 		}
-		d.pendingBytes -= len(d.pending[seq])
+		d.pendingBytes -= len(old)
 		d.pending[seq] = append([]byte(nil), payload...)
 		d.pendingBytes += len(payload)
 		return nil, nil
