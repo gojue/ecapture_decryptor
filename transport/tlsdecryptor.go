@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -61,11 +60,15 @@ type TLSDecryptor struct {
 	clientEncryptionStarted bool
 	clientInHandshakePhase  bool
 	clientCurrentDecryptor  *crypto.RecordDecryptor
+	clientApplicationSeen   bool // Protected by clientProcessMu.
+	clientProbeErr          error
 
 	// Server state for inline decryption
 	serverEncryptionStarted bool
 	serverInHandshakePhase  bool
 	serverCurrentDecryptor  *crypto.RecordDecryptor
+	serverApplicationSeen   bool // Protected by serverProcessMu.
+	serverProbeErr          error
 
 	// Close protection
 	closeOnce       sync.Once
@@ -89,6 +92,44 @@ type TLSDecryptor struct {
 
 	// Packet timestamp from pcap
 	packetTime time.Time
+	options    types.DecryptOptions
+	rawOffsets [2]uint64 // Protected by protocolMu.
+	rawEnded   bool
+	errMu      sync.Mutex
+	decryptErr error
+}
+
+// SetOptions must be called before feeding or decrypting the connection.
+func (td *TLSDecryptor) SetOptions(options types.DecryptOptions) { td.options = options }
+
+func (td *TLSDecryptor) recordFailure(stage, code string, err error) {
+	td.errMu.Lock()
+	first := td.decryptErr == nil
+	if first {
+		td.decryptErr = err
+	}
+	td.errMu.Unlock()
+	if first {
+		td.options.Report(td.ConnectionInfo, stage, code)
+	}
+}
+
+// emitRawLocked preserves bytes and per-direction offsets without interpreting
+// record boundaries as application messages. protocolMu must be held.
+func (td *TLSDecryptor) emitRawLocked(data []byte, direction string, end bool) {
+	index := 0
+	if direction == "response" {
+		index = 1
+	}
+	packet := types.NewDecryptedPacket("tcp", "tls", direction, bytes.Clone(data), td.packetTime, td.ConnectionInfo)
+	packet.Metadata["kind"] = "stream_chunk"
+	if end {
+		packet.Metadata["kind"] = "stream_end"
+	}
+	packet.Metadata["offset"] = td.rawOffsets[index]
+	packet.Metadata["end"] = end
+	td.rawOffsets[index] += uint64(len(data))
+	td.packetChan <- packet
 }
 
 // NewTLSDecryptor 创建 TLS 解密器
@@ -128,6 +169,11 @@ func (td *TLSDecryptor) queueRequest(data []byte) {
 	}
 
 	td.protocolMu.Lock()
+	if td.options.RawChunks && td.packetChan != nil {
+		td.emitRawLocked(data, "request", false)
+		td.protocolMu.Unlock()
+		return
+	}
 	if !td.protocolDetected && td.packetChan != nil {
 		td.sniffBuffer = append(td.sniffBuffer, data...)
 		preface := []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
@@ -171,6 +217,11 @@ func (td *TLSDecryptor) queueResponse(data []byte) {
 	}
 
 	td.protocolMu.Lock()
+	if td.options.RawChunks && td.packetChan != nil {
+		td.emitRawLocked(data, "response", false)
+		td.protocolMu.Unlock()
+		return
+	}
 	if td.parser != nil {
 		td.parser.FeedResponse(data)
 	} else if !td.protocolDetected && td.packetChan != nil {
@@ -283,6 +334,7 @@ func (td *TLSDecryptor) FeedClient(data []byte) error {
 		if errors.Is(err, io.ErrClosedPipe) {
 			return nil // Silently ignore write to closed pipe (connection already closed)
 		}
+		td.recordFailure("input", "resource_limit", err)
 		return err
 	}
 	// Try to decrypt available records inline
@@ -304,6 +356,7 @@ func (td *TLSDecryptor) FeedServer(data []byte) error {
 		if errors.Is(err, io.ErrClosedPipe) {
 			return nil // Silently ignore write to closed pipe (connection already closed)
 		}
+		td.recordFailure("input", "resource_limit", err)
 		return err
 	}
 	// Try to decrypt available records inline
@@ -362,6 +415,13 @@ func (td *TLSDecryptor) processClientRecords() {
 
 		plaintext, actualContentType, err := decryptor.Decrypt(record)
 		if err != nil {
+			// With application-only TLS 1.3 secrets we must skip encrypted
+			// handshake records until the first application record authenticates.
+			if td.version == tls.VersionTLS13 && td.clientHandshakeDecryptor == nil && !td.clientApplicationSeen {
+				td.clientProbeErr = err
+				continue
+			}
+			td.recordFailure("decrypt", "authentication_failed", err)
 			td.logger.Printf("Decrypt error (client): %v", err)
 			continue
 		}
@@ -380,6 +440,7 @@ func (td *TLSDecryptor) processClientRecords() {
 			continue
 		}
 
+		td.clientApplicationSeen = true
 		if len(plaintext) > 0 {
 			td.queueRequest(plaintext)
 		}
@@ -431,6 +492,11 @@ func (td *TLSDecryptor) processServerRecords() {
 
 		plaintext, actualContentType, err := decryptor.Decrypt(record)
 		if err != nil {
+			if td.version == tls.VersionTLS13 && td.serverHandshakeDecryptor == nil && !td.serverApplicationSeen {
+				td.serverProbeErr = err
+				continue
+			}
+			td.recordFailure("decrypt", "authentication_failed", err)
 			td.logger.Printf("Decrypt error (server): %v", err)
 			continue
 		}
@@ -449,6 +515,7 @@ func (td *TLSDecryptor) processServerRecords() {
 			continue
 		}
 
+		td.serverApplicationSeen = true
 		if len(plaintext) > 0 {
 			td.queueResponse(plaintext)
 		}
@@ -517,12 +584,6 @@ func (td *TLSDecryptor) Decrypt() error {
 
 	// Parse handshake to get cipher suite and secrets
 	if err := td.parseHandshake(); err != nil {
-		// If handshake fails (e.g. no secrets), we just stop processing this connection.
-		// The error is already logged inside parseHandshake if verbose.
-		if strings.Contains(err.Error(), "no secrets found") {
-			td.logger.Printf("ERROR Decrypt %s %s", td.ConnectionInfo, err)
-			return nil
-		}
 		return fmt.Errorf("parse handshake: %w", err)
 	}
 	// Feed may have queued encrypted records while waiting for a late DSB.
@@ -548,6 +609,34 @@ func (td *TLSDecryptor) Decrypt() error {
 	}()
 
 	wg.Wait()
+	// Close can race with the final Feed; direction locks join its record drain.
+	td.processClientRecords()
+	td.processServerRecords()
+	td.clientProcessMu.Lock()
+	if !td.clientApplicationSeen && td.clientProbeErr != nil {
+		// Application-only keys cannot distinguish a handshake-only capture
+		// from application records protected by unavailable or incorrect keys.
+		td.options.Report(td.ConnectionInfo, "decrypt", "no_authenticated_application_data")
+	}
+	td.clientProcessMu.Unlock()
+	td.serverProcessMu.Lock()
+	if !td.serverApplicationSeen && td.serverProbeErr != nil {
+		td.options.Report(td.ConnectionInfo, "decrypt", "no_authenticated_application_data")
+	}
+	td.serverProcessMu.Unlock()
+	if td.clientIn.Len() != 0 || td.serverIn.Len() != 0 {
+		td.recordFailure("input", "truncated_record", fmt.Errorf("truncated TLS record: %w", io.ErrUnexpectedEOF))
+	}
+	td.errMu.Lock()
+	incomplete := td.decryptErr != nil
+	td.errMu.Unlock()
+	td.protocolMu.Lock()
+	if td.options.RawChunks && td.packetChan != nil && !td.rawEnded && !incomplete {
+		td.rawEnded = true
+		td.emitRawLocked(nil, "request", true)
+		td.emitRawLocked(nil, "response", true)
+	}
+	td.protocolMu.Unlock()
 	td.protocolMu.RLock()
 	parser := td.parser
 	td.protocolMu.RUnlock()
@@ -557,10 +646,13 @@ func (td *TLSDecryptor) Decrypt() error {
 		parser.Flush()
 	}
 	if errorParser, ok := parser.(interface{ Err() error }); ok {
-		return errorParser.Err()
+		if err := errorParser.Err(); err != nil {
+			td.recordFailure("protocol", "parse_failed", err)
+		}
 	}
-
-	return nil
+	td.errMu.Lock()
+	defer td.errMu.Unlock()
+	return td.decryptErr
 }
 
 // waitForClientClose waits for client stream to close and processes remaining records
@@ -577,6 +669,7 @@ func (td *TLSDecryptor) parseHandshake() error {
 	// Read Client Hello and extract client random
 	clientRandom, err := crypto.ExtractClientRandom(td.clientIn)
 	if err != nil {
+		td.options.Report(td.ConnectionInfo, "handshake", "missing_client_hello")
 		return fmt.Errorf("extract client random: %w", err)
 	}
 
@@ -585,12 +678,24 @@ func (td *TLSDecryptor) parseHandshake() error {
 	// Read Server Hello and determine TLS version and cipher suite
 	version, cipherSuite, serverHelloHandshake, err := crypto.ParseServerHello(td.serverIn)
 	if err != nil {
+		td.options.Report(td.ConnectionInfo, "handshake", "invalid_server_hello")
 		return fmt.Errorf("parse server hello: %w", err)
+	}
+	if version != tls.VersionTLS12 && version != tls.VersionTLS13 {
+		td.options.Report(td.ConnectionInfo, "decrypt", "unsupported_version")
+		return fmt.Errorf("unsupported TLS version 0x%04x", version)
+	}
+	if !crypto.IsCipherSuiteSupported(cipherSuite) {
+		td.options.Report(td.ConnectionInfo, "decrypt", "unsupported_cipher")
+		return fmt.Errorf("unsupported cipher suite 0x%04x", cipherSuite)
 	}
 
 	td.logger.Printf("TLS Version: 0x%04x, Cipher Suite: 0x%04x", version, cipherSuite)
 
 	// Get secrets from key log
+	if td.keyLog.GetSecrets(clientRandom) == nil {
+		td.options.Report(td.ConnectionInfo, "keys", "waiting_secret")
+	}
 	secrets, err := td.keyLog.WaitForSecrets(clientRandom, func(s *crypto.TLSSecrets) bool {
 		if s == nil {
 			return false
@@ -601,6 +706,7 @@ func (td *TLSDecryptor) parseHandshake() error {
 		return len(s.MasterSecret) != 0
 	}, td.closeSignal, 30*time.Second)
 	if err != nil {
+		td.options.Report(td.ConnectionInfo, "keys", "missing_secret")
 		return fmt.Errorf("wait for TLS secrets: %w", err)
 	}
 
@@ -714,5 +820,7 @@ func (td *TLSDecryptor) detectProtocolLocked(data []byte) {
 		td.parser = parser
 		td.parser.SetPacketTime(td.packetTime)
 		td.logger.Printf("Detected %s protocol for %s", protocolName, td.ConnectionInfo)
+	} else {
+		td.options.Report(td.ConnectionInfo, "protocol", "unsupported_protocol")
 	}
 }

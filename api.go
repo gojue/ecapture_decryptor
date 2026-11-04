@@ -33,6 +33,13 @@ type DecryptorConfig struct {
 	packetChan   chan *types.DecryptedPacket
 	logger       *log.Logger
 	strictPcapng bool
+	options      types.DecryptOptions
+}
+
+// WithOptions selects raw output and optional connection diagnostics.
+func (c *DecryptorConfig) WithOptions(options types.DecryptOptions) *DecryptorConfig {
+	c.options = options
+	return c
 }
 
 // NewDecryptorConfig 创建默认配置
@@ -116,6 +123,7 @@ func DecryptWithConfig(config *DecryptorConfig) error {
 		tcpFlows:  make(map[string]*tcpConnection),
 		logger:    config.logger,
 	}
+	engine.factory.options = config.options
 
 	return engine.Run()
 }
@@ -133,6 +141,7 @@ type DecryptorEngine struct {
 	logger         *log.Logger
 	errMu          sync.Mutex
 	connectionErrs []error
+	missingStarts  int // Packet reader owns this bounded diagnostic counter.
 }
 
 func (e *DecryptorEngine) recordConnectionError(err error) {
@@ -452,6 +461,10 @@ func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.Tr
 		return
 	}
 	if ct == nil {
+		if len(transportLayer.GetPayload()) > 0 && e.missingStarts < 16 {
+			e.missingStarts++
+			e.factory.options.Report(key, "handshake", "missing_connection_start")
+		}
 		return
 	}
 	payload := transportLayer.GetPayload()
@@ -474,6 +487,7 @@ func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.Tr
 		var err error
 		chunks, err = direction.Push(seq, payload)
 		if err != nil {
+			e.factory.options.Report(ct.GetAddr(), "reassembly", "invalid_stream")
 			e.logger.Printf("TCP reassembly failed for %s: %v", ct.GetAddr(), err)
 			e.recordConnectionError(fmt.Errorf("reassemble TCP connection %s: %w", ct.GetAddr(), err))
 			_ = ct.Close()

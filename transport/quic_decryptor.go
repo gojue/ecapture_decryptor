@@ -66,6 +66,8 @@ type QUICDecryptor struct {
 	wake           chan struct{}
 	input          []quicDatagram
 	flow           *quicFlowState
+	options        types.DecryptOptions
+	packetChan     chan *types.DecryptedPacket
 
 	// Connection state
 	version    uint32
@@ -165,12 +167,23 @@ func NewQUICDecryptor(ci types.ConnectionKey, keyLog *crypto.KeyLogStore, logger
 		closeCh:        make(chan struct{}),
 		wake:           make(chan struct{}, 1),
 		flow:           newQUICFlowState(),
+		packetChan:     packetChan,
 	}
 	// Initialize HTTP/3 parser if channel is available
 	if packetChan != nil {
 		q.http3Parser = protocol.NewHTTP3StreamParser(ci, packetChan)
 	}
 	return q
+}
+
+// SetOptions configures output before Decrypt starts. Raw chunks replace HTTP/3
+// messages; they do not claim an application protocol or negotiated ALPN.
+func (q *QUICDecryptor) SetOptions(options types.DecryptOptions) {
+	q.options = options
+	q.http3Parser = nil
+	if !options.RawChunks && q.packetChan != nil {
+		q.http3Parser = protocol.NewHTTP3StreamParser(q.connectionInfo, q.packetChan)
+	}
 }
 
 // GetAddr returns the connection address
@@ -196,7 +209,24 @@ func (q *QUICDecryptor) Decrypt() error {
 			q.drainQUICInput()
 			q.retryDeferredQUICPackets() // DSB may have arrived after the last packet.
 			if len(q.flow.pending) != 0 {
+				if len(q.flow.clientRandom) == 0 {
+					q.options.Report(q.connectionInfo, "handshake", "missing_client_hello")
+				} else {
+					q.options.Report(q.connectionInfo, "keys", "missing_secret")
+				}
 				q.appendQUICError(fmt.Errorf("%d QUIC packets could not be decrypted: matching SSLKEYLOG secrets or ClientHello missing", len(q.flow.pending)))
+			}
+			if q.options.RawChunks {
+				incomplete := 0
+				for _, stream := range q.flow.streams {
+					if stream.pendingBytes > 0 || stream.hasFinal && stream.next < stream.final {
+						incomplete++
+					}
+				}
+				if incomplete != 0 {
+					q.options.Report(q.connectionInfo, "reassembly", "incomplete_stream")
+					q.appendQUICError(fmt.Errorf("%d QUIC streams have missing bytes at input end", incomplete))
+				}
 			}
 			if q.http3Parser != nil {
 				q.http3Parser.Flush()

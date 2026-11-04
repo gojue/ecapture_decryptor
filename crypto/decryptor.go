@@ -11,7 +11,6 @@ import (
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/sha1"
-	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
@@ -105,7 +104,7 @@ func NewRecordDecryptorTLS12(version uint16, cipherSuite uint16, masterSecret, c
 	}
 
 	// Generate key material
-	keys := keysFromMasterSecret(version, masterSecret, clientRandom, serverRandom, config.MacLen, config.KeyLen, config.IVLen)
+	keys := keysFromMasterSecret(config.HashFunc, masterSecret, clientRandom, serverRandom, config.MacLen, config.KeyLen, config.IVLen)
 
 	var (
 		macKey, encKey, iv []byte
@@ -156,13 +155,13 @@ type keyMaterial struct {
 	serverIV  []byte
 }
 
-func keysFromMasterSecret(version uint16, masterSecret, clientRandom, serverRandom []byte, macLen, keyLen, ivLen int) *keyMaterial {
+func keysFromMasterSecret(hashFunc func() hash.Hash, masterSecret, clientRandom, serverRandom []byte, macLen, keyLen, ivLen int) *keyMaterial {
 	seed := make([]byte, 0, len(clientRandom)+len(serverRandom))
 	seed = append(seed, serverRandom...)
 	seed = append(seed, clientRandom...)
 
 	n := 2*macLen + 2*keyLen + 2*ivLen
-	keyMaterialBytes := prf12(masterSecret, []byte("key expansion"), seed, n)
+	keyMaterialBytes := prf12(hashFunc, masterSecret, []byte("key expansion"), seed, n)
 
 	km := &keyMaterial{}
 	km.clientMAC = keyMaterialBytes[:macLen]
@@ -181,16 +180,16 @@ func keysFromMasterSecret(version uint16, masterSecret, clientRandom, serverRand
 }
 
 // prf12 implements the TLS 1.2 PRF
-func prf12(secret, label, seed []byte, n int) []byte {
+func prf12(hashFunc func() hash.Hash, secret, label, seed []byte, n int) []byte {
 	labelAndSeed := make([]byte, len(label)+len(seed))
 	copy(labelAndSeed, label)
 	copy(labelAndSeed[len(label):], seed)
 
-	return pHash(secret, labelAndSeed, n)
+	return pHash(hashFunc, secret, labelAndSeed, n)
 }
 
-func pHash(secret, seed []byte, n int) []byte {
-	mac := hmac.New(sha256.New, secret)
+func pHash(hashFunc func() hash.Hash, secret, seed []byte, n int) []byte {
+	mac := hmac.New(hashFunc, secret)
 
 	result := make([]byte, n)
 	a := seed

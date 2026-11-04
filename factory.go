@@ -41,6 +41,7 @@ type DecryptorFactory struct {
 	stderr     io.Writer
 	logger     *log.Logger
 	packetChan chan *types.DecryptedPacket // 解密包输出通道
+	options    types.DecryptOptions
 }
 
 // NewDecryptorFactory 创建解密器工厂
@@ -65,7 +66,11 @@ func (f *DecryptorFactory) Create(key types.ConnectionKey) types.Decryptor {
 		return nil
 	}
 
-	return creator(key, f)
+	decryptor := creator(key, f)
+	if configurable, ok := decryptor.(interface{ SetOptions(types.DecryptOptions) }); ok {
+		configurable.SetOptions(f.options)
+	}
+	return decryptor
 }
 
 // GetKeyLog returns the key log store

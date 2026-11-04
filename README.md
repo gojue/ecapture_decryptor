@@ -42,6 +42,7 @@ The SDK only decrypts and parses protocols — it does not impose an output form
 - 🔓 **Decrypt TLS/QUIC traffic**: supports external SSLKEYLOG files and pcapng-embedded DSB
 - 🌐 **Multi-protocol support**: HTTP/1.0, HTTP/1.1, HTTP/2, HTTP/3, WebSocket
 - 📦 **Flexible output**: emits `DecryptedPacket` values for callers to handle freely
+- **Raw streams and diagnostics**: opt into authenticated TLS bytes or QUIC STREAM chunks with `DecryptPcapngStreamWithOptions` / `WithOptions`; see the [API contract](docs/API.md#decryptpcapngstreamwithoptions--withoptions).
 - 🔧 **Multiple usage modes**: Go library, static library (`.a`), command-line tool
 - 🎯 **Clear responsibility**: decryption and protocol parsing only, no forced output format
 

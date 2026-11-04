@@ -5,9 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/gojue/ecapture_decryptor/types"
 )
 
 const maxQUICStreamBytes = 16 << 20
+
+var (
+	errQUICStreamLimit = errors.New("QUIC stream exceeds size limit")
+	errQUICBufferLimit = errors.New("QUIC stream reassembly buffer exceeds limit")
+)
 
 type quicStreamKey struct {
 	id       uint64
@@ -25,7 +32,7 @@ type quicStreamAssembler struct {
 
 func (s *quicStreamAssembler) push(offset uint64, data []byte, fin bool) ([][]byte, bool, error) {
 	if offset > maxQUICStreamBytes || uint64(len(data)) > maxQUICStreamBytes-offset {
-		return nil, false, errors.New("QUIC stream exceeds size limit")
+		return nil, false, errQUICStreamLimit
 	}
 	if fin {
 		end := offset + uint64(len(data))
@@ -44,7 +51,7 @@ func (s *quicStreamAssembler) push(offset uint64, data []byte, fin bool) ([][]by
 		}
 		if old := s.pending[offset]; len(old) < len(data) {
 			if s.pendingBytes-len(old)+len(data) > maxQUICStreamBytes {
-				return nil, false, errors.New("QUIC stream reassembly buffer exceeds limit")
+				return nil, false, errQUICBufferLimit
 			}
 			s.pendingBytes += len(data) - len(old)
 			s.pending[offset] = bytes.Clone(data)
@@ -102,7 +109,13 @@ func consumeQUICBytes(data *[]byte, length uint64) ([]byte, error) {
 // parseQUICFrames handles the frame types that carry HTTP/3 streams and TLS
 // CRYPTO data, and advances through the common control frames that can share
 // a packet with them.
-func (q *QUICDecryptor) parseQUICFrames(plaintext []byte, level int, isClient bool, at time.Time) error {
+func (q *QUICDecryptor) parseQUICFrames(plaintext []byte, level int, isClient bool, at time.Time) (frameErr error) {
+	reported := false
+	defer func() {
+		if frameErr != nil && !reported {
+			q.options.Report(q.connectionInfo, "protocol", "invalid_frame")
+		}
+	}()
 	data := plaintext
 	for len(data) > 0 {
 		frameType, err := consumeQUICVarint(&data)
@@ -153,6 +166,7 @@ func (q *QUICDecryptor) parseQUICFrames(plaintext []byte, level int, isClient bo
 			}
 			if level == quicLevelInitial && isClient {
 				if err := q.observeClientCrypto(offset, part); err != nil {
+					reported = true
 					return err
 				}
 			}
@@ -179,8 +193,9 @@ func (q *QUICDecryptor) parseQUICFrames(plaintext []byte, level int, isClient bo
 			if err != nil {
 				return err
 			}
-			if level == quicLevelApplication && q.http3Parser != nil {
+			if level == quicLevelApplication && (q.http3Parser != nil || q.options.RawChunks && q.packetChan != nil) {
 				if err := q.feedQUICStream(id, offset, part, frameType&1 != 0, isClient, at); err != nil {
+					reported = true
 					return err
 				}
 			}
@@ -255,6 +270,8 @@ func (q *QUICDecryptor) parseQUICFrames(plaintext []byte, level int, isClient bo
 				return err
 			}
 		default:
+			q.options.Report(q.connectionInfo, "protocol", "unsupported_frame")
+			reported = true
 			return fmt.Errorf("unsupported QUIC frame type 0x%x", frameType)
 		}
 	}
@@ -267,10 +284,12 @@ func (q *QUICDecryptor) observeClientCrypto(offset uint64, data []byte) error {
 	}
 	parts, _, err := q.flow.clientCrypto.push(offset, data, false)
 	if err != nil {
+		q.reportQUICReassemblyError(err)
 		return err
 	}
 	for _, part := range parts {
 		if q.flow.clientHello.Len()+len(part) > maxQUICStreamBytes {
+			q.options.Report(q.connectionInfo, "reassembly", "resource_limit")
 			return errors.New("QUIC ClientHello exceeds size limit")
 		}
 		_, _ = q.flow.clientHello.Write(part)
@@ -278,6 +297,7 @@ func (q *QUICDecryptor) observeClientCrypto(offset uint64, data []byte) error {
 	hello := q.flow.clientHello.Bytes()
 	if len(hello) >= 38 {
 		if hello[0] != 1 {
+			q.options.Report(q.connectionInfo, "handshake", "invalid_client_hello")
 			return fmt.Errorf("QUIC CRYPTO starts with TLS handshake type 0x%x, want ClientHello", hello[0])
 		}
 		q.flow.clientRandom = bytes.Clone(hello[6:38])
@@ -293,18 +313,27 @@ func (q *QUICDecryptor) feedQUICStream(id, offset uint64, data []byte, fin, isCl
 		stream = &quicStreamAssembler{}
 		q.flow.streams[key] = stream
 	}
+	next := stream.next
 	parts, complete, err := stream.push(offset, data, fin)
 	if err != nil {
+		q.reportQUICReassemblyError(err)
 		return err
 	}
 	for index, part := range parts {
 		last := complete && index == len(parts)-1
-		if err := q.http3Parser.FeedQUICStream(id, isClient, part, last, at); err != nil {
+		if q.options.RawChunks {
+			q.emitQUICChunk(id, next, part, last, isClient, at)
+		} else if err := q.http3Parser.FeedQUICStream(id, isClient, part, last, at); err != nil {
+			q.options.Report(q.connectionInfo, "protocol", "parse_failed")
 			return err
 		}
+		next += uint64(len(part))
 	}
 	if complete && len(parts) == 0 {
-		if err := q.http3Parser.FeedQUICStream(id, isClient, nil, true, at); err != nil {
+		if q.options.RawChunks {
+			q.emitQUICChunk(id, next, nil, true, isClient, at)
+		} else if err := q.http3Parser.FeedQUICStream(id, isClient, nil, true, at); err != nil {
+			q.options.Report(q.connectionInfo, "protocol", "parse_failed")
 			return err
 		}
 	}
@@ -315,4 +344,30 @@ func (q *QUICDecryptor) feedQUICStream(id, offset uint64, data []byte, fin, isCl
 		stream.pendingBytes = 0
 	}
 	return nil
+}
+
+func (q *QUICDecryptor) reportQUICReassemblyError(err error) {
+	code := "invalid_stream"
+	if errors.Is(err, errQUICStreamLimit) || errors.Is(err, errQUICBufferLimit) {
+		code = "resource_limit"
+	}
+	q.options.Report(q.connectionInfo, "reassembly", code)
+}
+
+func (q *QUICDecryptor) emitQUICChunk(id, offset uint64, data []byte, end, isClient bool, at time.Time) {
+	if q.packetChan == nil {
+		return
+	}
+	direction := "response"
+	if isClient {
+		direction = "request"
+	}
+	kind := "stream_chunk"
+	if len(data) == 0 && end {
+		kind = "stream_end"
+	}
+	packet := types.NewDecryptedPacket(types.TransportProtocolUDP, "quic", direction, data, at, q.connectionInfo)
+	packet.WithMetadata("kind", kind).WithMetadata("stream_id", id).
+		WithMetadata("offset", offset).WithMetadata("end", end)
+	q.packetChan <- packet
 }

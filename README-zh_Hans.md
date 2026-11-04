@@ -42,6 +42,7 @@ SDK 只负责解密与协议解析，不强制输出格式。结果以 `Decrypte
 - 🔓 **解密 TLS/QUIC 流量**：支持外部 SSLKEYLOG 文件和 pcapng 内嵌 DSB
 - 🌐 **多协议支持**：HTTP/1.0、HTTP/1.1、HTTP/2、HTTP/3、WebSocket
 - 📦 **灵活输出**：输出 `DecryptedPacket` 结构，由调用方自由处理
+- **原始流与诊断**：通过 `DecryptPcapngStreamWithOptions` / `WithOptions` 显式选择已认证的 TLS 字节或 QUIC STREAM chunk，详见 [API 契约](docs/API.md#decryptpcapngstreamwithoptions--withoptions)。
 - 🔧 **多种使用方式**：Go 库、静态链接库（`.a`）、命令行工具
 - 🎯 **职责清晰**：只负责解密和协议解析，不强制输出格式
 
