@@ -28,6 +28,10 @@ go.work
 *.swo
 *~
 
+# Local AI agent environment and VM credentials (never commit)
+AGENTS.local.md
+AGENTS.local.md.*
+
 # OS specific files
 .DS_Store
 Thumbs.db
