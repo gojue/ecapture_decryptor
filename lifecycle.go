@@ -12,7 +12,7 @@ import (
 func (e *DecryptorEngine) startIdleReaper() func() {
 	stop, done := make(chan struct{}), make(chan struct{})
 	timeout := e.factory.options.ConnectionIdleTimeout()
-	interval := timeout / 2
+	interval := min(timeout/2, e.factory.options.SecretWaitTimeout()/2)
 	if interval < time.Nanosecond {
 		interval = time.Nanosecond
 	}
@@ -24,6 +24,7 @@ func (e *DecryptorEngine) startIdleReaper() func() {
 			select {
 			case now := <-ticker.C:
 				e.expireIdleConnections(now, timeout)
+				e.expireQUICPending(now, false)
 			case <-stop:
 				return
 			}
@@ -46,6 +47,7 @@ func (e *DecryptorEngine) expireIdleConnections(now time.Time, timeout time.Dura
 		if connection := e.conntrack[key]; connection != nil {
 			expired = append(expired, connection)
 		}
+		e.removeQUICRouteLocked(key)
 		delete(e.conntrack, key)
 		delete(e.tcpFlows, key)
 		delete(e.lastActivity, key)

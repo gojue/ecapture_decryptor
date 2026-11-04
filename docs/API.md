@@ -155,8 +155,8 @@ raw 事件复用 `DecryptedPacket`：`Protocol` 为 `tls` 或 `quic`，`Data` �
 chunk 边界不是应用消息边界，raw 与应用解析互斥，不依赖 ALPN 或自动识别。
 TLS 终止错误时保留已认证字节并返回错误，不发送正常结束标记；捕获结束本身
 不证明应用消息完整。QUIC 只输出连续 STREAM 字节，已知 offset 缺口在关闭时报错。
-不支持 DATAGRAM 输出、RESET、TLS KeyUpdate、0-RTT 或 STARTTLS；QUIC Key Update
-支持范围见下节。现有 QUIC 16 MiB stream offset 上限仍适用。
+不支持 DATAGRAM 输出、RESET、TLS KeyUpdate 或 STARTTLS；QUIC Key Update、
+CID/Retry/VN 和 0-RTT 支持范围见下节。现有 QUIC 16 MiB stream offset 上限仍适用。
 
 `Diagnostic` 仅含连接标识、传输、阶段和固定原因码，不含底层错误字符串。
 典型原因包括 `waiting_secret`、`missing_secret`、`missing_client_hello`、
@@ -191,6 +191,59 @@ phase 或密文均可能导致 `decrypt/authentication_failed`，并保留终止
 ChaCha20-Poly1305 由独立固定派生向量及状态测试覆盖，未宣称真实套件全矩阵通过。
 生成器修正、实际换代证据及命令见 [HTTP/3 fixture 说明](../test/fixtures/http3_capture/README.md#key-update-fixtures)。
 TLS 1.3 的 KeyUpdate 属于另一个协议状态机，本次没有新增其支持。
+
+#### QUIC 连接身份、Retry/VN 与 0-RTT
+
+非零 CID 索引将双向流量、NEW/RETIRE_CONNECTION_ID、CID 轮换与地址迁移归入同一
+`ConnectionID` / `Generation`；输出地址保留初始连接地址。同一 tuple 的不同连接按
+Initial/CID 区分，不凭地址将未知 CID 归入已有连接。零长度 CID 仅支持唯一的原 tuple，
+不能用于识别迁移；碰撞、多个可能匹配的 CID/长度或零 CID tuple 报
+`input/ambiguous_connection_id`，不输出该包。退役 CID 从索引删除，非原始 tuple 别名
+同时清理；无法关联的迟到旧 CID 包也遵循未知 CID 边界。没有任何可关联起始连接时，
+沿用 `handshake/missing_connection_start` 诊断。
+
+每方向最多 64 个带 sequence 的 CID/退役标记；路由每方向最多 66 个 ID（含原始/
+Retry 临时 ID），每连接最多 8 个 tuple 别名。未知 CID 全引擎共用 32 MiB / 65,536 包
+等待队列，认证后的 CID 信息可在没有下一包或 EOF 时释放待路由包。以
+`KeyWaitTimeout` 为期限，达到后由巡检清理（检查周期不大于该值的一半），EOF 也清空；未解决时报告
+`input/unknown_connection_id` 并保留终止错误。CID/别名在取消、超时和 worker 退出时
+释放，正在退出的 worker 仍占连接额度。超限不扩容或猜测关联。
+
+v1/v2 Retry 验证格式、token 和 RFC 完整性 tag；最多处理一次 Retry，只在后续新
+DCID Initial 认证通过且 token/客户端 SCID 匹配后切换 Initial 密钥与 CRYPTO 重组
+epoch。Retry 不重置包号；仅保留一组前 epoch Initial 密钥，用于忽略可认证的迟到旧包。
+VN 最多观察 16 个非零版本，拒绝异常列表；只有后续受支持版本的 Initial 认证成功
+才选择版本。已经观察到有效服务端 Initial、Handshake 或 1-RTT 的连接不再接受 VN
+改变版本。Retry 完整性使用公开固定密钥，VN 没有密码学认证；这两者都不证明服务端
+身份，也不替代 TLS 的证书/握手验证。固定诊断包括 `handshake/invalid_retry`、
+`invalid_version_negotiation`、`invalid_negotiation` 和 `decrypt/version_change`。
+
+0-RTT 使用 `CLIENT_EARLY_TRAFFIC_SECRET`，与 1-RTT 共享 application 包号空间。
+已认证的 early STREAM 字节先缓冲，只有解密后的服务端 EncryptedExtensions 中的
+`early_data` 扩展才能确认接受；扩展缺失表示拒绝。只解出 early 字节不代表被服务端接受。
+
+- **messages**：接受后合入正常 STREAM 重组，按 offset 去重；拒绝时丢弃 early 字节，
+  后续 1-RTT 重传仅输出一次业务消息。已确认拒绝时，缺 early secret 不阻塞业务重传。
+- **raw**：接受后同样合入正常 STREAM；拒绝的已认证字节仍输出，但使用独立的 early
+  offset 空间。early chunk 增加 `encryption_level="0rtt"` 和
+  `early_data="accepted"|"rejected"|"unknown"`；观察过 early STREAM 后的正常 chunk
+  标记 `encryption_level="1rtt"`。接受的 0/1-RTT 共用 offset/FIN 与去重状态；拒绝或
+  unknown 的 early 空间与正常 1-RTT 空间分别计算 offset/FIN，消费者不能将两者当作
+  两次业务请求。未出现 early STREAM 的连接保持原 metadata 形状。
+- **未知**：等待接受信息同样受 `KeyWaitTimeout` 限制，每连接最多 32 MiB / 65,536 个
+  early frame。期限或 EOF 到达仍未知时，raw 输出已认证的连续字节并标记 `unknown`，
+  messages 丢弃未确认 early 字节；两者报告 `handshake/early_data_unknown` 并返回错误。
+  缺 secret 的密文不产生 raw 明文，沿用 `missing_secret` / `key_wait_timeout`。
+
+接受/拒绝诊断为 `handshake/early_data_accepted` / `early_data_rejected`，没有明文或密钥。
+raw 的 rejected/unknown early assembler 与正常 STREAM 分开，各受现有 stream 数量、
+16 MiB offset 与片段上限限制。流式 API 仍按既有背压契约交付，不启动无限输出队列。
+
+独立真实夹具与固定向量覆盖 v1/v2 × AES-128-GCM/AES-256-GCM/ChaCha20-Poly1305。
+实际 18 条连接产生 24 次请求/响应，其中 6 条经过迁移，6 条接受 early data，6 条拒绝后
+以 1-RTT 重传；文件、内嵌 DSB、末尾 DSB 和 raw/messages 回放相互核对。
+Retry 与 0-RTT 使用独立连接；未宣称真实覆盖二者组合、draft-29 或每种套件的 Key Update。
+
 
 ---
 

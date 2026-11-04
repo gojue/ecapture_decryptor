@@ -10,7 +10,6 @@ package transport
 import (
 	"crypto/cipher"
 	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -26,13 +25,14 @@ import (
 
 // QUIC packet types
 const (
-	QUICPacketTypeInitial   = 0x00
-	QUICPacketType0RTT      = 0x01
-	QUICPacketTypeHandshake = 0x02
-	QUICPacketTypeRetry     = 0x03
-	QUICPacketType1RTT      = 0x04
-	maxQUICBufferedBytes    = 32 << 20
-	maxQUICQueuedPackets    = 64 << 10
+	QUICPacketTypeInitial            = 0x00
+	QUICPacketType0RTT               = 0x01
+	QUICPacketTypeHandshake          = 0x02
+	QUICPacketTypeRetry              = 0x03
+	QUICPacketType1RTT               = 0x04
+	QUICPacketTypeVersionNegotiation = 0x05
+	maxQUICBufferedBytes             = 32 << 20
+	maxQUICQueuedPackets             = 64 << 10
 )
 
 var errQUICInputLimit = errors.New("QUIC input buffer limit exceeded")
@@ -74,6 +74,7 @@ type QUICDecryptor struct {
 	flow           *quicFlowState
 	options        types.DecryptOptions
 	packetChan     chan *types.DecryptedPacket
+	routingHandler func([]byte, bool, bool) ([]QUICRoutedPacket, error)
 
 	// Connection state
 	version    uint32
@@ -224,6 +225,7 @@ func (q *QUICDecryptor) Decrypt() (result error) {
 		q.http3Parser = nil
 		q.clientInitialKeys, q.serverInitialKeys = nil, nil
 		q.destConnID = nil
+		q.routingHandler = nil
 	}()
 	updates := q.keyLog.Updates()
 	for {
@@ -236,16 +238,19 @@ func (q *QUICDecryptor) Decrypt() (result error) {
 		if q.flow.terminalErr != nil {
 			return q.flow.terminalErr
 		}
-		if q.flow.pendingSince.IsZero() {
+		waitSince := q.flow.pendingSince
+		if early := q.flow.early.since; !early.IsZero() && (waitSince.IsZero() || early.Before(waitSince)) {
+			waitSince = early
+		}
+		if waitSince.IsZero() {
 			if keyTimer != nil {
 				keyTimer.Stop()
 			}
 			keyTimeout, keyDeadline = nil, time.Time{}
 		} else {
-			deadline := q.flow.pendingSince.Add(q.options.SecretWaitTimeout())
+			deadline := waitSince.Add(q.options.SecretWaitTimeout())
 			if !deadline.After(time.Now()) {
-				q.options.Report(q.connectionInfo, "keys", "key_wait_timeout")
-				return errors.New("timed out waiting for QUIC secrets")
+				return q.quicWaitExpired()
 			}
 			if !deadline.Equal(keyDeadline) {
 				if keyTimer == nil {
@@ -265,8 +270,7 @@ func (q *QUICDecryptor) Decrypt() (result error) {
 			updates = q.keyLog.Updates()
 			q.retryQUICPacketsWithNewKeys()
 		case <-keyTimeout:
-			q.options.Report(q.connectionInfo, "keys", "key_wait_timeout")
-			return errors.New("timed out waiting for QUIC secrets")
+			return q.quicWaitExpired()
 		case <-q.closeCh:
 			q.drainQUICInput(false)
 			q.mu.Lock()
@@ -278,7 +282,19 @@ func (q *QUICDecryptor) Decrypt() (result error) {
 			if q.flow.terminalErr != nil {
 				return q.flow.terminalErr
 			}
-			q.retryDeferredQUICPackets() // DSB may have arrived after the last packet.
+			// CID announcements unlocked by a trailing DSB can route earlier
+			// encrypted packets even during EOF drain. Drain them before exit.
+			for {
+				q.retryDeferredQUICPackets()
+				q.retryQUICPacketsWithNewKeys() // A retry can resolve early-data acceptance.
+				q.mu.Lock()
+				more := len(q.input) > 0
+				q.mu.Unlock()
+				if !more || q.flow.terminalErr != nil {
+					break
+				}
+				q.drainQUICInput(false)
+			}
 			if len(q.flow.pending) != 0 {
 				if len(q.flow.clientRandom) == 0 {
 					q.options.Report(q.connectionInfo, "handshake", "missing_client_hello")
@@ -287,11 +303,19 @@ func (q *QUICDecryptor) Decrypt() (result error) {
 				}
 				q.appendQUICError(fmt.Errorf("%d QUIC packets could not be decrypted: matching SSLKEYLOG secrets or ClientHello missing", len(q.flow.pending)))
 			}
+			if err := q.finishQUICEarly(); err != nil {
+				q.appendQUICError(err)
+			}
+			if !IsQUICVersionSupported(q.version) && q.version != 0 {
+				q.appendQUICError(errors.New("QUIC negotiation did not select a supported version"))
+			}
 			if q.options.RawChunks {
 				incomplete := 0
-				for _, stream := range q.flow.streams {
-					if stream.pendingBytes > 0 || stream.hasFinal && stream.next < stream.final {
-						incomplete++
+				for _, streams := range []map[quicStreamKey]*quicStreamAssembler{q.flow.streams, q.flow.early.streams} {
+					for _, stream := range streams {
+						if stream.pendingBytes > 0 || stream.hasFinal && stream.next < stream.final {
+							incomplete++
+						}
 					}
 				}
 				if incomplete != 0 {
@@ -321,8 +345,9 @@ func (q *QUICDecryptor) drainQUICInput(stopAtDeadline bool) {
 		q.inputBytes -= len(item.data)
 		q.mu.Unlock()
 		q.processQUICDatagram(item)
-		if q.flow.terminalErr != nil || stopAtDeadline && !q.flow.pendingSince.IsZero() &&
-			time.Since(q.flow.pendingSince) >= q.options.SecretWaitTimeout() {
+		keyExpired := !q.flow.pendingSince.IsZero() && time.Since(q.flow.pendingSince) >= q.options.SecretWaitTimeout()
+		earlyExpired := !q.flow.early.since.IsZero() && time.Since(q.flow.early.since) >= q.options.SecretWaitTimeout()
+		if q.flow.terminalErr != nil || stopAtDeadline && (keyExpired || earlyExpired) {
 			return
 		}
 	}
@@ -330,29 +355,21 @@ func (q *QUICDecryptor) drainQUICInput(stopAtDeadline bool) {
 
 // deriveInitialKeys derives initial encryption keys from destination connection ID
 func (q *QUICDecryptor) deriveInitialKeys(dcid []byte) {
+	q.clientInitialKeys, q.serverInitialKeys = quicInitialKeys(q.version, dcid)
+}
+
+func quicInitialKeys(version uint32, dcid []byte) (*QUICKeys, *QUICKeys) {
 	salt := quicV1InitialSalt
-	if q.version == quicVersion2 {
+	if version == quicVersion2 {
 		salt = quicV2InitialSalt
-	} else if q.version == 0xff00001d {
+	} else if version == 0xff00001d {
 		salt = quicDraft29InitialSalt
 	}
-
-	initialSecret := quicHkdfExtract(salt, dcid)
-	clientSecret := quicHkdfExpandLabel(initialSecret, "client in", nil, 32)
-	serverSecret := quicHkdfExpandLabel(initialSecret, "server in", nil, 32)
-
-	q.logger.Printf("QUIC Initial secrets derived from DCID: %s", hex.EncodeToString(dcid))
-
-	var err error
-	q.clientInitialKeys, err = deriveQUICKeys(clientSecret, q.version, quicAES128)
-	if err != nil {
-		q.logger.Printf("Failed to derive client initial keys: %v", err)
-	}
-
-	q.serverInitialKeys, err = deriveQUICKeys(serverSecret, q.version, quicAES128)
-	if err != nil {
-		q.logger.Printf("Failed to derive server initial keys: %v", err)
-	}
+	secret := quicHkdfExtract(salt, dcid)
+	// Fixed 32-byte secrets and AES-128 always form a valid key/suite pair.
+	client, _ := deriveQUICKeys(quicHkdfExpandLabel(secret, "client in", nil, 32), version, quicAES128)
+	server, _ := deriveQUICKeys(quicHkdfExpandLabel(secret, "server in", nil, 32), version, quicAES128)
+	return client, server
 }
 
 // getPacketTypeName returns the name of a QUIC packet type

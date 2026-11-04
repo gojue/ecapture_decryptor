@@ -151,3 +151,128 @@ func TestUDPQUICInitialAndReverseDatagramRouting(t *testing.T) {
 		}
 	})
 }
+
+func TestQUICCIDRoutingMigrationIsolationAndRetirement(t *testing.T) {
+	withRoutingDecryptor(t, types.TransportProtocolUDP, func(e *DecryptorEngine, created *[]*routingDecryptor) {
+		key := types.ConnectionKey{SrcIP: net.IPv4(192, 0, 2, 1), DstIP: net.IPv4(192, 0, 2, 2), SrcPort: 41000, DstPort: 443, Proto: "udp"}
+		initial := func(dcid, scid string) []byte {
+			p := append([]byte{0xc0, 0, 0, 0, 1, byte(len(dcid))}, []byte(dcid)...)
+			p = append(p, byte(len(scid)))
+			return append(p, []byte(scid)...)
+		}
+		short := func(cid string) []byte {
+			return append(append([]byte{0x40}, []byte(cid)...), bytes.Repeat([]byte{0xff}, 24)...)
+		}
+		e.handleQUICPacket(key, initial("dest-one", "client-one"), time.Time{})
+		e.handleQUICPacket(key, initial("dest-two", "client-two"), time.Time{})
+		if len(*created) != 2 {
+			t.Fatalf("same tuple connections=%d", len(*created))
+		}
+		first, second := (*created)[0], (*created)[1]
+		route := e.quic.routes[first.addr.String()]
+		if _, err := e.quicCIDUpdate(route, []byte("rotated"), false, false); err != nil {
+			t.Fatal(err)
+		}
+		migrated := key
+		migrated.SrcPort++
+		e.handleQUICPacket(migrated, short("rotated"), time.Time{})
+		e.handleQUICPacket(migrated.Reverse(), short("client-one"), time.Time{})
+		e.handleQUICPacket(key, short("dest-two"), time.Time{})
+		if len(first.client) != 2 || len(first.server) != 1 || len(second.client) != 2 || len(second.server) != 0 {
+			t.Fatal("migration lost identity or crossed connections")
+		}
+		if len(route.aliases) != 2 {
+			t.Fatal("migration tuple was not recorded")
+		}
+		if _, err := e.quicCIDUpdate(route, []byte("rotated"), false, true); err != nil {
+			t.Fatal(err)
+		}
+		e.handleQUICPacket(migrated, short("rotated"), time.Time{})
+		if len(first.client) != 2 || len(route.aliases) != 1 || len(e.quic.pending) != 1 {
+			t.Fatal("retired CID/tuple still routed")
+		}
+		// Colliding IDs must never use tuple proximity to choose a connection.
+		other := e.quic.routes[second.addr.String()]
+		if _, err := e.quicCIDUpdate(other, []byte("client-one"), true, false); err != nil {
+			t.Fatal(err)
+		}
+		e.handleQUICPacket(key.Reverse(), short("client-one"), time.Time{})
+		if len(first.server) != 1 || len(second.server) != 0 {
+			t.Fatal("ambiguous CID routed")
+		}
+		for i := 0; i < 20; i++ {
+			migrated.SrcPort++
+			e.handleQUICPacket(migrated, short("dest-one"), time.Time{})
+		}
+		if len(route.aliases) > maxQUICTupleAliases {
+			t.Fatal("unbounded tuple aliases")
+		}
+		e.expireIdleConnections(time.Now().Add(time.Hour), time.Second)
+		if len(e.quic.routes) != 0 || len(e.quic.cids) != 0 {
+			t.Fatal("idle cleanup leaked CID index")
+		}
+		e.expireQUICPending(time.Now(), true)
+		if len(e.quic.pending) != 0 || e.quic.bytes != 0 {
+			t.Fatal("pending routing leaked")
+		}
+	})
+}
+
+func TestQUICCIDPendingReleaseAndCapacity(t *testing.T) {
+	withRoutingDecryptor(t, types.TransportProtocolUDP, func(e *DecryptorEngine, created *[]*routingDecryptor) {
+		e.factory.options = types.DecryptOptions{MaxConnections: 1}
+		key := types.ConnectionKey{SrcIP: net.IPv4(192, 0, 2, 1), DstIP: net.IPv4(192, 0, 2, 2), SrcPort: 41000, DstPort: 443, Proto: "udp"}
+		e.handleQUICPacket(key, []byte{0xc0, 0, 0, 0, 1, 1, 7, 1, 8}, time.Time{})
+		first := (*created)[0]
+		finish := make(chan struct{})
+		first.finish = finish
+		data := append([]byte{0x40, 9}, bytes.Repeat([]byte{0xff}, 20)...)
+		e.handleQUICPacket(key, data, time.Unix(7, 0))
+		if len(e.quic.pending) != 1 {
+			t.Fatal("unknown CID guessed from tuple")
+		}
+		route := e.quic.routes[first.addr.String()]
+		ready, err := e.quicCIDUpdate(route, []byte{9}, false, false)
+		if err != nil || len(ready) != 1 || !ready[0].IsClient || !ready[0].Time.Equal(time.Unix(7, 0)) || !bytes.Equal(ready[0].Data, data) {
+			t.Fatal("CID announcement did not release captured packet", err)
+		}
+		if len(e.quic.pending) != 0 || e.quic.bytes != 0 {
+			t.Fatal("released packet retained")
+		}
+		e.expireIdleConnections(time.Now().Add(time.Hour), time.Second)
+		e.handleQUICPacket(key, []byte{0xc0, 0, 0, 0, 1, 1, 10, 1, 11}, time.Time{})
+		if len(*created) != 1 {
+			t.Fatal("closing worker did not consume connection quota")
+		}
+		close(finish)
+	})
+}
+
+func TestQUICZeroCIDDoesNotGuessMigrationOrAmbiguousTuple(t *testing.T) {
+	withRoutingDecryptor(t, types.TransportProtocolUDP, func(e *DecryptorEngine, created *[]*routingDecryptor) {
+		key := types.ConnectionKey{SrcIP: net.IPv4(192, 0, 2, 1), DstIP: net.IPv4(192, 0, 2, 2), SrcPort: 41000, DstPort: 443, Proto: "udp"}
+		e.handleQUICPacket(key, []byte{0xc0, 0, 0, 0, 1, 1, 7, 0}, time.Time{})
+		first := (*created)[0]
+		data := append([]byte{0x40}, bytes.Repeat([]byte{0xff}, 20)...)
+		e.handleQUICPacket(key.Reverse(), data, time.Time{})
+		migrated := key
+		migrated.SrcPort++
+		e.handleQUICPacket(migrated.Reverse(), data, time.Time{})
+		if len(first.server) != 1 || len(e.quic.pending) != 1 {
+			t.Fatal("zero CID migration guessed a connection")
+		}
+		// Another same-tuple connection makes the zero-CID direction ambiguous.
+		e.handleQUICPacket(key, []byte{0xc0, 0, 0, 0, 1, 1, 9, 0}, time.Time{})
+		if len(*created) != 2 {
+			t.Fatal("distinct Initial did not create a second route")
+		}
+		e.handleQUICPacket(key.Reverse(), data, time.Time{})
+		if len(first.server) != 1 || len((*created)[1].server) != 0 {
+			t.Fatal("zero CID ambiguous tuple guessed a connection")
+		}
+		e.expireQUICPending(time.Now().Add(time.Minute), false)
+		if len(e.quic.pending) != 0 {
+			t.Fatal("unknown-CID waiting deadline not bounded")
+		}
+	})
+}

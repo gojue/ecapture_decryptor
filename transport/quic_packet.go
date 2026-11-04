@@ -37,6 +37,7 @@ type quicPacket struct {
 	pnOffset   int
 	dcid       []byte
 	scid       []byte
+	token      []byte
 }
 
 func readQUICVarint(data []byte) (uint64, int, error) {
@@ -83,40 +84,22 @@ func splitQUICDatagram(data []byte) ([]quicPacket, error) {
 			packets = append(packets, quicPacket{data: data, packetType: QUICPacketType1RTT})
 			break
 		}
-		if len(data) < 7 {
-			return nil, ioUnexpectedQUICEnd
+		h, err := InspectQUICHeader(data)
+		if err != nil {
+			return nil, err
 		}
-		version := binary.BigEndian.Uint32(data[1:5])
-		if version == 0 { // Version Negotiation has no protected payload.
+		version, dcid, scid, packetType, pos := h.Version, h.DCID, h.SCID, h.Type, h.Length
+		if version == 0 || packetType == QUICPacketTypeRetry {
+			packets = append(packets, quicPacket{data: data, version: version, packetType: packetType, long: true, dcid: dcid, scid: scid, pnOffset: pos})
 			break
 		}
-		pos := 5
-		dcidLen := int(data[pos])
-		pos++
-		if dcidLen > 20 || len(data) < pos+dcidLen+1 {
-			return nil, ioUnexpectedQUICEnd
-		}
-		dcid := data[pos : pos+dcidLen]
-		pos += dcidLen
-		scidLen := int(data[pos])
-		pos++
-		if scidLen > 20 || len(data) < pos+scidLen {
-			return nil, ioUnexpectedQUICEnd
-		}
-		scid := data[pos : pos+scidLen]
-		pos += scidLen
-		packetType := (data[0] >> 4) & 3
-		if version == quicVersion2 {
-			packetType = (packetType + 3) & 3 // v2: Retry, Initial, 0-RTT, Handshake.
-		}
-		if packetType == QUICPacketTypeRetry {
-			break // Retry is not AEAD protected and consumes the datagram.
-		}
+		var token []byte
 		if packetType == QUICPacketTypeInitial {
 			tokenLen, n, err := readQUICVarint(data[pos:])
 			if err != nil || tokenLen > uint64(len(data)-pos-n) {
 				return nil, ioUnexpectedQUICEnd
 			}
+			token = data[pos+n : pos+n+int(tokenLen)]
 			pos += n + int(tokenLen)
 		}
 		payloadLen, n, err := readQUICVarint(data[pos:])
@@ -127,7 +110,7 @@ func splitQUICDatagram(data []byte) ([]quicPacket, error) {
 		end := pos + int(payloadLen)
 		packets = append(packets, quicPacket{
 			data: data[:end], version: version, packetType: packetType,
-			long: true, pnOffset: pos, dcid: dcid, scid: scid,
+			long: true, pnOffset: pos, dcid: dcid, scid: scid, token: token,
 		})
 		data = data[end:]
 	}
@@ -295,4 +278,75 @@ func decryptQUICPacket(packet quicPacket, keys *QUICKeys, cidLen int, largest ui
 		return nil, 0, 0, fmt.Errorf("QUIC packet authentication: %w", err)
 	}
 	return plaintext, pn, first, nil
+}
+
+// QUICHeaderInfo is the invariant header needed by the SDK connection router.
+// Inspection does not authenticate a packet or establish connection identity.
+type QUICHeaderInfo struct {
+	Long       bool
+	Version    uint32
+	Type       uint8
+	DCID, SCID []byte
+	Length     int
+}
+
+func InspectQUICHeader(data []byte) (QUICHeaderInfo, error) {
+	var h QUICHeaderInfo
+	if len(data) == 0 || len(data) > quicMaxPacketSize {
+		return h, ioUnexpectedQUICEnd
+	}
+	h.Long = data[0]&0x80 != 0
+	if !h.Long {
+		h.Type = QUICPacketType1RTT
+		return h, nil
+	}
+	if len(data) < 7 {
+		return h, ioUnexpectedQUICEnd
+	}
+	h.Version = binary.BigEndian.Uint32(data[1:5])
+	pos := 6
+	n := int(data[5])
+	if n > 20 || len(data) < pos+n+1 {
+		return h, ioUnexpectedQUICEnd
+	}
+	h.DCID = data[pos : pos+n]
+	pos += n
+	n = int(data[pos])
+	pos++
+	if n > 20 || len(data) < pos+n {
+		return h, ioUnexpectedQUICEnd
+	}
+	h.SCID = data[pos : pos+n]
+	h.Length = pos + n
+	h.Type = (data[0] >> 4) & 3
+	if h.Version == quicVersion2 {
+		h.Type = (h.Type + 3) & 3
+	}
+	if h.Version == 0 {
+		h.Type = QUICPacketTypeVersionNegotiation
+	}
+	return h, nil
+}
+
+// RFC 9001 §5.8 and RFC 9369 §3.3.3. This public integrity key detects corrupt
+// Retry packets; it does not authenticate the server's identity.
+func validQUICRetry(packet quicPacket, originalDCID []byte) bool {
+	if len(packet.data) <= packet.pnOffset+16 || len(originalDCID) > 20 {
+		return false
+	}
+	key := []byte{0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e}
+	nonce := []byte{0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb}
+	if packet.version == quicVersion2 {
+		key = []byte{0x8f, 0xb4, 0xb0, 0x1b, 0x56, 0xac, 0x48, 0xe2, 0x60, 0xfb, 0xcb, 0xce, 0xad, 0x7c, 0xcc, 0x92}
+		nonce = []byte{0xd8, 0x69, 0x69, 0xbc, 0x2d, 0x7c, 0x6d, 0x99, 0x90, 0xef, 0xb0, 0x4a}
+	} else if packet.version != quicVersion1 {
+		return false
+	}
+	block, _ := aes.NewCipher(key)
+	aead, _ := cipher.NewGCM(block)
+	end := len(packet.data) - 16
+	pseudo := append([]byte{byte(len(originalDCID))}, originalDCID...)
+	pseudo = append(pseudo, packet.data[:end]...)
+	_, err := aead.Open(nil, nonce, packet.data[end:], pseudo)
+	return err == nil
 }

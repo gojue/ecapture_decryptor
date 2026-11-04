@@ -50,7 +50,7 @@ SDK 只负责解密与协议解析，不强制输出格式。结果以 `Decrypte
 
 解密 HTTP/3 需要包含客户端 Initial（其中有 ClientHello）的双向 UDP 抓包，以及匹配该连接的 TLS 1.3 SSLKEYLOG。密钥可作为外部文件传入，也可放在 pcapng 的 DSB 中。解析器按 QUIC 连接、包号和 STREAM 偏移重组数据，再按 HTTP/3 请求流输出 `http/3` 的 `DecryptedPacket`。
 
-仓库中的 [Linux HTTP/3 抓包](test/fixtures/http3_capture/README.md)与 [Linux HTTP/1.x 和 HTTP/2 抓包](test/fixtures/http_tcp_capture/README.md)由 `tcpdump` 和 eCapture 实际捕获，覆盖外部密钥、内嵌 DSB 和 DSB 文件的流式读取。新增独立回环抓包覆盖 QUIC v1/v2、AES-128-GCM 的双向多次 Key Update。SDK 从初始 application traffic secret 派生后续密钥，并保留上一代处理乱序；[边界与失败行为](docs/API.md#quic-key-update)见 API 文档。AES-256-GCM、ChaCha20-Poly1305 的更新有向量和状态测试，尚无真实抓包覆盖；draft-29 仍未通过真实抓包验证。HTTP/3 头部解析支持 QPACK 静态表和字面量；动态 QPACK 和连接迁移尚不支持。
+仓库中的 [Linux HTTP/3 抓包](test/fixtures/http3_capture/README.md)与 [Linux HTTP/1.x 和 HTTP/2 抓包](test/fixtures/http_tcp_capture/README.md)由 `tcpdump` 和 eCapture 实际捕获，覆盖外部密钥、内嵌 DSB 和 DSB 文件的流式读取。新增独立回环抓包覆盖 QUIC v1/v2、AES-128-GCM 的双向多次 Key Update。SDK 从初始 application traffic secret 派生后续密钥，并保留上一代处理乱序；[边界与失败行为](docs/API.md#quic-key-update)见 API 文档。AES-256-GCM、ChaCha20-Poly1305 的更新有向量和状态测试，尚无真实抓包覆盖；draft-29 仍未通过真实抓包验证。另有 aioquic 1.3.0 独立抓包，实测 v1/v2 × 三种套件的握手与应用解密、CID 轮换/NAT rebinding、Retry、版本协商和 accepted/rejected 0-RTT；它不扩大上述 Key Update 的真实套件覆盖范围。[连接身份与 early data 契约](docs/API.md#quic-连接身份retryvn-与-0-rtt)见 API 文档。HTTP/3 头部解析支持 QPACK 静态表和字面量；动态 QPACK 仍不支持。
 
 # 快速开始
 

@@ -309,3 +309,181 @@ func TestQUICKeyUpdateCaptureAPIs(t *testing.T) {
 		})
 	}
 }
+
+func TestQUICLifecycleCaptureAPIs(t *testing.T) {
+	const base = "test/testdata/http3_lifecycle_aioquic"
+	packets, clientKeys, serverKeys := quicDSBBlocks(t, base+".pcapng", base+".keys")
+	keylog, err := os.ReadFile(base + ".keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	withDSB := bytes.Join([][]byte{packets, clientKeys, serverKeys}, nil)
+	var reference map[string]string
+	for _, raw := range []bool{false, true} {
+		for _, mode := range []string{"file_external", "file_dsb", "stream_late_dsb"} {
+			t.Run(fmt.Sprintf("raw=%v/%s", raw, mode), func(t *testing.T) {
+				var output []*types.DecryptedPacket
+				if mode == "stream_late_dsb" {
+					synctest.Test(t, func(t *testing.T) {
+						stream := newQUICLiveStream(t, raw)
+						stream.write(t, packets)
+						synctest.Wait()
+						if len(stream.packets) != 0 {
+							t.Fatal("application output without secrets")
+						}
+						stream.write(t, clientKeys)
+						stream.write(t, serverKeys)
+						synctest.Wait()
+						stream.assertOpen(t)
+						if len(stream.packets) < 48 {
+							t.Fatal("lifecycle output delayed until EOF")
+						}
+						count := len(stream.packets)
+						if err := stream.writer.Close(); err != nil {
+							t.Fatal(err)
+						}
+						synctest.Wait()
+						if err := <-stream.done; err != nil {
+							t.Fatal(err)
+						}
+						if len(stream.packets) != count {
+							t.Fatal("output changed at EOF")
+						}
+						output = stream.packets
+					})
+				} else {
+					input := withDSB
+					var secrets io.Reader
+					if mode == "file_external" {
+						input = packets
+						secrets = bytes.NewReader(keylog)
+					}
+					ch := make(chan *types.DecryptedPacket)
+					done := make(chan struct{})
+					go func() {
+						defer close(done)
+						for p := range ch {
+							output = append(output, p)
+						}
+					}()
+					err := DecryptWithConfig(NewDecryptorConfig().WithPcapReader(bytes.NewReader(input)).WithSSLKeyLog(secrets).WithPacketChan(ch).WithOptions(types.DecryptOptions{RawChunks: raw}).WithLogger(log.New(io.Discard, "", 0)))
+					close(ch)
+					<-done
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				parsers := make(map[string]*protocol.HTTP3StreamParser)
+				// Parser output uses its configured ConnectionKey, so retain the
+				// original raw identity separately for stable-connection assertions.
+				parsed := make(map[string]chan *types.DecryptedPacket)
+				messages := make(map[string][]*types.DecryptedPacket)
+				offsets := make(map[string]uint64)
+				ended := make(map[string]bool)
+				early := map[string]map[string]bool{"accepted": {}, "rejected": {}}
+				for _, p := range output {
+					conn := p.ConnectionID()
+					if !raw {
+						messages[conn] = append(messages[conn], p)
+						continue
+					}
+					id := p.Metadata["stream_id"].(uint64)
+					level, _ := p.Metadata["encryption_level"].(string)
+					status, _ := p.Metadata["early_data"].(string)
+					space := ""
+					if level == "0rtt" && status != "accepted" {
+						space = "early"
+					}
+					key := fmt.Sprintf("%s/%d/%s/%s", conn, id, p.Direction, space)
+					if ended[key] || p.Metadata["offset"] != offsets[key] {
+						t.Fatal("duplicate or non-contiguous raw output", key)
+					}
+					offsets[key] += uint64(len(p.Data))
+					ended[key] = p.Metadata["end"] == true
+					if level == "0rtt" {
+						if early[status] == nil {
+							t.Fatal("unexpected early status", status)
+						}
+						early[status][conn] = true
+						if status == "rejected" {
+							continue
+						}
+					}
+					if id%4 != 0 {
+						continue
+					}
+					if parsers[conn] == nil {
+						parsed[conn] = make(chan *types.DecryptedPacket, 8)
+						parsers[conn] = protocol.NewHTTP3StreamParser(types.ConnectionKey{}, parsed[conn])
+					}
+					if err := parsers[conn].FeedQUICStream(id, p.Direction == "request", p.Data, ended[key], time.Time{}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if raw {
+					if len(early["accepted"]) != 6 || len(early["rejected"]) != 6 {
+						t.Fatalf("early connections=%v", early)
+					}
+					for conn, parser := range parsers {
+						parser.Flush()
+						close(parsed[conn])
+						for p := range parsed[conn] {
+							messages[conn] = append(messages[conn], p)
+						}
+					}
+				}
+				if len(messages) != 18 {
+					t.Fatalf("stable connections=%d want18", len(messages))
+				}
+				data := make(map[string]string)
+				owners := make(map[string]string)
+				for conn, ps := range messages {
+					paths := make(map[uint64]string)
+					for _, p := range ps {
+						if p.Direction == "request" {
+							paths[p.Metadata["stream_id"].(uint64)] = p.Metadata["path"].(string)
+						}
+					}
+					for _, p := range ps {
+						path := paths[p.Metadata["stream_id"].(uint64)]
+						key := path + "/" + p.Direction
+						if _, seen := data[key]; seen {
+							t.Fatal("duplicate business message", key)
+						}
+						data[key] = string(p.Data)
+						owners[path] = conn
+						if p.Direction == "response" {
+							body := bytes.SplitN(p.Data, []byte("\r\n\r\n"), 2)
+							if p.Metadata["status"] != 200 || len(body) != 2 || string(body[1]) != "reply "+path {
+								t.Fatal("response mismatch", key)
+							}
+						} else if p.Metadata["method"] != "GET" || p.Metadata["authority"] != "localhost" {
+							t.Fatal("request metadata mismatch")
+						}
+					}
+				}
+				if len(data) != 48 {
+					t.Fatalf("messages=%d want48", len(data))
+				}
+				for _, v := range []int{1, 2} {
+					for _, suite := range []string{"aes128", "aes256", "chacha"} {
+						prefix := fmt.Sprintf("/v%d/%s/", v, suite)
+						for _, stage := range []string{"seed", "migrate", "accepted", "rejected"} {
+							if owners[prefix+stage] == "" {
+								t.Fatal("missing matrix cell", prefix+stage)
+							}
+						}
+						if owners[prefix+"seed"] != owners[prefix+"migrate"] || owners[prefix+"accepted"] == owners[prefix+"rejected"] {
+							t.Fatal("migration or reused tuple identity mismatch")
+						}
+					}
+				}
+				if reference == nil {
+					reference = data
+				} else if !reflect.DeepEqual(reference, data) {
+					t.Fatal("raw/messages or file/stream results differ")
+				}
+			})
+		}
+	}
+}
