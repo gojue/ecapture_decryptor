@@ -18,7 +18,7 @@ import (
 )
 
 func TestQUICStreamLateDSBBeforeEOF(t *testing.T) {
-	packets, clientKeys, serverKeys := quicLateDSBBlocks(t)
+	packets, clientKeys, serverKeys := quicDSBBlocks(t, "test/testdata/http3_loopback_tcpdump_no_dsb.pcapng", "test/testdata/http3_loopback_tcpdump.keys")
 	synctest.Test(t, func(t *testing.T) {
 		// Two independent engines stay open concurrently, one for each output
 		// mode. All I/O within the bubble uses io.Pipe, never files or sockets.
@@ -80,7 +80,7 @@ func TestQUICStreamLateDSBBeforeEOF(t *testing.T) {
 }
 
 func TestQUICStreamMissingKeysCancellation(t *testing.T) {
-	packets, _, _ := quicLateDSBBlocks(t)
+	packets, _, _ := quicDSBBlocks(t, "test/testdata/http3_loopback_tcpdump_no_dsb.pcapng", "test/testdata/http3_loopback_tcpdump.keys")
 	synctest.Test(t, func(t *testing.T) {
 		streams := []*quicLiveStream{newQUICLiveStream(t, false), newQUICLiveStream(t, true)}
 		for _, stream := range streams {
@@ -208,11 +208,11 @@ func assertQUICLiveOutput(t *testing.T, packets []*types.DecryptedPacket, raw, r
 	}
 }
 
-// Read only the tracked loopback fixture, outside any synctest bubble. Rewrap
+// Read only a controlled loopback fixture, outside any synctest bubble. Rewrap
 // its real packets and split its matching secrets into two later DSB updates.
-func quicLateDSBBlocks(t *testing.T) (packets, clientKeys, serverKeys []byte) {
+func quicDSBBlocks(t *testing.T, capturePath, keylogPath string) (packets, clientKeys, serverKeys []byte) {
 	t.Helper()
-	file, err := os.Open("test/testdata/http3_loopback_tcpdump_no_dsb.pcapng")
+	file, err := os.Open(capturePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +242,7 @@ func quicLateDSBBlocks(t *testing.T) (packets, clientKeys, serverKeys []byte) {
 		t.Fatal(err)
 	}
 	packets = bytes.Clone(encoded.Bytes())
-	keylog, err := os.ReadFile("test/testdata/http3_loopback_tcpdump.keys")
+	keylog, err := os.ReadFile(keylogPath)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -28,6 +28,19 @@ type quicDeferredPacket struct {
 	at       time.Time
 }
 
+// Retain only one previous generation. The next candidates are cached even on
+// authentication failure, so forged phase bits cannot force repeated HKDF work.
+// Before suite selection there are at most two candidates (AES128 / ChaCha20).
+type quicKeyPhaseState struct {
+	generation      uint64
+	authenticated   bool
+	firstPN         uint64
+	minimumPN       uint64
+	previousMinimum uint64
+	previous        *QUICKeys
+	next            [2]*QUICKeys
+}
+
 type quicFlowState struct {
 	clientRandom   []byte
 	clientCID      []byte
@@ -36,9 +49,11 @@ type quicFlowState struct {
 	clientHello    bytes.Buffer
 	streams        map[quicStreamKey]*quicStreamAssembler
 	keys           [2][4][]*QUICKeys
+	keyPhase       [2]quicKeyPhaseState
 	largest        [2][3]uint64
 	haveLargest    [2][3]bool
 	pending        []quicDeferredPacket
+	pendingLevels  [2][4]bool
 	pendingBytes   int
 	pendingSince   time.Time
 	terminalErr    error
@@ -121,6 +136,7 @@ func (q *QUICDecryptor) processQUICDatagram(datagram quicDatagram) {
 			packet.dcid = bytes.Clone(packet.dcid)
 			packet.scid = bytes.Clone(packet.scid)
 			q.flow.pending = append(q.flow.pending, quicDeferredPacket{packet: packet, isClient: datagram.isClient, at: datagram.at})
+			q.flow.pendingLevels[quicDirectionIndex(datagram.isClient)][quicPacketLevel(packet)] = true
 			q.flow.pendingBytes += len(packet.data)
 		}
 	}
@@ -157,6 +173,7 @@ func (q *QUICDecryptor) retryDeferredQUICPackets() {
 	deferred := q.flow.pending
 	q.flow.pending = nil
 	q.flow.pendingBytes = 0
+	q.flow.pendingLevels = [2][4]bool{}
 	for _, item := range deferred {
 		pending, err := q.processQUICPacket(item.packet, item.isClient, item.at)
 		if err != nil {
@@ -166,6 +183,7 @@ func (q *QUICDecryptor) retryDeferredQUICPackets() {
 			}
 		} else if pending {
 			q.flow.pending = append(q.flow.pending, item)
+			q.flow.pendingLevels[quicDirectionIndex(item.isClient)][quicPacketLevel(item.packet)] = true
 			q.flow.pendingBytes += len(item.packet.data)
 		}
 	}
@@ -202,6 +220,12 @@ func (q *QUICDecryptor) processQUICPacket(packet quicPacket, isClient bool, at t
 		return false, nil
 	}
 	direction := quicDirectionIndex(isClient)
+	// Preserve arrival order within a direction/level while waiting for keys.
+	// A secret can arrive midway through a retry pass: later packets must not
+	// advance generations before earlier deferred packets get their turn.
+	if q.flow.pendingLevels[direction][level] {
+		return true, nil
+	}
 	keys, err := q.quicKeysForLevel(direction, level)
 	if err != nil {
 		q.options.Report(q.connectionInfo, "decrypt", "invalid_key_material")
@@ -226,18 +250,22 @@ func (q *QUICDecryptor) processQUICPacket(packet quicPacket, isClient bool, at t
 	} else {
 		cidLengths = []int{0}
 	}
-	for _, key := range keys {
+	for keyIndex, key := range keys {
 		for _, cidLen := range cidLengths {
-			plaintext, pn, _, decryptErr := decryptQUICPacket(packet, key, cidLen, q.flow.largest[direction][space], q.flow.haveLargest[direction][space])
+			var plaintext []byte
+			var pn uint64
+			var decryptErr error
+			if level == quicLevelApplication {
+				plaintext, pn, decryptErr = q.decryptQUICApplication(packet, key, keyIndex, cidLen, direction)
+			} else {
+				plaintext, pn, _, decryptErr = decryptQUICPacket(packet, key, cidLen, q.flow.largest[direction][space], q.flow.haveLargest[direction][space])
+			}
 			if decryptErr != nil {
 				continue
 			}
 			if !q.flow.haveLargest[direction][space] || pn > q.flow.largest[direction][space] {
 				q.flow.largest[direction][space] = pn
 				q.flow.haveLargest[direction][space] = true
-			}
-			if level == quicLevelApplication {
-				q.flow.keys[direction][level] = []*QUICKeys{key}
 			}
 			if err := q.parseQUICFrames(plaintext, level, isClient, at); err != nil {
 				return false, err
@@ -252,6 +280,76 @@ func (q *QUICDecryptor) processQUICPacket(packet quicPacket, isClient bool, at t
 	q.options.Report(q.connectionInfo, "decrypt", "authentication_failed")
 	return false, fmt.Errorf("cannot authenticate QUIC %s packet (direction=%s, bytes=%d, first=0x%02x)",
 		q.getPacketTypeName(packet.packetType), directionName, len(packet.data), packet.data[0])
+}
+
+func (q *QUICDecryptor) decryptQUICApplication(packet quicPacket, current *QUICKeys, keyIndex, cidLen, direction int) ([]byte, uint64, error) {
+	state := &q.flow.keyPhase[direction]
+	largest := q.flow.largest[direction][quicLevelApplication]
+	haveLargest := q.flow.haveLargest[direction][quicLevelApplication]
+	phase := uint8(state.generation & 1)
+	// Try only current, previous, and next; never chase missing generations.
+	for attempt := 0; attempt < 3; attempt++ {
+		key := current
+		if attempt == 1 {
+			key = state.previous
+			if key == nil {
+				continue
+			}
+		} else if attempt == 2 {
+			if state.next[keyIndex] == nil {
+				var err error
+				state.next[keyIndex], err = current.nextKeys()
+				if err != nil {
+					return nil, 0, err
+				}
+			}
+			key = state.next[keyIndex]
+		}
+		plaintext, pn, first, err := decryptQUICPacket(packet, key, cidLen, largest, haveLargest)
+		if err != nil {
+			continue
+		}
+		packetPhase := (first >> 2) & 1
+		switch attempt {
+		case 0:
+			if packetPhase != phase || pn < state.minimumPN {
+				continue
+			}
+			if !state.authenticated || pn < state.firstPN {
+				state.firstPN = pn
+			}
+		case 1:
+			if packetPhase == phase || pn < state.previousMinimum || pn >= state.firstPN {
+				continue
+			}
+			// A later reordered old packet tightens the lower bound for current.
+			if pn >= state.minimumPN {
+				state.minimumPN = pn + 1
+			}
+			return plaintext, pn, nil
+		case 2:
+			if packetPhase == phase || (haveLargest && pn <= largest) {
+				continue
+			}
+			state.previous = current
+			state.previousMinimum = state.minimumPN
+			state.minimumPN = 0
+			if haveLargest {
+				state.minimumPN = largest + 1
+			}
+			state.firstPN = pn
+			state.generation++
+		}
+		state.authenticated = true
+		q.flow.keys[direction][quicLevelApplication] = []*QUICKeys{key}
+		if attempt == 2 {
+			state.next = [2]*QUICKeys{}
+		} else {
+			state.next = [2]*QUICKeys{state.next[keyIndex]}
+		}
+		return plaintext, pn, nil
+	}
+	return nil, 0, errors.New("QUIC application packet authentication failed")
 }
 
 func (q *QUICDecryptor) quicKeysForLevel(direction, level int) ([]*QUICKeys, error) {

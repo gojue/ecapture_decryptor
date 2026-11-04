@@ -197,6 +197,24 @@ func deriveQUICKeys(secret []byte, version uint32, suite quicCipherSuite) (*QUIC
 	return keys, err
 }
 
+func (k *QUICKeys) nextKeys() (*QUICKeys, error) {
+	label := "quic ku"
+	if k.version == quicVersion2 {
+		label = "quicv2 ku"
+	}
+	secret, err := expandQUICLabel(k.secret, label, len(k.secret))
+	if err != nil {
+		return nil, err
+	}
+	next, err := deriveQUICKeys(secret, k.version, k.suite)
+	if err != nil {
+		return nil, err
+	}
+	// RFC 9001 section 6: header protection never changes during key updates.
+	next.hp = k.hp
+	return next, nil
+}
+
 func (k *QUICKeys) headerMask(sample []byte) ([5]byte, error) {
 	var mask [5]byte
 	if len(sample) < 16 {

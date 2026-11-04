@@ -112,8 +112,9 @@ type lockingCloseDecryptor struct {
 }
 
 func (d *lockingCloseDecryptor) Close() error {
+	// Re-enter the routing lock during Close to detect callers holding it.
 	d.engine.mu.Lock()
-	d.engine.mu.Unlock()
+	defer d.engine.mu.Unlock()
 	return d.routingDecryptor.Close()
 }
 
