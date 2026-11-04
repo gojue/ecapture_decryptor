@@ -191,6 +191,16 @@ func (kl *KeyLogStore) GetSecrets(clientRandom []byte) *TLSSecrets {
 	return cloneSecrets(kl.secrets[key])
 }
 
+// Updates returns the current broadcast channel, which closes when secrets are
+// added. Subscribe before reading secrets, and subscribe again before rechecking
+// them after a notification, so updates cannot be missed between reads and waits.
+// Notifications may concern another connection or repeat an existing secret.
+func (kl *KeyLogStore) Updates() <-chan struct{} {
+	kl.mu.RLock()
+	defer kl.mu.RUnlock()
+	return kl.updated
+}
+
 func cloneSecrets(s *TLSSecrets) *TLSSecrets {
 	if s == nil {
 		return nil

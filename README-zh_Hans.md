@@ -76,6 +76,10 @@ err = ecapture_decryptor.DecryptPcapFile(keylogFile, pcapngFile, packetChan)
 
 `DecryptPcapngStream(ctx, input, emit)` 从持续增长的 pcapng `io.ReadCloser` 读取完整块，并在 DSB 到达时立即加载 NSS Key Log 密钥。DSB 可以晚于握手、应用数据，甚至最后一个网络包。SDK 按 TCP 序号重组、去重，并输出完整的 HTTP/1.1 或 HTTP/2 请求/响应；`emit` 返回错误会停止读取并返回该错误。取消 `ctx` 会关闭 `input`，以解除阻塞读取。调用方应按需给 `input` 配置能够被 `Close` 中断的实现，例如 `io.PipeReader` 或网络连接。
 
+QUIC 在匹配的密钥到达时也会重试缓存包。因此，即使 DSB 晚于最后一个 UDP 包，
+输入保持打开时仍可输出 HTTP/3 消息或原始 STREAM chunk。原有待解密包上限和
+关闭时缺少密钥的错误语义保持不变。
+
 ```go
 err := ecapture_decryptor.DecryptPcapngStream(ctx, input, func(message *types.DecryptedPacket) error {
     // message.Data 是完整 HTTP 消息；Metadata 包含 host / authority 和 stream_id。

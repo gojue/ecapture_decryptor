@@ -1,11 +1,77 @@
 package crypto
 
 import (
+	"bytes"
 	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestKeyLogUpdatesBroadcastAndResubscribe(t *testing.T) {
+	store := NewKeyLogStore()
+	first, second := store.Updates(), store.Updates()
+	select {
+	case <-first:
+		t.Fatal("new subscription was already notified")
+	default:
+	}
+	random := []byte{1, 2, 3, 4}
+	store.AddSecret("CLIENT_TRAFFIC_SECRET_0", hex.EncodeToString(random), []byte{5, 6})
+	for _, updates := range []<-chan struct{}{first, second} {
+		select {
+		case <-updates:
+		default:
+			t.Fatal("secret addition did not notify every subscriber")
+		}
+	}
+
+	// Subscribe before reading. An addition between that read and the next wait
+	// must close this generation instead of requiring a further secret update.
+	next := store.Updates()
+	secrets := store.GetSecrets(random)
+	if secrets == nil || !bytes.Equal(secrets.ClientTrafficSecret, []byte{5, 6}) {
+		t.Fatal("notified secret was not available")
+	}
+	select {
+	case <-next:
+		t.Fatal("resubscription reused a completed notification")
+	default:
+	}
+	store.AddSecret("SERVER_TRAFFIC_SECRET_0", hex.EncodeToString(random), []byte{7, 8})
+	select {
+	case <-next:
+	default:
+		t.Fatal("secret added between read and wait was missed")
+	}
+	if got := store.GetSecrets(random); got == nil || !bytes.Equal(got.ServerTrafficSecret, []byte{7, 8}) {
+		t.Fatal("second notification did not publish the server secret")
+	}
+}
+
+func TestKeyLogUpdatesWaitForCompleteStreamingLine(t *testing.T) {
+	store := NewKeyLogStore()
+	updates := store.Updates()
+	if _, err := store.Write([]byte("CLIENT_TRAFFIC_SECRET_0 01020304 0506")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-updates:
+		t.Fatal("partial keylog line notified subscribers before a secret was available")
+	default:
+	}
+	if _, err := store.Write([]byte("\n")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-updates:
+	default:
+		t.Fatal("completing a keylog line did not notify subscribers")
+	}
+	if got := store.GetSecrets([]byte{1, 2, 3, 4}); got == nil || !bytes.Equal(got.ClientTrafficSecret, []byte{5, 6}) {
+		t.Fatal("streaming notification did not publish the complete secret")
+	}
+}
 
 func TestLoadFromReader(t *testing.T) {
 	cr := "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"

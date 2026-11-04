@@ -110,6 +110,12 @@ err := ecapture_decryptor.DecryptPcapngStreamWithOptions(ctx, input, emit, optio
 `input` 必须支持通过 `Close` 中断读取。`emit` 串行执行；其错误停止输入并返回。
 诊断回调可能并发执行，必须及时返回，不应回调解密引擎。
 
+QUIC 的待解密包会由密钥更新唤醒重试，不需要新的 UDP 包或输入 EOF；这同样
+适用于末尾才到达的 DSB。尚未获得所需密钥的包继续等待，仍受原有缓存上限和
+关闭时错误检查约束。底层 `crypto.KeyLogStore.Updates()` 返回当前广播通道快照：
+添加密钥会关闭该通道。调用方应先订阅、再读取密钥；收到通知后先重新订阅、
+再重读，避免错过并发更新。通知可能属于其他连接或重复密钥，不等同于目标密钥已就绪。
+
 raw 事件复用 `DecryptedPacket`：`Protocol` 为 `tls` 或 `quic`，`Data` 是
 已认证的原始字节；`Direction=request/response` 分别表示客户端到服务端、
 服务端到客户端，不代表应用层请求/响应。`Metadata` 包含：
