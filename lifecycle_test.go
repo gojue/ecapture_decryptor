@@ -4,6 +4,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -29,16 +30,23 @@ func TestConnectionLimitReleasesCapacityAfterCompletion(t *testing.T) {
 				diagnostics = append(diagnostics, d)
 			}}
 			engine.handlePacket(lifecycleIP(), lifecyclePacket(41000, true, false), time.Time{})
+			finish := make(chan struct{})
+			release := sync.OnceFunc(func() { close(finish) })
+			defer release() // Unblock the helper's cleanup even if an assertion fails.
+			(*created)[0].finish = finish
 			engine.handlePacket(lifecycleIP(), lifecyclePacket(41001, true, false), time.Time{})
 			if len(*created) != 1 || engine.active != 1 || len(diagnostics) != 1 || diagnostics[0].Code != "connection_limit" || engine.connectionError() == nil {
 				t.Fatal("connection admission did not enforce and report its limit")
 			}
-			// Closing is not completion: the worker still owns its buffers and slot.
+			// Explicitly hold the worker after Close; synctest does not prevent
+			// runnable goroutines from finishing before the next assertion.
 			_ = (*created)[0].Close()
+			synctest.Wait()
 			engine.handlePacket(lifecycleIP(), lifecyclePacket(41001, true, false), time.Time{})
-			if len(*created) != 1 || len(diagnostics) != 1 {
+			if len(*created) != 1 || engine.active != 1 || len(diagnostics) != 1 {
 				t.Fatal("closing connection released capacity early or repeated diagnostics")
 			}
+			release()
 			synctest.Wait()
 			if engine.active != 0 || len(engine.conntrack) != 0 || len(engine.tcpFlows) != 0 || len(engine.lastActivity) != 0 {
 				t.Fatal("finished connection retained routing or admission state")

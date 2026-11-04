@@ -23,9 +23,16 @@ type routingDecryptor struct {
 	closed                     chan struct{}
 	closeMu                    sync.Once
 	clientClosed, serverClosed bool
+	finish                     <-chan struct{} // Optional completion gate, configured before Close.
 }
 
-func (d *routingDecryptor) Decrypt() error          { <-d.closed; return nil }
+func (d *routingDecryptor) Decrypt() error {
+	<-d.closed
+	if d.finish != nil {
+		<-d.finish
+	}
+	return nil
+}
 func (d *routingDecryptor) SetPacketTime(time.Time) {}
 func (d *routingDecryptor) CloseClient() error      { return d.closeDirection(true) }
 func (d *routingDecryptor) CloseServer() error      { return d.closeDirection(false) }
