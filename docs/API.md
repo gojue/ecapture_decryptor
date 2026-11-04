@@ -91,6 +91,53 @@ func DecryptLiveTraffic(
 
 ---
 
+#### DecryptPcapngStreamWithOptions / WithOptions
+
+旧的 `DecryptPcapngStream(ctx, input, emit)` 保持默认应用消息输出。
+显式 raw 输出及不含明文/密钥的诊断可通过以下入口选择：
+
+```go
+options := types.DecryptOptions{
+    RawChunks: true,
+    OnDiagnostic: func(d types.Diagnostic) {
+        // d.ConnectionID, d.Transport, d.Stage, d.Code
+    },
+}
+err := ecapture_decryptor.DecryptPcapngStreamWithOptions(ctx, input, emit, options)
+// 文件 API 使用 NewDecryptorConfig().WithOptions(options)，其余配置不变。
+```
+
+`input` 必须支持通过 `Close` 中断读取。`emit` 串行执行；其错误停止输入并返回。
+诊断回调可能并发执行，必须及时返回，不应回调解密引擎。
+
+raw 事件复用 `DecryptedPacket`：`Protocol` 为 `tls` 或 `quic`，`Data` 是
+已认证的原始字节；`Direction=request/response` 分别表示客户端到服务端、
+服务端到客户端，不代表应用层请求/响应。`Metadata` 包含：
+
+| 字段 | 类型和含义 |
+| --- | --- |
+| `kind` | `stream_chunk`，或不携带数据的 `stream_end` |
+| `offset` | `uint64`，TLS 按连接/方向，QUIC 按连接/方向/stream 的字节偏移 |
+| `end` | `bool`，QUIC 表示连续数据到达 FIN；TLS 表示捕获输入结束 |
+| `stream_id` | QUIC 的 `uint64` stream ID；TLS 不设置 |
+
+chunk 边界不是应用消息边界，raw 与应用解析互斥，不依赖 ALPN 或自动识别。
+TLS 终止错误时保留已认证字节并返回错误，不发送正常结束标记；捕获结束本身
+不证明应用消息完整。QUIC 只输出连续 STREAM 字节，已知 offset 缺口在关闭时报错。
+不新增 DATAGRAM、RESET、KeyUpdate、0-RTT 或 STARTTLS 支持；现有 QUIC 16 MiB
+stream offset 上限仍适用。
+
+`Diagnostic` 仅含连接标识、传输、阶段和固定原因码，不含底层错误字符串。
+典型原因包括 `waiting_secret`、`missing_secret`、`missing_client_hello`、
+`unsupported_version`、`unsupported_cipher`、`authentication_failed`、
+`unsupported_protocol`、`parse_failed`、`truncated_record`、`incomplete_stream`
+和 `resource_limit`。`waiting_secret` 表示暂时等待，并非最终失败；只有 application
+secret 时，无法区分仅含加密握手的记录与缺少正确密钥的应用记录，终止时报告
+`no_authenticated_application_data`，不直接判定认证失败。
+诊断用于解释输出缺失，不保证每个包一条，也不替代函数返回的终止错误。
+
+---
+
 #### DecryptWithConfig
 
 使用高级配置进行解密。

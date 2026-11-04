@@ -92,6 +92,7 @@ func (q *QUICDecryptor) appendQUICError(err error) {
 func (q *QUICDecryptor) processQUICDatagram(datagram quicDatagram) {
 	packets, err := splitQUICDatagram(datagram.data)
 	if err != nil {
+		q.options.Report(q.connectionInfo, "input", "invalid_packet")
 		q.appendQUICError(err)
 		return
 	}
@@ -101,6 +102,7 @@ func (q *QUICDecryptor) processQUICDatagram(datagram quicDatagram) {
 			q.appendQUICError(err)
 		} else if deferred {
 			if q.flow.pendingBytes+len(packet.data) > 32<<20 {
+				q.options.Report(q.connectionInfo, "reassembly", "resource_limit")
 				q.appendQUICError(errors.New("QUIC deferred packet buffer exceeds 32 MiB"))
 				continue
 			}
@@ -151,12 +153,14 @@ func (q *QUICDecryptor) retryDeferredQUICPackets() {
 func (q *QUICDecryptor) processQUICPacket(packet quicPacket, isClient bool, at time.Time) (bool, error) {
 	if packet.long {
 		if !IsQUICVersionSupported(packet.version) {
+			q.options.Report(q.connectionInfo, "decrypt", "unsupported_version")
 			return false, fmt.Errorf("unsupported QUIC version 0x%08x", packet.version)
 		}
 		if q.version == 0 {
 			q.version = packet.version
 		}
 		if packet.version != q.version {
+			q.options.Report(q.connectionInfo, "decrypt", "version_change")
 			return false, fmt.Errorf("mixed QUIC versions 0x%08x and 0x%08x", q.version, packet.version)
 		}
 		if packet.packetType == QUICPacketTypeInitial {
@@ -176,6 +180,7 @@ func (q *QUICDecryptor) processQUICPacket(packet quicPacket, isClient bool, at t
 	direction := quicDirectionIndex(isClient)
 	keys, err := q.quicKeysForLevel(direction, level)
 	if err != nil {
+		q.options.Report(q.connectionInfo, "decrypt", "invalid_key_material")
 		return false, err
 	}
 	if len(keys) == 0 {
@@ -220,6 +225,7 @@ func (q *QUICDecryptor) processQUICPacket(packet quicPacket, isClient bool, at t
 	if isClient {
 		directionName = "client"
 	}
+	q.options.Report(q.connectionInfo, "decrypt", "authentication_failed")
 	return false, fmt.Errorf("cannot authenticate QUIC %s packet (direction=%s, bytes=%d, first=0x%02x)",
 		q.getPacketTypeName(packet.packetType), directionName, len(packet.data), packet.data[0])
 }

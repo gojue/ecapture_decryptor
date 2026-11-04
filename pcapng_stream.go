@@ -22,6 +22,12 @@ const maxPcapngBlock = 16 << 20
 // once for each reconstructed application message. Closing ctx closes input,
 // which must be an io.ReadCloser so a blocked read can be interrupted.
 func DecryptPcapngStream(ctx context.Context, input io.ReadCloser, emit func(*types.DecryptedPacket) error) error {
+	return DecryptPcapngStreamWithOptions(ctx, input, emit, types.DecryptOptions{})
+}
+
+// DecryptPcapngStreamWithOptions adds raw chunks and payload-free diagnostics.
+// The input, callback and cancellation contracts match DecryptPcapngStream.
+func DecryptPcapngStreamWithOptions(ctx context.Context, input io.ReadCloser, emit func(*types.DecryptedPacket) error, options types.DecryptOptions) error {
 	if ctx == nil || input == nil || emit == nil {
 		return errors.New("context, pcapng input and packet callback are required")
 	}
@@ -63,13 +69,14 @@ func DecryptPcapngStream(ctx context.Context, input io.ReadCloser, emit func(*ty
 	engine := &DecryptorEngine{
 		config: &DecryptorConfig{
 			pcapReader: reader, packetChan: packetChan, logger: logger,
-			strictPcapng: true,
+			strictPcapng: true, options: options,
 		},
 		keyLog: keyLog, logger: logger,
 		factory:   NewDecryptorFactory(keyLog, logger, packetChan),
 		conntrack: make(map[string]types.Decryptor),
 		tcpFlows:  make(map[string]*tcpConnection),
 	}
+	engine.factory.options = options
 	engine.factory.SetOutput(io.Discard, io.Discard)
 	runErr := engine.Run()
 	close(stopCancel)

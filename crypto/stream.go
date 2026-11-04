@@ -150,3 +150,10 @@ func (sb *StreamBuffer) Close() error {
 	sb.closeOnce.Do(func() { close(sb.Closed) })
 	return nil
 }
+
+// Len returns the number of bytes not yet consumed by record processing.
+func (sb *StreamBuffer) Len() int {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	return sb.buf.Len()
+}
