@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/gojue/ecapture_decryptor/protocol"
 	"github.com/gojue/ecapture_decryptor/types"
 )
 
@@ -45,7 +46,18 @@ func (s *quicStreamAssembler) push(offset uint64, data []byte, fin bool) ([][]by
 		if s.hasFinal && s.final != end {
 			return nil, false, errors.New("QUIC stream has conflicting final offsets")
 		}
+		if end < s.next {
+			return nil, false, errors.New("QUIC final offset precedes received bytes")
+		}
+		for offset, part := range s.pending {
+			if offset+uint64(len(part)) > end {
+				return nil, false, errors.New("QUIC final offset precedes pending bytes")
+			}
+		}
 		s.final, s.hasFinal = end, true
+	}
+	if s.hasFinal && offset+uint64(len(data)) > s.final {
+		return nil, false, errors.New("QUIC stream exceeds final offset")
 	}
 	if s.finished {
 		return nil, false, nil
@@ -218,8 +230,29 @@ func (q *QUICDecryptor) parseQUICFrames(plaintext []byte, level int, isClient bo
 				}
 			}
 		case frameType == 0x04:
-			for i := 0; i < 3; i++ { // RESET_STREAM
-				if _, err := consumeQUICVarint(&data); err != nil {
+			id, err := consumeQUICVarint(&data)
+			if err != nil {
+				return err
+			}
+			code, err := consumeQUICVarint(&data)
+			if err != nil {
+				return err
+			}
+			final, err := consumeQUICVarint(&data)
+			if err != nil {
+				return err
+			}
+			if level == quicLevelEarly {
+				if !isClient {
+					return errors.New("server cannot send early RESET_STREAM")
+				}
+				if err := q.queueQUICEarly(quicEarlyFrame{id: id, offset: final, reset: true, errorCode: code, at: at}); err != nil {
+					reported = true
+					return err
+				}
+			} else if level == quicLevelApplication {
+				if err := q.resetQUICStream(id, final, code, isClient, at); err != nil {
+					reported = true
 					return err
 				}
 			}
@@ -367,7 +400,7 @@ func (q *QUICDecryptor) feedQUICStream(id, offset uint64, data []byte, fin, isCl
 		if q.options.RawChunks {
 			q.emitQUICChunk(id, next, part, last, isClient, at)
 		} else if err := q.http3Parser.FeedQUICStream(id, isClient, part, last, at); err != nil {
-			q.options.Report(q.connectionInfo, "protocol", "parse_failed")
+			q.reportHTTP3Error(err)
 			return err
 		}
 		next += uint64(len(part))
@@ -376,7 +409,7 @@ func (q *QUICDecryptor) feedQUICStream(id, offset uint64, data []byte, fin, isCl
 		if q.options.RawChunks {
 			q.emitQUICChunk(id, next, nil, true, isClient, at)
 		} else if err := q.http3Parser.FeedQUICStream(id, isClient, nil, true, at); err != nil {
-			q.options.Report(q.connectionInfo, "protocol", "parse_failed")
+			q.reportHTTP3Error(err)
 			return err
 		}
 	}
@@ -414,6 +447,11 @@ func (q *QUICDecryptor) emitQUICChunk(id, offset uint64, data []byte, end, isCli
 	packet := types.NewDecryptedPacket(types.TransportProtocolUDP, "quic", direction, data, at, q.connectionInfo)
 	packet.WithMetadata("kind", kind).WithMetadata("stream_id", id).
 		WithMetadata("offset", offset).WithMetadata("end", end)
+	q.annotateQUICEarly(packet)
+	q.packetChan <- packet
+}
+
+func (q *QUICDecryptor) annotateQUICEarly(packet *types.DecryptedPacket) {
 	if q.flow.early.emitting {
 		status := q.flow.early.status
 		if status == "" {
@@ -423,7 +461,6 @@ func (q *QUICDecryptor) emitQUICChunk(id, offset uint64, data []byte, end, isCli
 	} else if q.flow.early.seen {
 		packet.WithMetadata("encryption_level", "1rtt")
 	}
-	q.packetChan <- packet
 }
 
 // ServerHello selects the suite. Only authenticated EncryptedExtensions can
@@ -497,17 +534,22 @@ func (q *QUICDecryptor) observeServerCrypto(level int, offset uint64, data []byt
 }
 
 func (q *QUICDecryptor) feedQUICEarly(id, offset uint64, data []byte, fin bool, at time.Time) error {
+	return q.queueQUICEarly(quicEarlyFrame{id: id, offset: offset, data: data, fin: fin, at: at})
+}
+
+func (q *QUICDecryptor) queueQUICEarly(frame quicEarlyFrame) error {
 	early := &q.flow.early
 	if !early.seen && early.status != "" {
 		q.options.Report(q.connectionInfo, "handshake", "early_data_"+early.status)
 	}
 	early.seen = true
-	if len(early.frames) >= maxQUICQueuedPackets || len(data) > maxQUICBufferedBytes-early.bytes {
+	if len(early.frames) >= maxQUICQueuedPackets || len(frame.data) > maxQUICBufferedBytes-early.bytes {
 		q.reportQUICReassemblyError(errQUICBufferLimit)
 		return errQUICBufferLimit
 	}
-	early.frames = append(early.frames, quicEarlyFrame{id: id, offset: offset, data: bytes.Clone(data), fin: fin, at: at})
-	early.bytes += len(data)
+	frame.data = bytes.Clone(frame.data)
+	early.frames = append(early.frames, frame)
+	early.bytes += len(frame.data)
 	if early.status != "" {
 		return q.flushQUICEarly()
 	}
@@ -536,7 +578,13 @@ func (q *QUICDecryptor) flushQUICEarly() error {
 	early.emitting = true
 	defer func() { early.emitting = false }()
 	for _, frame := range frames {
-		if err := q.feedQUICStream(frame.id, frame.offset, frame.data, frame.fin, true, frame.at); err != nil {
+		var err error
+		if frame.reset {
+			err = q.resetQUICStream(frame.id, frame.offset, frame.errorCode, true, frame.at)
+		} else {
+			err = q.feedQUICStream(frame.id, frame.offset, frame.data, frame.fin, true, frame.at)
+		}
+		if err != nil {
 			return err
 		}
 	}
@@ -557,9 +605,86 @@ func (q *QUICDecryptor) finishQUICEarly() error {
 }
 
 func (q *QUICDecryptor) quicWaitExpired() error {
+	if q.http3Parser != nil {
+		since := q.http3Parser.PendingSince()
+		if !since.IsZero() && time.Since(since) >= q.options.SecretWaitTimeout() {
+			q.options.Report(q.connectionInfo, "protocol", "parse_timeout")
+			return errors.New("timed out waiting for HTTP/3 compression or push state")
+		}
+	}
 	if !q.flow.early.since.IsZero() && time.Since(q.flow.early.since) >= q.options.SecretWaitTimeout() {
 		return q.finishQUICEarly()
 	}
 	q.options.Report(q.connectionInfo, "keys", "key_wait_timeout")
 	return errors.New("timed out waiting for QUIC secrets")
+}
+
+// RESET_STREAM terminates only the sender's direction. A tombstone retains the
+// final offset for duplicate validation without retaining buffered plaintext.
+func (q *QUICDecryptor) resetQUICStream(id, final, code uint64, client bool, at time.Time) error {
+	if id&2 != 0 && (id&1 == 0) != client {
+		err := errors.New("QUIC RESET_STREAM from non-sender")
+		q.reportQUICReassemblyError(err)
+		return err
+	}
+	key := quicStreamKey{id: id, isClient: client}
+	s := q.flow.streams[key]
+	if s == nil {
+		if len(q.flow.streams) >= maxQUICStreams {
+			q.reportQUICReassemblyError(errQUICStreamCountLimit)
+			return errQUICStreamCountLimit
+		}
+		s = &quicStreamAssembler{}
+		q.flow.streams[key] = s
+	}
+	var err error
+	if final > maxQUICStreamBytes {
+		err = errQUICStreamLimit
+	} else if final < s.next || s.hasFinal && s.final != final {
+		err = errors.New("invalid QUIC RESET_STREAM final offset")
+	}
+	for offset, data := range s.pending {
+		if offset+uint64(len(data)) > final {
+			err = errors.New("invalid QUIC RESET_STREAM final offset")
+		}
+	}
+	if err != nil {
+		q.reportQUICReassemblyError(err)
+		return err
+	}
+	if s.finished {
+		return nil
+	}
+	s.final = final
+	s.hasFinal = true
+	s.finished = true
+	s.pending = nil
+	s.pendingBytes = 0
+	if q.http3Parser != nil {
+		if err := q.http3Parser.ResetQUICStream(id, client); err != nil {
+			q.reportHTTP3Error(err)
+			return err
+		}
+	} else if q.options.RawChunks && q.packetChan != nil {
+		direction := "response"
+		if client {
+			direction = "request"
+		}
+		packet := types.NewDecryptedPacket(types.TransportProtocolUDP, "quic", direction, nil, at, q.connectionInfo)
+		packet.WithMetadata("kind", "stream_reset").WithMetadata("stream_id", id).WithMetadata("offset", final).
+			WithMetadata("end", true).WithMetadata("error_code", code)
+		q.annotateQUICEarly(packet)
+		q.packetChan <- packet
+	}
+	return nil
+}
+
+func (q *QUICDecryptor) reportHTTP3Error(err error) {
+	code := "parse_failed"
+	if errors.Is(err, protocol.ErrHTTP3ResourceLimit) {
+		code = "resource_limit"
+	}
+	q.options.Report(q.connectionInfo, "protocol", code)
+	q.flow.terminalErr = err
+	_ = q.Close()
 }

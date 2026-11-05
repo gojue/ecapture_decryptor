@@ -389,3 +389,110 @@ func TestQUICRejectedRawGapAtEOF(t *testing.T) {
 	}
 	assertQUICReleased(t, q)
 }
+
+func TestQUICResetReleasesBuffersAndValidatesFinalSize(t *testing.T) {
+	for _, raw := range []bool{false, true} {
+		t.Run(fmt.Sprint(raw), func(t *testing.T) {
+			q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: raw})
+			at := time.Now()
+			// A gap is allowed when RESET supplies the final size; it must not retain
+			// pending bytes or fabricate a complete HTTP response at EOF.
+			if err := q.feedQUICStream(0, 3, []byte("tail"), false, false, at); err != nil {
+				t.Fatal(err)
+			}
+			reset := []byte{4, 0, 0x41, 0x0c, 7}
+			for i := 0; i < 2; i++ {
+				if err := q.parseQUICFrames(reset, quicLevelApplication, false, at); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s := q.flow.streams[quicStreamKey{id: 0, isClient: false}]
+			if !s.finished || s.pendingBytes != 0 || s.pending != nil {
+				t.Fatal("reset retained buffered stream")
+			}
+			if raw {
+				if len(out) != 1 {
+					t.Fatal("reset missing or repeated")
+				}
+				p := <-out
+				if p.Metadata["kind"] != "stream_reset" || p.Metadata["offset"] != uint64(7) || p.Metadata["error_code"] != uint64(0x10c) || p.Metadata["end"] != true || len(p.Data) != 0 {
+					t.Fatal(p.Metadata)
+				}
+			} else if len(out) != 0 {
+				t.Fatal("reset emitted incomplete HTTP message")
+			}
+			if err := q.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := q.Decrypt(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	q, _ := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true})
+	if err := q.feedQUICStream(0, 5, []byte("tail"), false, true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.resetQUICStream(0, 8, 0, true, time.Now()); err == nil {
+		t.Fatal("reset before already received tail accepted")
+	}
+}
+
+func TestQUICEarlyResetUsesAcceptanceSpace(t *testing.T) {
+	for _, status := range []string{"accepted", "rejected"} {
+		for _, raw := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/raw=%v", status, raw), func(t *testing.T) {
+				q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: raw})
+				if err := q.parseQUICFrames([]byte{4, 0, 0x41, 0x0c, 0}, quicLevelEarly, true, time.Now()); err != nil {
+					t.Fatal(err)
+				}
+				if len(out) != 0 {
+					t.Fatal("early reset before acceptance")
+				}
+				q.flow.early.status = status
+				if err := q.flushQUICEarly(); err != nil {
+					t.Fatal(err)
+				}
+				key := quicStreamKey{id: 0, isClient: true}
+				if (q.flow.streams[key] != nil) != (status == "accepted") {
+					t.Fatal("early reset used wrong stream space")
+				}
+				if raw {
+					if len(out) != 1 {
+						t.Fatal("missing raw reset")
+					}
+					packet := <-out
+					if packet.Metadata["early_data"] != status || packet.Metadata["encryption_level"] != "0rtt" {
+						t.Fatal(packet.Metadata)
+					}
+				} else if len(out) != 0 {
+					t.Fatal("early reset emitted message")
+				}
+			})
+		}
+	}
+}
+
+func TestQUICResetFinalSizeAndDirection(t *testing.T) {
+	for _, pending := range []bool{false, true} {
+		var stream quicStreamAssembler
+		offset := uint64(0)
+		if pending {
+			offset = 3
+		}
+		if _, _, err := stream.push(offset, []byte("tail"), false); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := stream.push(0, nil, true); err == nil {
+			t.Fatal("FIN truncated previously received bytes")
+		}
+	}
+	var diagnostics []types.Diagnostic
+	q, _ := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true, OnDiagnostic: func(d types.Diagnostic) { diagnostics = append(diagnostics, d) }})
+	if err := q.resetQUICStream(2, 0, 0, false, time.Now()); err == nil {
+		t.Fatal("server reset client's unidirectional stream")
+	}
+	if len(diagnostics) != 1 || diagnostics[0].Stage != "reassembly" || diagnostics[0].Code != "invalid_stream" {
+		t.Fatal(diagnostics)
+	}
+}

@@ -82,6 +82,11 @@ func pairHTTPPackets(packets []*types.DecryptedPacket) []HTTPPair {
 	var groupOrder []string
 
 	for _, pkt := range packets {
+		// Informational responses and pushed exchanges are separate SDK events,
+		// not the final response to the initiating request in a HAR pair.
+		if kind, _ := pkt.Metadata["kind"].(string); pkt.Protocol == "http/3" && kind != "" {
+			continue
+		}
 		if !strings.HasPrefix(pkt.Protocol, "http") {
 			continue
 		}

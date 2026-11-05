@@ -242,6 +242,12 @@ func (q *QUICDecryptor) Decrypt() (result error) {
 		if early := q.flow.early.since; !early.IsZero() && (waitSince.IsZero() || early.Before(waitSince)) {
 			waitSince = early
 		}
+		if q.http3Parser != nil {
+			since := q.http3Parser.PendingSince()
+			if !since.IsZero() && (waitSince.IsZero() || since.Before(waitSince)) {
+				waitSince = since
+			}
+		}
 		if waitSince.IsZero() {
 			if keyTimer != nil {
 				keyTimer.Stop()
@@ -309,22 +315,23 @@ func (q *QUICDecryptor) Decrypt() (result error) {
 			if !IsQUICVersionSupported(q.version) && q.version != 0 {
 				q.appendQUICError(errors.New("QUIC negotiation did not select a supported version"))
 			}
-			if q.options.RawChunks {
-				incomplete := 0
-				for _, streams := range []map[quicStreamKey]*quicStreamAssembler{q.flow.streams, q.flow.early.streams} {
-					for _, stream := range streams {
-						if stream.pendingBytes > 0 || stream.hasFinal && stream.next < stream.final {
-							incomplete++
-						}
+			incomplete := 0
+			for _, streams := range []map[quicStreamKey]*quicStreamAssembler{q.flow.streams, q.flow.early.streams} {
+				for _, stream := range streams {
+					if !stream.finished && (stream.pendingBytes > 0 || stream.hasFinal && stream.next < stream.final) {
+						incomplete++
 					}
 				}
-				if incomplete != 0 {
-					q.options.Report(q.connectionInfo, "reassembly", "incomplete_stream")
-					q.appendQUICError(fmt.Errorf("%d QUIC streams have missing bytes at input end", incomplete))
-				}
+			}
+			if incomplete != 0 {
+				q.options.Report(q.connectionInfo, "reassembly", "incomplete_stream")
+				q.appendQUICError(fmt.Errorf("%d QUIC streams have missing bytes at input end", incomplete))
 			}
 			if q.http3Parser != nil {
-				q.http3Parser.Flush()
+				if err := q.http3Parser.Close(); err != nil {
+					q.reportHTTP3Error(err)
+					q.appendQUICError(err)
+				}
 			}
 			q.logger.Printf("QUIC decryption ended for %s", q.connectionInfo)
 			return errors.Join(q.flow.errors...)
@@ -347,7 +354,12 @@ func (q *QUICDecryptor) drainQUICInput(stopAtDeadline bool) {
 		q.processQUICDatagram(item)
 		keyExpired := !q.flow.pendingSince.IsZero() && time.Since(q.flow.pendingSince) >= q.options.SecretWaitTimeout()
 		earlyExpired := !q.flow.early.since.IsZero() && time.Since(q.flow.early.since) >= q.options.SecretWaitTimeout()
-		if q.flow.terminalErr != nil || stopAtDeadline && (keyExpired || earlyExpired) {
+		httpExpired := false
+		if q.http3Parser != nil {
+			since := q.http3Parser.PendingSince()
+			httpExpired = !since.IsZero() && time.Since(since) >= q.options.SecretWaitTimeout()
+		}
+		if q.flow.terminalErr != nil || stopAtDeadline && (keyExpired || earlyExpired || httpExpired) {
 			return
 		}
 	}

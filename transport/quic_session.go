@@ -58,6 +58,8 @@ type quicEarlyFrame struct {
 	id, offset uint64
 	data       []byte
 	fin        bool
+	reset      bool
+	errorCode  uint64
 	at         time.Time
 }
 

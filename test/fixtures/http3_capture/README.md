@@ -312,3 +312,47 @@ claimed as real-capture verified. The generator is unpatched; it uses two pinned
 H3/configuration introspection hooks to force static QPACK and record negotiated
 values. Dynamic QPACK and draft-29 are outside this fixture's scope. Its TLS test
 keys and local self-signed certificate are only for reproducible test traffic.
+
+
+## Dynamic QPACK and message-state fixture
+
+`http3_dynamic_aioquic.pcapng` and `.keys` are a separate, independent QUIC v1
+capture from `aioquic_capture.py --dynamic` (aioquic 1.3.0, pylsqpack 0.3.24).
+The production SDK does not import either package. The fixture has 71 real
+loopback UDP packets, zero dumpcap drops, and two connections (`alpha`, `beta`).
+Each connection sends `/LABEL/warmup`, `/LABEL/one`, `/LABEL/two`, `/LABEL/reset`.
+Repeated `x-fixture-token: LABEL` × 16 values exercise dynamic references across
+request streams in both directions. Encoder writes are delayed 80 ms and split
+at one byte with a further 20 ms gap; the bytes are sent over actual QUIC sockets.
+
+`/one` and `/two` receive 103 with `link: </asset>; rel=preload`, followed by 200,
+body `reply /LABEL/PATH`, and `x-finished: LABEL` trailers. `/one` promises
+`/LABEL/asset` (push ID 0, stream 15), body `asset LABEL`. `/reset` receives a
+partial response then RESET_STREAM with error 0x10c; it has no complete response.
+There are 20 message events: 8 requests, 6 final responses, 4 informational
+responses, and 2 push responses. Raw output additionally observes 2 resets.
+
+The pinned adapter keeps aioquic's header state at INITIAL after 1xx and sends
+informational frames without advancing the final-response send state; QPACK
+encoding/decoding remains entirely in pylsqpack. The generator asserts nonzero
+Required Insert Counts and fragmented encoder writes in both directions, records
+received fields/body/reset/push events in `dynamic-evidence.json`, and writes
+`dynamic.qlog` for inspection. These auxiliary artifacts are local, not fixtures.
+
+To reproduce, use the lifecycle section's venv/certificate/dumpcap setup, capture
+to `http3_dynamic_aioquic.pcapng`, and run:
+
+```sh
+"$work/venv/bin/python" test/fixtures/http3_capture/aioquic_capture.py \
+  --dynamic --cert "$work/server.crt" --key "$work/server.key" --output "$work"
+# Stop and wait for the capture process before inspecting or copying the files.
+# dynamic.keys is the matching SSLKEYLOG for http3_dynamic_aioquic.pcapng.
+go test -run TestHTTP3DynamicCaptureAPIs -v .
+```
+
+The regression compares field semantics, exact body bytes, stream IDs and
+directions across seekable/non-seekable files, external keys, embedded/trailing
+DSB, and raw reconstruction. Duplicate DSB does not duplicate messages; blocked
+headers resume before EOF. RFC 9204 Appendix B vectors, wrapping insert counts,
+invalid SETTINGS, eviction, limits, reset and deadline tests complement this
+capture. Dynamic HTTP/3 on v2 and early RESET remain outside real-capture coverage.
