@@ -292,3 +292,64 @@ func TestTLSWebSocketSplitUpgradeAndMalformedFrame(t *testing.T) {
 		})
 	}
 }
+
+func TestExplicitTLSProtocolSelectionFragments(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		client, server []byte
+		protocol       string
+		responseFirst  bool
+	}{
+		{"mqtt", []byte{0x10, 13, 0, 4, 'M', 'Q', 'T', 'T', 4, 2, 0, 0, 0, 1, 'c'}, []byte{0x20, 2, 0, 0}, "mqtt", false},
+		{"redis", []byte("*1\r\n$4\r\nPING\r\n"), []byte("+PONG\r\n"), "redis", false},
+		{"redis", []byte("*1\r\n$4\r\nPING\r\n"), []byte("+PONG\r\n"), "redis", true},
+		{"dot", []byte{0, 17, 0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1}, []byte{0, 17, 0, 1, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1}, "dns", false},
+	} {
+		name := tc.name
+		if tc.responseFirst {
+			name += "/response-first"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				td, out := newTLSRawTest(types.DecryptOptions{ApplicationProtocol: tc.name})
+				secret := bytes.Repeat([]byte{0x11}, 32)
+				prepareTLS13RawHandshake(t, td, secret)
+				done := make(chan error, 1)
+				go func() { done <- td.Decrypt() }()
+				synctest.Wait()
+				for i, v := range tc.client {
+					if i == 1 && tc.responseFirst {
+						if err := td.FeedServer(tls13RawTestRecord(t, secret, 0, tc.server, 0x17)); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := td.FeedClient(tls13RawTestRecord(t, secret, uint64(i), []byte{v}, 0x17)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if !tc.responseFirst {
+					if err := td.FeedServer(tls13RawTestRecord(t, secret, 0, tc.server, 0x17)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				_ = td.Close()
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
+				if len(out) != 2 {
+					t.Fatalf("got %d messages", len(out))
+				}
+				for len(out) > 0 {
+					p := <-out
+					if p.Protocol != tc.protocol {
+						t.Fatal(p.Protocol)
+					}
+					if tc.protocol == "redis" && (p.Metadata["request_id"] != uint64(1) || p.Metadata["command"] != "PING") {
+						t.Fatal("unpaired Redis exchange", p.Metadata)
+					}
+				}
+				assertTLSBuffersReleased(t, td)
+			})
+		})
+	}
+}

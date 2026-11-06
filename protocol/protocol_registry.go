@@ -117,4 +117,41 @@ func init() {
 	RegisterProtocol(&HTTP2Detector{})
 	RegisterProtocol(&WebSocketDetector{})
 	RegisterProtocol(&HTTP1Detector{})
+	RegisterProtocol(selectedProtocol{"dot", func(ci types.ConnectionKey, ch chan *types.DecryptedPacket) types.StreamParserInterface {
+		return NewDNSStreamParser(ci, ch)
+	}})
+	RegisterProtocol(selectedProtocol{"mqtt", func(ci types.ConnectionKey, ch chan *types.DecryptedPacket) types.StreamParserInterface {
+		return NewMQTTStreamParser(ci, ch)
+	}})
+	RegisterProtocol(selectedProtocol{"redis", func(ci types.ConnectionKey, ch chan *types.DecryptedPacket) types.StreamParserInterface {
+		return NewRedisStreamParser(ci, ch)
+	}})
+}
+
+// SelectProtocol selects a registered parser by explicit name without guessing
+// from ports or ambiguous payload prefixes. DNS/DoQ transport framing is selected
+// by the caller; an empty name retains the existing detector scores.
+func SelectProtocol(name string, data []byte, ci types.ConnectionKey, ch chan *types.DecryptedPacket) (types.StreamParserInterface, string) {
+	if name == "" || name == "doh" {
+		return DetectProtocol(data, ci, ch)
+	}
+	protocolRegistryMu.RLock()
+	defer protocolRegistryMu.RUnlock()
+	for _, d := range protocolRegistry {
+		if d.Name() == name {
+			return d.CreateParser(ci, ch), name
+		}
+	}
+	return nil, ""
+}
+
+type selectedProtocol struct {
+	name   string
+	create func(types.ConnectionKey, chan *types.DecryptedPacket) types.StreamParserInterface
+}
+
+func (d selectedProtocol) Name() string      { return d.name }
+func (d selectedProtocol) Detect([]byte) int { return 0 }
+func (d selectedProtocol) CreateParser(ci types.ConnectionKey, ch chan *types.DecryptedPacket) types.StreamParserInterface {
+	return d.create(ci, ch)
 }

@@ -129,3 +129,53 @@ The SDK tests verify exact message bytes, stream/direction/connection identity,
 status trailers, external keys, non-seekable input with tail DSB, and gRPC output
 before capture EOF. This does not validate WebSocket extended CONNECT, gRPC-Web,
 gRPC over HTTP/3 or compression algorithms other than gzip for gRPC.
+
+## D08 MQTT and Redis fixtures
+
+`d08_tcp.py` starts both TLS peers using only Python's standard library. It
+checks every received wire byte and imports no SDK, eCapture or E01 code.
+The matching external keylog for both captures is `d08_mqtt_redis.keys`.
+
+| Capture | TCP port | Connections | Expected application messages |
+| --- | ---: | ---: | --- |
+| `d08_mqtt.pcapng` | 44440 | 1 | 20 MQTT 3.1.1 packets: CONNECT/CONNACK, subscribe, QoS 0/1/2, observed DUP, server publish, ping, unsubscribe and disconnect |
+| `d08_redis.pcapng` | 44441 | 2 | 15 RESP2 + 13 RESP3 values: binary SET/GET pipeline, multi-channel pubsub and unsubscribe, HELLO 3, attribute and push before a pending GET reply |
+
+From the repository root on Linux, with Python 3, OpenSSL, dumpcap and tshark
+available, capture real loopback traffic before starting the peers:
+
+```sh
+work=$(mktemp -d)
+umask 077
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout "$work/peer.key" -out "$work/peer.crt" -subj /CN=localhost -days 1
+sudo dumpcap -i lo -s 0 -B 64 -f 'tcp port 44440 or tcp port 44441' \
+  -a duration:10 -w - > "$work/d08_tcp.pcapng" 2> "$work/capture.log" &
+capture_pid=$!
+sleep 1
+python3 test/fixtures/http_tcp_capture/d08_tcp.py \
+  "$work/peer.crt" "$work/peer.key" "$work/d08_mqtt_redis.keys"
+wait "$capture_pid"
+tshark -r "$work/d08_tcp.pcapng" -Y 'tcp.port == 44440' -w "$work/d08_mqtt.pcapng"
+tshark -r "$work/d08_tcp.pcapng" -Y 'tcp.port == 44441' -w "$work/d08_redis.pcapng"
+```
+
+The keylog path must be new. An optional fourth argument, `mqtt` or `redis`,
+runs just that protocol. Check `capture.log` for capture drops before using the
+files; tshark only selects captured packets and does not manufacture traffic.
+Keep the temporary certificate private key out of the repository. The peers
+split length fields and payloads across TLS writes and coalesce application
+messages; Redis values include NUL, CRLF and non-UTF-8 bytes. These captures
+do not extend support to MQTT 5 or streamed RESP. Unit tests cover malformed
+input, truncation, larger values, resource bounds and backpressure separately.
+
+To validate the committed fixtures and protocol tests from the repository root:
+
+```sh
+CGO_ENABLED=1 go test -race -run 'TestD08ApplicationCaptureAPIs/(mqtt|redis)|TestMQTT|TestRedis' ./protocol .
+```
+
+The fixture regression verifies message counts, binary payloads, metadata and
+connection identity with external keys and a non-seekable stream with a trailing
+DSB. DNS fixture reproduction is in
+[`../http3_capture/README.md`](../http3_capture/README.md#d08-dns-fixtures).

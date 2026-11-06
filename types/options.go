@@ -13,6 +13,9 @@ type DecryptOptions struct {
 	// RawChunks emits authenticated TLS bytes or QUIC STREAM chunks instead of
 	// parsed application messages. Chunk boundaries are not message boundaries.
 	RawChunks bool
+	// ApplicationProtocol explicitly selects dot, doh, doq, mqtt (3.1.1), or redis.
+	// Empty retains HTTP detection. It cannot be combined with RawChunks/HTTPEvents.
+	ApplicationProtocol string
 	// HTTPEvents emits incremental HTTP headers, body, SSE, HTTP/2 gRPC messages,
 	// trailers and terminal events.
 	HTTPEvents bool
@@ -35,6 +38,15 @@ type DecryptOptions struct {
 
 // Validate rejects conflicting output modes before consuming any input.
 func (o DecryptOptions) Validate() error {
+	switch o.ApplicationProtocol {
+	case "", "dot", "doh", "doq", "mqtt", "redis":
+	default:
+		return errors.New("unsupported ApplicationProtocol")
+	}
+	if o.ApplicationProtocol != "" && (o.RawChunks || o.HTTPEvents || o.MaxDecodedBodyBytes != 0) {
+		return errors.New("ApplicationProtocol conflicts with raw/HTTP event output")
+	}
+
 	if o.RawChunks && o.HTTPEvents {
 		return errors.New("RawChunks and HTTPEvents are mutually exclusive")
 	}

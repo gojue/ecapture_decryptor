@@ -41,6 +41,7 @@ The SDK only decrypts and parses protocols — it does not impose an output form
 
 - 🔓 **Decrypt TLS/QUIC traffic**: supports external SSLKEYLOG files and pcapng-embedded DSB
 - 🌐 **Multi-protocol support**: HTTP/1.0, HTTP/1.1, HTTP/2, HTTP/3, WebSocket
+- **Explicit DNS, MQTT and Redis parsing**: select DoT, DoH, DoQ, MQTT 3.1.1 or fixed-length Redis RESP2/RESP3 through the Go API.
 - 📦 **Flexible output**: emits `DecryptedPacket` values for callers to handle freely
 - **Raw streams and diagnostics**: opt into authenticated TLS bytes or QUIC STREAM chunks with `DecryptPcapngStreamWithOptions` / `WithOptions`; see the [API contract](docs/API.md#decryptpcapngstreamwithoptions--withoptions).
 - 🔧 **Multiple usage modes**: Go library, static library (`.a`), command-line tool
@@ -49,6 +50,8 @@ The SDK only decrypts and parses protocols — it does not impose an output form
 Go callers can select `types.DecryptOptions{HTTPEvents: true}` to receive headers, body chunks, SSE records, trailers, and end/reset/partial events as HTTP/1, HTTP/2 or HTTP/3 traffic arrives. Body offsets are per message and direction. Incremental HTTP and raw QUIC can pass 16 MiB while out-of-order storage stays bounded. Gzip expansion is opt-in with a per-message decoded byte limit. [HTTP event contract](docs/API.md#http-增量事件)
 
 HTTP/1 WebSocket validates fragmented Upgrade handshakes and emits bounded bidirectional messages, ping/pong/close and negotiated permessage-deflate, including context takeover. In `HTTPEvents` mode, HTTP/2 gRPC adds complete `grpc_message` events before stream end, with per-direction framing, gzip message compression and status trailers. Protobuf bytes remain opaque without a descriptor. See the [WebSocket and gRPC contracts](docs/API.md#websocket).
+
+Use `types.DecryptOptions{ApplicationProtocol: "doh"}` with the Go file or streaming API to select `dot`, `doh`, `doq`, `mqtt` or `redis`; the default HTTP/WebSocket detection stays unchanged. The selector applies to all connections in that call and conflicts with raw/HTTP event output and gzip expansion. DNS supports ordinary queries over TLS, HTTP/1.x–3 or QUIC; DoQ requires explicit selection and supports 1-RTT only, checking the negotiated ALPN when handshake secrets make it observable. MQTT supports 3.1.1 control packets without tracking ACK delivery outcomes. Redis supports fixed-length RESP2/RESP3, pipelined replies and Pub/Sub. Packets retain DNS wire messages or complete MQTT/RESP bytes with protocol metadata. See [output fields, limits and unsupported modes](docs/API.md#applicationprotocol); CLI/C examples do not expose this selector.
 
 ### QUIC / HTTP/3 input requirements
 

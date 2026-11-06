@@ -602,3 +602,236 @@ func TestGRPCCaptureMessagesBeforeEOF(t *testing.T) {
 		}
 	})
 }
+
+func TestApplicationProtocolOptionsBeforeInput(t *testing.T) {
+	for _, options := range []types.DecryptOptions{
+		{ApplicationProtocol: "smtp"}, {ApplicationProtocol: "mqtt", RawChunks: true}, {ApplicationProtocol: "doh", HTTPEvents: true}, {ApplicationProtocol: "redis", MaxDecodedBodyBytes: 1},
+	} {
+		calls := 0
+		err := DecryptPcapngStreamWithOptions(context.Background(), io.NopCloser(bytes.NewReader(nil)), func(*types.DecryptedPacket) error { calls++; return nil }, options)
+		if err == nil || calls != 0 {
+			t.Fatalf("invalid options consumed input: %+v", options)
+		}
+	}
+	if err := DecryptWithConfig(NewDecryptorConfig().WithOptions(types.DecryptOptions{ApplicationProtocol: "dot"})); err == nil {
+		t.Fatal("explicit parser without output accepted")
+	}
+}
+
+func TestD08ApplicationCaptureAPIs(t *testing.T) {
+	for _, tc := range []struct {
+		name, selected, keys, protocol string
+		count, connections             int
+	}{
+		{"mqtt", "mqtt", "mqtt_redis", "mqtt", 20, 1}, {"redis", "redis", "mqtt_redis", "redis", 28, 2},
+		{"dot", "dot", "dns", "dns", 8, 2}, {"doh1", "doh", "dns", "dns", 4, 1},
+		{"doh2", "doh", "dns", "dns", 4, 1}, {"doq", "doq", "dns", "dns", 8, 2},
+		{"doh3", "doh", "dns", "dns", 4, 1},
+	} {
+		for _, mode := range []int{0, 1, 2} {
+			t.Run(fmt.Sprintf("%s/mode=%d", tc.name, mode), func(t *testing.T) {
+				options := types.DecryptOptions{ApplicationProtocol: tc.selected}
+				path := "test/testdata/d08_" + tc.name + ".pcapng"
+				keyPath := "test/testdata/d08_" + tc.keys + ".keys"
+				var packets []*types.DecryptedPacket
+				if mode != 0 {
+					capture, client, server := quicDSBBlocks(t, path, keyPath)
+					if mode == 2 {
+						client, server = server, client
+					} // Server secrets may precede client secrets.
+					synctest.Test(t, func(t *testing.T) {
+						stream := newLiveStreamWithOptions(t, options)
+						stream.write(t, capture)
+						synctest.Wait()
+						if len(stream.packets) != 0 {
+							t.Fatal("output without keys")
+						}
+						stream.write(t, client)
+						stream.write(t, server)
+						synctest.Wait()
+						stream.assertOpen(t)
+						if len(stream.packets) != tc.count {
+							t.Fatalf("before EOF: %d messages", len(stream.packets))
+						}
+						stream.write(t, client)
+						stream.write(t, server)
+						if err := stream.writer.Close(); err != nil {
+							t.Fatal(err)
+						}
+						synctest.Wait()
+						if err := <-stream.done; err != nil {
+							t.Fatal(err)
+						}
+						packets = stream.packets
+					})
+				} else {
+					keys, err := os.ReadFile(keyPath)
+					if err != nil {
+						t.Fatal(err)
+					}
+					f, err := os.Open(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer f.Close()
+					ch := make(chan *types.DecryptedPacket)
+					done := make(chan struct{})
+					go func() {
+						for p := range ch {
+							packets = append(packets, p)
+						}
+						close(done)
+					}()
+					err = DecryptWithConfig(NewDecryptorConfig().WithSSLKeyLog(bytes.NewReader(keys)).WithPcapReader(f).WithPacketChan(ch).WithOptions(options).WithLogger(log.New(io.Discard, "", 0)))
+					close(ch)
+					<-done
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				connections := map[string]bool{}
+				publications, duplicates, push, attribute := 0, 0, 0, 0
+				dnsRequests := map[string]string{}
+				dnsResponses := map[string]bool{}
+				for _, p := range packets {
+					if p.Protocol != tc.protocol {
+						t.Fatalf("wrong parser: %s", p.Protocol)
+					}
+					connections[p.ConnectionID()] = true
+					if tc.protocol == "dns" {
+						if p.Metadata["transport"] != tc.selected || p.Metadata["kind"] != "message" {
+							t.Fatal(p.Metadata)
+						}
+						questions := p.Metadata["questions"].([]map[string]any)
+						if len(questions) != 1 || questions[0]["type"] != uint16(1) || questions[0]["class"] != uint16(1) {
+							t.Fatal(p.Metadata)
+						}
+						name := questions[0]["name"].(string)
+						if !strings.HasPrefix(name, tc.name+"-") || !strings.HasSuffix(name, ".example.") {
+							t.Fatal(name)
+						}
+						key := fmt.Sprintf("%s/%v", p.ConnectionID(), p.Metadata["request_id"])
+						if p.Direction == "request" {
+							if _, exists := dnsRequests[key]; exists {
+								t.Fatal("duplicate DNS request association")
+							}
+							dnsRequests[key] = name
+							if p.Metadata["qr"] != false || binary.BigEndian.Uint16(p.Data[2:4])&0x8000 != 0 {
+								t.Fatal("query wire QR changed")
+							}
+						} else {
+							if p.Metadata["matched"] != true || dnsRequests[key] != name || dnsResponses[key] {
+								t.Fatal("incorrect DNS response association", p.Metadata)
+							}
+							dnsResponses[key] = true
+							answers := p.Metadata["answers"].([]map[string]any)
+							if len(answers) != 1 || answers[0]["address"] != "192.0.2.1" || answers[0]["ttl"] != uint32(60) || p.Metadata["qr"] != true || !bytes.Equal(p.Data[len(p.Data)-4:], []byte{192, 0, 2, 1}) {
+								t.Fatal("DNS answer changed", p.Metadata)
+							}
+						}
+					}
+					if tc.name == "mqtt" && p.Metadata["packet_name"] == "PUBLISH" {
+						publications++
+						offset := p.Metadata["payload_offset"].(int)
+						payload := p.Data[offset:]
+						if p.Metadata["dup"] == true {
+							duplicates++
+							if string(payload) != "qos1" {
+								t.Fatal("DUP payload changed")
+							}
+						}
+						switch p.Metadata["qos"] {
+						case uint8(0):
+							if len(payload) != 512 {
+								t.Fatal("MQTT long payload truncated")
+							}
+							for i, v := range payload {
+								if v != byte(i%256) {
+									t.Fatal("MQTT payload changed")
+								}
+							}
+						case uint8(1), uint8(2):
+							if string(payload) != "qos1" && string(payload) != "qos2" && string(payload) != "push" {
+								t.Fatal("MQTT payload changed")
+							}
+						default:
+							t.Fatal(p.Metadata)
+						}
+					}
+					if tc.name == "redis" {
+						if p.Metadata["kind"] == "push" {
+							push++
+							if p.Metadata["push_type"] == "message" && !bytes.Contains(p.Data, []byte("server-push")) {
+								t.Fatal("Redis push changed")
+							}
+						}
+						if p.Metadata["kind"] == "attribute" {
+							attribute++
+						}
+						if p.Metadata["kind"] == "response" && p.Metadata["command"] == "GET" && !bytes.Contains(p.Data, []byte{0, 'f', 'i', 'x', 't', 'u', 'r', 'e', '\r', '\n', 255}) {
+							t.Fatal("Redis binary response changed")
+						}
+					}
+				}
+				if len(packets) != tc.count || len(connections) != tc.connections {
+					t.Fatalf("packets=%d connections=%d", len(packets), len(connections))
+				}
+				if tc.protocol == "dns" && (len(dnsRequests) != tc.count/2 || len(dnsResponses) != len(dnsRequests)) {
+					t.Fatal("missing DNS transactions")
+				}
+				if tc.name == "mqtt" && (publications != 5 || duplicates != 1) {
+					t.Fatalf("publishes %d DUP %d", publications, duplicates)
+				}
+				if tc.name == "redis" && (push != 9 || attribute != 1) {
+					t.Fatalf("push %d attributes %d", push, attribute)
+				}
+			})
+		}
+	}
+}
+
+func TestD08CancelAndCallbackFailure(t *testing.T) {
+	for _, tc := range []struct{ name, selected, keys string }{
+		{"dot", "dot", "dns"}, {"doh1", "doh", "dns"}, {"doh2", "doh", "dns"},
+		{"doq", "doq", "dns"}, {"doh3", "doh", "dns"},
+		{"mqtt", "mqtt", "mqtt_redis"}, {"redis", "redis", "mqtt_redis"},
+	} {
+		packets, clientKeys, serverKeys := quicDSBBlocks(t, "test/testdata/d08_"+tc.name+".pcapng", "test/testdata/d08_"+tc.keys+".keys")
+		for _, canceled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/cancel=%t", tc.name, canceled), func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					r, w := io.Pipe()
+					defer w.Close()
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					want := errors.New("consumer stopped")
+					done := make(chan error, 1)
+					calls := 0
+					go func() {
+						done <- DecryptPcapngStreamWithOptions(ctx, r, func(*types.DecryptedPacket) error {
+							calls++
+							if canceled {
+								cancel()
+								return nil
+							}
+							return want
+						}, types.DecryptOptions{ApplicationProtocol: tc.selected})
+					}()
+					go func() { _, _ = w.Write(packets); _, _ = w.Write(clientKeys); _, _ = w.Write(serverKeys) }()
+					synctest.Wait()
+					select {
+					case err := <-done:
+						if canceled {
+							want = context.Canceled
+						}
+						if !errors.Is(err, want) || calls != 1 {
+							t.Fatalf("calls=%d err=%v", calls, err)
+						}
+					default:
+						t.Fatal("open capture did not stop")
+					}
+				})
+			})
+		}
+	}
+}

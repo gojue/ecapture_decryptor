@@ -532,3 +532,21 @@ func TestQUICRawLongOffsetsAndPendingBounds(t *testing.T) {
 		t.Fatal("aggregate out-of-order storage", err)
 	}
 }
+
+func TestQUICApplicationSelectionAndALPN(t *testing.T) {
+	for _, tc := range []struct {
+		selected, alpn string
+		raw, valid     bool
+	}{
+		{"doq", "doq", false, true}, {"doq", "h3", false, false}, {"", "doq", false, false}, {"doh", "h3", false, true}, {"", "other", false, false}, {"", "other", true, true},
+	} {
+		q := NewQUICDecryptor(types.ConnectionKey{}, crypto.NewKeyLogStore(), log.New(io.Discard, "", 0), nil, make(chan *types.DecryptedPacket, 4)).(*QUICDecryptor)
+		q.SetOptions(types.DecryptOptions{ApplicationProtocol: tc.selected, RawChunks: tc.raw})
+		if err := q.checkApplicationALPN(tc.alpn); (err == nil) != tc.valid {
+			t.Fatalf("%+v: %v", tc, err)
+		}
+		if tc.selected == "doq" && (q.doqParser == nil || q.http3Parser != nil) {
+			t.Fatal("DoQ routed into HTTP/3")
+		}
+	}
+}

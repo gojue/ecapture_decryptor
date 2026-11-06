@@ -32,6 +32,7 @@ type eventOutput struct {
 	active       map[*eventBody]struct{}
 	inflaters    int
 	grpcBuffered int
+	doh          *dnsHTTP
 }
 
 func newEventOutput(conn types.ConnectionKey, ch chan *types.DecryptedPacket, limit int64) *eventOutput {
@@ -48,6 +49,7 @@ type eventBody struct {
 	decoder    *gzipFeed
 	sse        *eventSource
 	grpc       *grpcMessages
+	doh        *dohMessage
 	done       bool
 }
 
@@ -61,10 +63,16 @@ func (o *eventOutput) headers(proto string, id uint64, client bool, at time.Time
 			return nil, ErrHTTPEventLimit
 		}
 		o.active[b] = struct{}{}
+		if o.doh != nil {
+			if err := b.startDoH(h, meta); err != nil {
+				delete(o.active, b)
+				return nil, err
+			}
+		}
 		coding := strings.TrimSpace(strings.Join(h.Values("Content-Encoding"), ","))
 		b.gzip = o.limit > 0 && strings.EqualFold(coding, "gzip")
 		media, _, _ := mime.ParseMediaType(h.Get("Content-Type"))
-		if proto == "http/2" && isGRPC(media) {
+		if o.doh == nil && proto == "http/2" && isGRPC(media) {
 			if coding != "" && !strings.EqualFold(coding, "identity") {
 				delete(o.active, b)
 				return nil, errGRPC
@@ -75,7 +83,7 @@ func (o *eventOutput) headers(proto string, id uint64, client bool, at time.Time
 			}
 			meta["grpc"] = true
 		}
-		if !client && media == "text/event-stream" && (coding == "" || strings.EqualFold(coding, "identity") || b.gzip) {
+		if o.doh == nil && !client && media == "text/event-stream" && (coding == "" || strings.EqualFold(coding, "identity") || b.gzip) {
 			b.sse = &eventSource{first: true}
 		}
 	}
@@ -91,7 +99,7 @@ func (o *eventOutput) headers(proto string, id uint64, client bool, at time.Time
 }
 
 func (b *eventBody) emit(kind string, data []byte, meta map[string]any, offset uint64) {
-	if b.out.ch == nil {
+	if b.out.ch == nil || b.out.doh != nil {
 		return
 	}
 	direction := "response"
@@ -133,6 +141,9 @@ func (b *eventBody) decoded(data []byte) error {
 func (b *eventBody) write(data []byte) error {
 	if len(data) == 0 {
 		return nil
+	}
+	if b.doh != nil {
+		return b.writeDoH(data)
 	}
 	if !b.gzip {
 		return b.decoded(data)
@@ -184,6 +195,11 @@ func (b *eventBody) finish(kind string, meta map[string]any) error {
 		return nil
 	}
 	var err error
+	if b.doh != nil {
+		if err = b.finishDoH(kind); err != nil {
+			kind = "partial"
+		}
+	}
 	if kind == "end" {
 		if err = b.finishCoding(); err != nil {
 			kind = "partial"
@@ -222,6 +238,12 @@ func (o *eventOutput) finishAll(kind string) {
 	if o != nil {
 		for b := range o.active {
 			_ = b.finish(kind, nil)
+		}
+		if o.doh != nil {
+			o.doh.pending = nil
+			o.doh.responses = nil
+			o.doh.canceled = nil
+			o.doh.bytes = 0
 		}
 	}
 }

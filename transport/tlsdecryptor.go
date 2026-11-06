@@ -188,7 +188,7 @@ func (td *TLSDecryptor) queueRequest(data []byte) {
 	if !td.protocolDetected && td.packetChan != nil {
 		td.sniffBuffer = append(td.sniffBuffer, data...)
 		preface := []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
-		if len(td.sniffBuffer) < 4 || (len(td.sniffBuffer) < len(preface) && bytes.HasPrefix(preface, td.sniffBuffer)) {
+		if (td.options.ApplicationProtocol == "" || td.options.ApplicationProtocol == "doh") && (len(td.sniffBuffer) < 4 || (len(td.sniffBuffer) < len(preface) && bytes.HasPrefix(preface, td.sniffBuffer))) {
 			td.protocolMu.Unlock()
 			return
 		}
@@ -465,7 +465,7 @@ func (td *TLSDecryptor) processClientRecords() {
 				continue
 			}
 			td.recordFailure("decrypt", "authentication_failed", err)
-			if td.options.HTTPEvents {
+			if td.httpEventMode() {
 				td.abortInput()
 				return
 			}
@@ -547,7 +547,7 @@ func (td *TLSDecryptor) processServerRecords() {
 				continue
 			}
 			td.recordFailure("decrypt", "authentication_failed", err)
-			if td.options.HTTPEvents {
+			if td.httpEventMode() {
 				td.abortInput()
 				return
 			}
@@ -642,7 +642,7 @@ func (td *TLSDecryptor) Close() error {
 		parser := td.parser
 		td.protocolMu.RUnlock()
 
-		if parser != nil && !td.options.HTTPEvents && !td.aborted.Load() {
+		if parser != nil && !td.httpEventMode() && !td.aborted.Load() {
 			parser.Flush()
 		}
 		// Final flush of any remaining queued data
@@ -741,7 +741,7 @@ func (td *TLSDecryptor) Decrypt() error {
 	td.protocolMu.RUnlock()
 	// Close can run before this goroutine finishes draining queued TLS records.
 	// Flush again after the drain so close-delimited HTTP/1.0 bodies are emitted.
-	if events, ok := parser.(interface{ FinishHTTPEvents(string) }); ok && td.options.HTTPEvents {
+	if events, ok := parser.(interface{ FinishHTTPEvents(string) }); ok && td.httpEventMode() {
 		reason := ""
 		switch {
 		case incomplete || td.aborted.Load():
@@ -947,9 +947,17 @@ func (td *TLSDecryptor) detectProtocolLocked(data []byte) {
 	td.protocolDetected = true
 
 	// Use protocol registry to detect and create the appropriate parser
-	parser, protocolName := protocol.DetectProtocol(data, td.ConnectionInfo, td.packetChan)
+	parser, protocolName := protocol.SelectProtocol(td.options.ApplicationProtocol, data, td.ConnectionInfo, td.packetChan)
 	if parser != nil {
-		if td.options.HTTPEvents {
+		if td.options.ApplicationProtocol == "doh" {
+			doh, ok := parser.(interface{ EnableDNSOverHTTP() })
+			if !ok {
+				td.recordFailure("protocol", "unsupported_protocol", errors.New("selected parser cannot parse DoH"))
+				td.abortInput()
+				return
+			}
+			doh.EnableDNSOverHTTP()
+		} else if td.options.HTTPEvents {
 			events, ok := parser.(interface{ EnableHTTPEvents(int64) })
 			if !ok {
 				td.recordFailure("protocol", "unsupported_protocol", errors.New("selected parser does not support HTTP events"))
@@ -962,8 +970,8 @@ func (td *TLSDecryptor) detectProtocolLocked(data []byte) {
 		td.parser.SetPacketTime(td.packetTime)
 		td.logger.Printf("Detected %s protocol for %s", protocolName, td.ConnectionInfo)
 	} else {
-		if td.options.HTTPEvents {
-			td.recordFailure("protocol", "unsupported_protocol", errors.New("unrecognized HTTP event protocol"))
+		if td.httpEventMode() || td.options.ApplicationProtocol != "" {
+			td.recordFailure("protocol", "unsupported_protocol", errors.New("unrecognized application protocol"))
 			td.abortInput()
 		} else {
 			td.options.Report(td.ConnectionInfo, "protocol", "unsupported_protocol")
@@ -987,4 +995,8 @@ func (td *TLSDecryptor) checkEventParser() {
 			td.abortInput()
 		}
 	}
+}
+
+func (td *TLSDecryptor) httpEventMode() bool {
+	return td.options.HTTPEvents || td.options.ApplicationProtocol == "doh"
 }

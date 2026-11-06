@@ -852,6 +852,9 @@ func (p *HTTP2StreamParser) parseEventFrames(buf *bytes.Buffer, client bool) err
 				return ErrHTTPEventLimit
 			}
 			e.reset[id] = true
+			if err := e.output.resetDoH(uint64(id)); err != nil {
+				return err
+			}
 			if s := e.streams[id]; s != nil {
 				for i := range s {
 					if s[i].body != nil {
@@ -994,7 +997,7 @@ func (p *HTTP2StreamParser) finishEvents(reason string) {
 		return
 	}
 	e.closed = true
-	incomplete := len(e.output.active) > 0 || p.clientBuffer.Len()+p.serverBuffer.Len() > 0
+	incomplete := e.output.incompleteDoH() || len(e.output.active) > 0 || p.clientBuffer.Len()+p.serverBuffer.Len() > 0
 	for _, in := range e.input {
 		incomplete = incomplete || in.headerID != 0 || in.dataID != 0
 	}

@@ -25,6 +25,7 @@
 - Go module 与根包：`github.com/gojue/ecapture_decryptor` / `ecapture_decryptor`。
 - 这是 TLS 1.2/1.3、QUIC 流量的解密和应用协议解析 SDK。输入为已有 pcap/pcapng 文件或捕获数据流，以及匹配的 NSS SSLKEYLOG 密钥。密钥可来自外部 reader、pcapng 内嵌 TLS Decryption Secrets Block（DSB），或两者共同提供。
 - SDK 输出 `types.DecryptedPacket`，默认解析 HTTP/1.0、HTTP/1.1、HTTP/2、HTTP/3、WebSocket。HAR/JSON 转换由示例或调用方负责，不应移入核心解密层。
+- Go API 的 `ApplicationProtocol` 可显式选择 DoT、DoH、DoQ、MQTT 3.1.1、Redis RESP2/RESP3；不按端口自动识别这些协议，CLI/C 示例尚未暴露该选项。
 - 可直接嵌入 Go 程序，也可通过 `capi/` 构建 C 静态库/动态库；CLI 位于 `examples/go_demo/`，不是根目录的 `main` 包。
 - 已有抓包的解密、构建和回归测试可在 macOS/Linux 上运行，不要求 root、eBPF 或在线连接原始抓包目标。当前核心读取路径使用 `gopacket/pcapgo`，不依赖 libpcap 开发库。
 - Linux VM 用于运行独立的 eCapture、tcpdump 和流量发生器，重新生成真实夹具。eCapture/eBPF 抓包所需内核与权限属于采集端环境，不是 SDK 离线运行前提。
@@ -48,7 +49,7 @@ pcap/pcapng + 外部 SSLKEYLOG / 内嵌 DSB
 | `crypto/` | NSS keylog、密钥更新广播、TLS 握手/记录解密、密码套件、输入缓冲 |
 | `transport/tls*.go` | TLS 双向处理、密钥等待、协议识别与 raw 输出 |
 | `transport/quic*.go` | QUIC 头部保护、包号空间、CRYPTO/STREAM 重组、迟到密钥重试 |
-| `protocol/` | HTTP/1.x、HTTP/2 HPACK、HTTP/3 QPACK、WebSocket 解析 |
+| `protocol/` | HTTP/1.x、HTTP/2 HPACK、HTTP/3 QPACK、WebSocket、DNS、MQTT、Redis 解析 |
 | `types/` | `Decryptor`、`ProtocolDetector`、`StreamParserInterface`、公共选项和数据模型 |
 | `capi/main.go` | C 导出函数、错误缓冲、JSON 包装和字符串释放 |
 | `examples/go_demo/` | CLI、JSON/HAR 转换及转换器测试 |
@@ -68,12 +69,15 @@ pcap/pcapng + 外部 SSLKEYLOG / 内嵌 DSB
 - `input.Close()` 必须能中断阻塞读取。取消 context 无法中断调用方永久阻塞的 `emit`；保持背压，不使用无限队列或随意丢弃输出规避阻塞。
 - `RawChunks` 默认关闭；开启后输出已认证的 TLS 字节或连续 QUIC STREAM 字节，与应用解析互斥。chunk 不是应用消息；`offset`、`stream_id`、`stream_end` 的含义见 `docs/API.md`。
 - `HTTPEvents` 为显式 HTTP 增量输出，与 `RawChunks` 互斥。正文 offset 以消息/方向为单位，SSE 和 HTTP/2 gRPC message 是额外的语义事件。增量 HTTP 和 raw QUIC 可超过累计 16 MiB，乱序缓存、QPACK 等待、可选 gzip 展开仍有上限。
+- 非空 `ApplicationProtocol` 作用于该次调用的所有连接，与 `RawChunks`、`HTTPEvents`、非零 `MaxDecodedBodyBytes` 互斥。DNS 输出 wire message，MQTT/Redis 输出完整线上控制包/RESP 值；元数据和资源契约见 `docs/API.md`，不要把原始字节误写成脱敏内容。
 - `OnDiagnostic` 可并发执行，必须及时返回且不能重入引擎。诊断仅含连接、阶段和固定原因码，不加入密钥、明文或底层 parser 错误文本；诊断不能替代终止错误返回。
 - 默认 `KeyWaitTimeout=30s`、`IdleTimeout=5min`、`MaxConnections=1024`；非正值使用默认值。期限依据实际时间，不能使用抓包时间戳；连接额度包括仍在退出的 worker。
 - 保持现有缓存上限和关闭语义；退出需释放路由、队列、解析器引用与连接额度，正常 EOF 需处理已缓冲数据。不得通过删除限制、无界等待或持有路由锁执行阻塞关闭修复问题。
 - `DecryptedPacket.Data` 带 `json:"-"`：直接 JSON 编码不会自动携带明文正文。Go CLI 的显式转换器与 C API 的 JSON 输出行为不同，修改时同时检查消费者预期。
 
 HTTP/3 需要包含客户端 Initial/ClientHello 的双向 UDP 抓包和匹配 TLS 1.3 secrets。真实夹具验证 QUIC v1/v2 的 AES-128-GCM 双向多次 Key Update；AES-256-GCM/ChaCha20 更新仅有向量和状态测试，draft-29 未通过真实抓包验证。QUIC 每方向保留当前/上一代及下一代候选，详见 `docs/API.md`。独立 aioquic 夹具覆盖 v1/v2 × 三套件的握手/应用解密、CID 轮换/迁移、Retry/VN 和 accepted/rejected 0-RTT（不扩大 Key Update 的实测套件范围）；零长度 CID 仅在唯一原 tuple 路由，early data 输出边界见 API 文档。HTTP/3 已支持有界动态 QPACK、控制流、1xx/final/trailers、push 和 RESET_STREAM；双向动态 QPACK 的独立真实夹具使用 QUIC v1。decoder feedback 仅被动读取，不发送 ACK；消息与资源契约见 API 文档。HTTP/1 WebSocket 支持有界双向分片、控制帧和协商后的 permessage-deflate/context takeover。gRPC 语义仅在 HTTPEvents 的 HTTP/2 路径启用，保留无 schema 的消息字节，支持未压缩/gzip 和状态 trailers；不外推到 gRPC-Web、H3 或扩展 CONNECT。不要宣称已支持 TLS KeyUpdate、DATAGRAM 或 STARTTLS。C 的 `DecryptLiveTrafficToFile` 网卡接入仍是占位实现，E2E 验证其错误路径。
+
+DNS 仅解析普通 QUERY（不含 AXFR/IXFR）：DoT 按连接内 ID 和问题唯一关联，DoH 支持 HTTP/1.x、2、3 GET/POST，DoQ 限客户端双向流的一问一答及 1-RTT。DoQ 必须显式选择；观察到经认证的 QUIC ALPN 时核对 `doq`/`h3`，缺少握手 secrets 时由调用方声明协议，不代表已验证协商结果。MQTT 仅支持 TLS 内 3.1.1 控制包，不跟踪 QoS ACK 状态或去重 DUP；Redis 仅支持定长 RESP2/RESP3，保留流水线和 Pub/Sub 配对，不包含 inline、流式 RESP、复制或 MONITOR。新增真实夹具由独立 Python TLS/QUIC 对端产生，不依赖 eCapture。
 
 ## 编译环境与命令
 

@@ -94,16 +94,31 @@ func TestIdleReaperKeepsActiveConnectionsAndReleasesIdleOnes(t *testing.T) {
 }
 
 func TestTCPResetClosesBothDirections(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		withRoutingDecryptor(t, types.TransportProtocolTCP, func(engine *DecryptorEngine, created *[]*routingDecryptor) {
-			engine.handlePacket(lifecycleIP(), lifecyclePacket(41000, true, false), time.Time{})
-			engine.handlePacket(lifecycleIP(), lifecyclePacket(41000, false, true), time.Time{})
-			synctest.Wait()
-			if engine.active != 0 || len(engine.conntrack) != 0 {
-				t.Fatal("TCP reset left one direction or its connection worker open")
-			}
+	for _, tc := range []struct {
+		name    string
+		options types.DecryptOptions
+	}{
+		{"default", types.DecryptOptions{}},
+		{"http_events", types.DecryptOptions{HTTPEvents: true}},
+		{"doh", types.DecryptOptions{ApplicationProtocol: "doh"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				withRoutingDecryptor(t, types.TransportProtocolTCP, func(engine *DecryptorEngine, created *[]*routingDecryptor) {
+					engine.factory.options = tc.options
+					engine.handlePacket(lifecycleIP(), lifecyclePacket(41000, true, false), time.Time{})
+					engine.handlePacket(lifecycleIP(), lifecyclePacket(41000, false, true), time.Time{})
+					synctest.Wait()
+					if engine.active != 0 || len(engine.conntrack) != 0 {
+						t.Fatal("TCP reset left one direction or its connection worker open")
+					}
+					if !(*created)[0].resetObserved {
+						t.Fatal("TCP reset was not distinguished from normal EOF")
+					}
+				})
+			})
 		})
-	})
+	}
 }
 
 type lockingCloseDecryptor struct {

@@ -396,3 +396,68 @@ terminal events and raw QUIC STREAM payloads. The small fixture is also fed a
 packet at a time with input held open to verify dispatch before the third SSE
 record and before response completion. Unit regressions cover single large
 HTTP chunks/frames, gzip limits, reset, truncation and blocked consumers.
+
+## D08 DNS fixtures
+
+`dns_capture.py` starts independent loopback DNS peers over TLS and QUIC using
+Python TLS, dnspython 2.8.0, hyper-h2 4.3.0 and aioquic 1.3.0. It imports the
+existing `StaticH3` fixture adapter from `aioquic_capture.py`; neither script
+imports SDK code or writes capture packets. No eCapture or E01 is required.
+All five captures share the external SSLKEYLOG file `d08_dns.keys`.
+
+| Capture | Transport / port | Connections | Queries / responses | Scenario |
+| --- | --- | ---: | ---: | --- |
+| `d08_dot.pcapng` | TCP 44439 | 2 | 4 / 4 | Length-prefix fragmentation, pipelining, reversed replies, IDs 7/8 reused across connections |
+| `d08_doh1.pcapng` | TCP 44442 | 1 | 2 / 2 | HTTP/1.1 GET base64url and POST, Content-Length and chunked replies |
+| `d08_doh2.pcapng` | TCP 44443 | 1 | 2 / 2 | HTTP/2 GET/POST on streams 1/3, reversed replies and split DATA |
+| `d08_doq.pcapng` | UDP 44444 | 2 | 4 / 4 | ALPN `doq`, concurrent streams with DNS ID zero, split length prefix and FIN |
+| `d08_doh3.pcapng` | UDP 44445 | 1 | 2 / 2 | HTTP/3 GET/POST on concurrent streams, split DATA and FIN |
+
+DoQ and DoH/3 select QUIC v1 with AES-128-GCM. DoH uses DNS ID zero on both
+streams, so correlation must use the HTTP exchange. The peers verify complete
+DNS response bytes and the A answer `192.0.2.1`. These fixtures do not claim
+QUIC v2, 0-RTT, dynamic QPACK or failure/reset coverage; unit tests cover the
+parser's invalid input, reset, limits and cancellation paths separately.
+
+Run from the repository root on Linux with Python venv, OpenSSL, dumpcap and
+tshark available. This creates a fresh keylog and captures actual packets:
+
+```sh
+work=$(mktemp -d)
+umask 077
+python3 -m venv "$work/venv"
+"$work/venv/bin/pip" install aioquic==1.3.0 dnspython==2.8.0 h2==4.3.0
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout "$work/peer.key" -out "$work/peer.crt" -subj /CN=localhost -days 1
+sudo dumpcap -i lo -s 0 -B 64 \
+  -f 'tcp port 44439 or tcp port 44442 or tcp port 44443 or udp port 44444 or udp port 44445' \
+  -a duration:15 -w - > "$work/d08_dns.pcapng" 2> "$work/capture.log" &
+capture_pid=$!
+sleep 1
+"$work/venv/bin/python" test/fixtures/http3_capture/dns_capture.py \
+  --cert "$work/peer.crt" --key "$work/peer.key" \
+  --keylog "$work/d08_dns.keys" --mode all
+wait "$capture_pid"
+for entry in dot:tcp:44439 doh1:tcp:44442 doh2:tcp:44443 doq:udp:44444 doh3:udp:44445; do
+  mode=${entry%%:*}
+  endpoint=${entry#*:}
+  transport=${endpoint%%:*}
+  port=${endpoint##*:}
+  tshark -r "$work/d08_dns.pcapng" -Y "$transport.port == $port" -w "$work/d08_$mode.pcapng"
+done
+```
+
+`--mode` also accepts one of `dot`, `doh1`, `doh2`, `doq` or `doh3`; every run
+requires a new keylog path. Inspect `capture.log` for capture drops before
+using the files. Keep the temporary certificate private key out of Git.
+Splitting by port preserves captured network packets without synthesizing
+traffic. To validate the committed captures and related unit tests:
+
+```sh
+CGO_ENABLED=1 go test -race -run 'TestD08ApplicationCaptureAPIs/(dot|doh1|doh2|doq|doh3)|TestDNS|TestDoT|TestDoQ|TestDoH' ./protocol .
+```
+
+The fixture regression checks message counts, DNS fields, query/reply association,
+stream and connection identity with an external keylog and a trailing DSB on a
+non-seekable stream. MQTT and Redis reproduction is in
+[`../http_tcp_capture/README.md`](../http_tcp_capture/README.md#d08-mqtt-and-redis-fixtures).

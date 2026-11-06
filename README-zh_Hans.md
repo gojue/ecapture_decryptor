@@ -41,6 +41,7 @@ SDK 只负责解密与协议解析，不强制输出格式。结果以 `Decrypte
 
 - 🔓 **解密 TLS/QUIC 流量**：支持外部 SSLKEYLOG 文件和 pcapng 内嵌 DSB
 - 🌐 **多协议支持**：HTTP/1.0、HTTP/1.1、HTTP/2、HTTP/3、WebSocket
+- **显式 DNS、MQTT 与 Redis 解析**：Go API 可选择 DoT、DoH、DoQ、MQTT 3.1.1 或定长 Redis RESP2/RESP3。
 - 📦 **灵活输出**：输出 `DecryptedPacket` 结构，由调用方自由处理
 - **原始流与诊断**：通过 `DecryptPcapngStreamWithOptions` / `WithOptions` 显式选择已认证的 TLS 字节或 QUIC STREAM chunk，详见 [API 契约](docs/API.md#decryptpcapngstreamwithoptions--withoptions)。
 - 🔧 **多种使用方式**：Go 库、静态链接库（`.a`）、命令行工具
@@ -49,6 +50,8 @@ SDK 只负责解密与协议解析，不强制输出格式。结果以 `Decrypte
 Go 调用方可以用 `types.DecryptOptions{HTTPEvents: true}` 接收 HTTP/1、2、3 的 headers、正文片段、SSE、trailers 与 end/reset/partial 事件。正文按消息和方向独立维护 offset。增量 HTTP 和 raw QUIC 可以累计交付超过 16 MiB，乱序缓存仍受限。gzip 展开需显式设置每条消息的展开额度。[增量事件契约](docs/API.md#http-增量事件)
 
 HTTP/1 WebSocket 支持跨 record 的握手校验、双向分片、ping/pong/close 和协商后的 permessage-deflate（含 context takeover），消息与压缩缓存有界。`HTTPEvents` 模式为 HTTP/2 gRPC 增加流结束前的完整 `grpc_message` 输出，含分方向消息边界、gzip 消息压缩和状态 trailers；无 descriptor 时保留原始 Protobuf 字节。详见 [WebSocket 与 gRPC 契约](docs/API.md#websocket)。
+
+Go 文件或流式 API 可用 `types.DecryptOptions{ApplicationProtocol: "doh"}` 显式选择 `dot`、`doh`、`doq`、`mqtt`、`redis`，空值保留原有 HTTP/WebSocket 识别。选择作用于本次调用的所有连接，与 raw/HTTP 增量输出及 gzip 展开互斥。DNS 支持 TLS、HTTP/1.x–3、QUIC 上的普通查询；DoQ 必须显式选择，仅支持 1-RTT，在握手 secrets 足以观察协商 ALPN 时核对它。MQTT 支持 3.1.1 控制包，不跟踪 ACK 投递结果；Redis 支持定长 RESP2/RESP3、流水线响应及 Pub/Sub。输出保留 DNS wire 或完整 MQTT/RESP 字节及协议元数据。[字段、上限与未支持模式](docs/API.md#applicationprotocol)见 API 文档；CLI/C 示例尚未提供该选项。
 
 ### QUIC / HTTP/3 输入要求
 

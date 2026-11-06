@@ -527,7 +527,7 @@ func (e *http1Events) close(reason string) error {
 			return err
 		}
 	}
-	if e.request.body != nil || e.response.body != nil || e.request.buf.Len() > 0 || e.response.buf.Len() > 0 {
+	if e.output.incompleteDoH() || e.request.body != nil || e.response.body != nil || e.request.buf.Len() > 0 || e.response.buf.Len() > 0 {
 		return io.ErrUnexpectedEOF
 	}
 	return nil
