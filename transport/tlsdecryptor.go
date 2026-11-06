@@ -103,6 +103,12 @@ type TLSDecryptor struct {
 	rawEnded   bool
 	errMu      sync.Mutex
 	decryptErr error
+
+	// Internal tunnel hooks run only on authenticated application bytes. The
+	// sink is serialized by protocolMu and never feeds this same TLS instance.
+	plaintextSink  func([]byte, bool, time.Time) error
+	handshakeReady func()
+	rawMetadata    map[string]any
 }
 
 const (
@@ -139,6 +145,9 @@ func (td *TLSDecryptor) emitRawLocked(data []byte, direction string, end bool) {
 	}
 	packet.Metadata["offset"] = td.rawOffsets[index]
 	packet.Metadata["end"] = end
+	for key, value := range td.rawMetadata {
+		packet.Metadata[key] = value
+	}
 	td.rawOffsets[index] += uint64(len(data))
 	td.packetChan <- packet
 }
@@ -180,6 +189,11 @@ func (td *TLSDecryptor) queueRequest(data []byte) {
 	}
 
 	td.protocolMu.Lock()
+	if td.plaintextSink != nil {
+		td.forwardPlaintextLocked(data, true)
+		td.protocolMu.Unlock()
+		return
+	}
 	if td.options.RawChunks && td.packetChan != nil {
 		td.emitRawLocked(data, "request", false)
 		td.protocolMu.Unlock()
@@ -235,6 +249,11 @@ func (td *TLSDecryptor) queueResponse(data []byte) {
 	}
 
 	td.protocolMu.Lock()
+	if td.plaintextSink != nil {
+		td.forwardPlaintextLocked(data, false)
+		td.protocolMu.Unlock()
+		return
+	}
 	if td.options.RawChunks && td.packetChan != nil {
 		td.emitRawLocked(data, "response", false)
 		td.protocolMu.Unlock()
@@ -278,6 +297,20 @@ func (td *TLSDecryptor) queueResponse(data []byte) {
 
 	// Flush output
 	td.flushOutput()
+}
+
+func (td *TLSDecryptor) forwardPlaintextLocked(data []byte, client bool) {
+	if td.options.RawChunks && td.packetChan != nil {
+		direction := "response"
+		if client {
+			direction = "request"
+		}
+		td.emitRawLocked(data, direction, false)
+	}
+	if err := td.plaintextSink(data, client, td.packetTime); err != nil {
+		td.recordParserFailure(err)
+		td.abortInput()
+	}
 }
 
 // flushOutput outputs data in the correct order: requests before responses
@@ -685,6 +718,9 @@ func (td *TLSDecryptor) Decrypt() error {
 		td.errMu.Unlock()
 		return errors.Join(fmt.Errorf("parse handshake: %w", err), failure)
 	}
+	if td.handshakeReady != nil {
+		td.handshakeReady()
+	}
 	// Feed may have queued encrypted records while waiting for a late DSB.
 	// Drain them immediately; subsequent Feed calls use the same direction lock.
 	td.processClientRecords()
@@ -776,6 +812,9 @@ func (td *TLSDecryptor) releaseBuffers() {
 	td.serverIn.Discard()
 	td.protocolMu.Lock()
 	td.parser = nil
+	td.plaintextSink = nil
+	td.handshakeReady = nil
+	td.rawMetadata = nil
 	td.sniffBuffer = nil
 	td.pendingResponses = nil
 	td.pendingResponseBytes = 0
@@ -981,7 +1020,7 @@ func (td *TLSDecryptor) detectProtocolLocked(data []byte) {
 
 func (td *TLSDecryptor) recordParserFailure(err error) {
 	code := "parse_failed"
-	if errors.Is(err, protocol.ErrHTTPEventLimit) {
+	if errors.Is(err, protocol.ErrHTTPEventLimit) || errors.Is(err, errTLSUpgradeLimit) {
 		code = "resource_limit"
 	}
 	td.recordFailure("protocol", code, err)

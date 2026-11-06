@@ -97,7 +97,7 @@ func DecryptWithConfig(config *DecryptorConfig) error {
 	if err := config.options.Validate(); err != nil {
 		return err
 	}
-	if (config.options.HTTPEvents || config.options.ApplicationProtocol != "") && config.packetChan == nil {
+	if (config.options.HTTPEvents || config.options.ApplicationProtocol != "" || config.options.TLSUpgrade != "") && config.packetChan == nil {
 		return errors.New("application parsing requires a packet channel")
 	}
 	if config.logger == nil {

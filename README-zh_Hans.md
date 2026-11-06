@@ -53,6 +53,8 @@ HTTP/1 WebSocket 支持跨 record 的握手校验、双向分片、ping/pong/clo
 
 Go 文件或流式 API 可用 `types.DecryptOptions{ApplicationProtocol: "doh"}` 显式选择 `dot`、`doh`、`doq`、`mqtt`、`redis`，空值保留原有 HTTP/WebSocket 识别。选择作用于本次调用的所有连接，与 raw/HTTP 增量输出及 gzip 展开互斥。DNS 支持 TLS、HTTP/1.x–3、QUIC 上的普通查询；DoQ 必须显式选择，仅支持 1-RTT，在握手 secrets 足以观察协商 ALPN 时核对它。MQTT 支持 3.1.1 控制包，不跟踪 ACK 投递结果；Redis 支持定长 RESP2/RESP3、流水线响应及 Pub/Sub。输出保留 DNS wire 或完整 MQTT/RESP 字节及协议元数据。[字段、上限与未支持模式](docs/API.md#applicationprotocol)见 API 文档；CLI/C 示例尚未提供该选项。
 
+Go API 可通过 `TLSUpgrade` 显式选择 SMTP、IMAP、POP3、LDAP、PostgreSQL、MySQL 或 HTTP/1 CONNECT 协商，并用 `https-connect` 解密一层内层 TLS。升级被拒绝后保持明文，不扫描 TLS 前缀；升级后的载荷沿用已有应用/raw 输出，缺内层密钥仍保留可解的外层字节。[协商范围、层级与上限](docs/API.md#tlsupgrade)见 API 文档。
+
 ### QUIC / HTTP/3 输入要求
 
 解密 HTTP/3 需要包含客户端 Initial（其中有 ClientHello）的双向 UDP 抓包，以及匹配该连接的 TLS 1.3 SSLKEYLOG。密钥可作为外部文件传入，也可放在 pcapng 的 DSB 中。解析器按 QUIC 连接、包号和 STREAM 偏移重组数据，再按 HTTP/3 请求流输出 `http/3` 的 `DecryptedPacket`。

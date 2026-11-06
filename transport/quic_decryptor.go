@@ -242,7 +242,7 @@ func (q *QUICDecryptor) Decrypt() (result error) {
 		q.destConnID = nil
 		q.routingHandler = nil
 	}()
-	if name := q.options.ApplicationProtocol; name != "" && name != "doh" && name != "doq" {
+	if name := q.options.ApplicationProtocol; q.options.TLSUpgrade != "" || name != "" && name != "doh" && name != "doq" {
 		q.options.Report(q.connectionInfo, "protocol", "unsupported_protocol")
 		return errors.New("selected application protocol is not supported over QUIC")
 	}

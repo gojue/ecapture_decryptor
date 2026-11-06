@@ -179,3 +179,84 @@ The fixture regression verifies message counts, binary payloads, metadata and
 connection identity with external keys and a non-seekable stream with a trailing
 DSB. DNS fixture reproduction is in
 [`../http3_capture/README.md`](../http3_capture/README.md#d08-dns-fixtures).
+
+## D09 TLS upgrade and CONNECT fixtures
+
+`tls_upgrade.py` uses Python's standard-library sockets, TLS and MemoryBIO to
+generate real loopback traffic. It imports no SDK, eCapture or E01 code and
+never writes capture packets. Every mode opens two connections: a refused
+negotiation followed by a separate successful negotiation. The refused peer
+continues with fixed plaintext containing a fake TLS record prefix; it never
+retries an upgrade on that connection.
+
+| Mode / capture name | TCP port | Upgrade boundary |
+| --- | ---: | --- |
+| `smtp` / `d09_smtp.pcapng` | 44446 | EHLO capabilities, STARTTLS, 220 success / 454 refusal |
+| `imap` / `d09_imap.pcapng` | 44447 | CAPABILITY, tagged STARTTLS, matching tagged OK / NO |
+| `pop3` / `d09_pop3.pcapng` | 44448 | CAPA, STLS, +OK / -ERR |
+| `ldap` / `d09_ldap.pcapng` | 44449 | BER StartTLS extended request, result code 0 / 52 |
+| `postgres` / `d09_postgres.pcapng` | 44450 | Eight-byte SSLRequest, S / N |
+| `mysql` / `d09_mysql.pcapng` | 44451 | Protocol 10 greeting with / without CLIENT_SSL; successful client sends a 32-byte SSLRequest |
+| `connect` / `d09_connect.pcapng` | 44452 | Plain HTTP/1.1 CONNECT, 200 / 407 |
+| `https_connect` / `d09_https_connect.pcapng` | 44453 | CONNECT inside outer TLS, then independent inner TLS on success |
+
+The committed captures were generated with Python 3.14.4, OpenSSL 3.5.5 and
+Wireshark/dumpcap 4.6.4 on Linux arm64 (506 packets, zero drops).
+All TLS layers negotiate TLS 1.3 and ALPN `http/1.1`. Successful upgrades
+exchange exactly one HTTP/1.1 POST to `/d09/MODE` and one 200 response. Their
+bodies are `d09/MODE/request` and `d09/MODE/response`, each followed by the
+bytes `00 0d 0a ff`. This deliberately tests TLS handoff and HTTP/raw output;
+it does not implement encrypted mail, LDAP or database application semantics.
+Prelude and payload writes are fragmented. MySQL's SSLRequest tail and the
+actual TLS ClientHello share one socket write. Other clients wait for the
+successful upgrade response before starting TLS, preserving protocol ordering.
+
+`d09_upgrade.keys` contains the ordinary upgrade secrets and HTTPS CONNECT's
+outer TLS secrets. Only `d09_inner.keys` contains HTTPS CONNECT's inner TLS
+secrets, allowing separate complete-key and missing-inner-key regressions.
+Both paths must be new. Inner TLS runs over an outer SSLObject and actual TCP;
+the nested traffic is not assembled from synthetic encrypted capture records.
+
+Run from the repository root on Linux with Python 3 linked to a TLS 1.3-capable
+OpenSSL, plus OpenSSL CLI, dumpcap and tshark:
+
+```sh
+work=$(mktemp -d)
+umask 077
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout "$work/peer.key" -out "$work/peer.crt" -subj /CN=localhost -days 1
+sudo -v
+sudo -n dumpcap -i lo -s 0 -B 64 -f 'tcp portrange 44446-44453' \
+  -w - > "$work/d09_all.pcapng" 2> "$work/capture.log" &
+capture_pid=$!
+trap 'sudo -n kill -INT "$capture_pid" 2>/dev/null || true; wait "$capture_pid" 2>/dev/null || true' EXIT
+sleep 1
+python3 test/fixtures/http_tcp_capture/tls_upgrade.py \
+  --cert "$work/peer.crt" --key "$work/peer.key" \
+  --keylog "$work/d09_upgrade.keys" --inner-keylog "$work/d09_inner.keys" \
+  --mode all > "$work/evidence.jsonl"
+# Let the capture queue drain after the final TLS close_notify/TCP close.
+sleep 1
+sudo -n kill -INT "$capture_pid"
+wait "$capture_pid"
+trap - EXIT
+for entry in smtp:44446 imap:44447 pop3:44448 ldap:44449 postgres:44450 mysql:44451 connect:44452 https_connect:44453; do
+  mode=${entry%:*}
+  port=${entry##*:}
+  tshark -r "$work/d09_all.pcapng" -Y "tcp.port == $port" -w "$work/d09_$mode.pcapng"
+done
+```
+
+`--mode` can select any single mode in the table. Check capture drops in
+`capture.log` and the eight successful peer summaries in `evidence.jsonl`
+before using a full run. Each summary includes SHA-256 hashes of the complete
+expected HTTP request and response; both peers also verify every received byte
+and exchange TLS close_notify. Keep temporary certificate private keys out of
+Git. Tshark only filters real captured packets by port.
+
+The negotiation transcripts follow [SMTP STARTTLS](https://www.rfc-editor.org/rfc/rfc3207.html),
+[IMAP/POP3 TLS](https://www.rfc-editor.org/rfc/rfc2595.html),
+[LDAP StartTLS](https://www.rfc-editor.org/rfc/rfc4511.html#section-4.14),
+[PostgreSQL SSLRequest](https://www.postgresql.org/docs/18/protocol-flow.html#PROTOCOL-FLOW-SSL),
+[MySQL SSLRequest](https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_ssl_request.html)
+and [HTTP CONNECT](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6).

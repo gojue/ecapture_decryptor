@@ -8,12 +8,343 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"io"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/gojue/ecapture_decryptor/types"
 )
+
+func newTLSUpgradeTest(options types.DecryptOptions, capacity int) (*TLSDecryptorWrapper, chan *types.DecryptedPacket) {
+	base, _ := newTLSRawTest(types.DecryptOptions{})
+	packets := make(chan *types.DecryptedPacket, capacity)
+	wrapper := NewTLSDecryptorLibrary(base.ConnectionInfo, base.keyLog, base.clientOut, base.serverOut, base.logger, packets).(*TLSDecryptorWrapper)
+	wrapper.SetOptions(options)
+	return wrapper, packets
+}
+
+func tlsUpgradeTestHellos(random byte) (client, server []byte) {
+	c := append([]byte{3, 3}, bytes.Repeat([]byte{random}, 32)...)
+	c = append(c, 0, 0, 2, 0x13, 1, 1, 0, 0, 7, 0, 43, 0, 3, 2, 3, 4)
+	s := append([]byte{3, 3}, bytes.Repeat([]byte{0x55}, 32)...)
+	s = append(s, 0, 0x13, 1, 0, 0, 6, 0, 43, 0, 2, 3, 4)
+	client = append([]byte{0x16, 3, 3, 0, byte(4 + len(c)), 1, 0, 0, byte(len(c))}, c...)
+	server = append([]byte{0x16, 3, 3, 0, byte(4 + len(s)), 2, 0, 0, byte(len(s))}, s...)
+	return client, server
+}
+
+func tlsUpgradeTestSecrets(w *TLSDecryptorWrapper, random byte, secret []byte) {
+	id := hex.EncodeToString(bytes.Repeat([]byte{random}, 32))
+	w.keyLog.AddSecret("CLIENT_TRAFFIC_SECRET_0", id, secret)
+	w.keyLog.AddSecret("SERVER_TRAFFIC_SECRET_0", id, secret)
+}
+
+func TestTLSUpgradeEmptyCloseAndDeadline(t *testing.T) {
+	for _, mode := range []string{"smtp", "imap", "pop3", "ldap", "postgres", "mysql", "connect", "https-connect"} {
+		for _, timeout := range []bool{false, true} {
+			t.Run(mode+map[bool]string{false: "/close", true: "/timeout"}[timeout], func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					w, packets := newTLSUpgradeTest(types.DecryptOptions{TLSUpgrade: mode, KeyWaitTimeout: time.Second}, 8)
+					done := make(chan error, 1)
+					go func() { done <- w.Decrypt() }()
+					synctest.Wait()
+					if timeout {
+						time.Sleep(time.Second)
+					} else {
+						_ = w.Close()
+						_ = w.Close()
+					}
+					err := <-done
+					if timeout && !errors.Is(err, context.DeadlineExceeded) || !timeout && mode != "https-connect" && err != nil {
+						t.Fatalf("unexpected terminal error: %v", err)
+					}
+					if len(packets) != 0 || w.upgrade.inner != nil {
+						t.Fatal("empty negotiation created TLS output or a child")
+					}
+					_ = w.Close()
+				})
+			})
+		}
+	}
+}
+
+func TestTLSUpgradeRefusalKeepsPlaintextAndStopsDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w, packets := newTLSUpgradeTest(types.DecryptOptions{TLSUpgrade: "postgres", KeyWaitTimeout: time.Second}, 8)
+		done := make(chan error, 1)
+		go func() { done <- w.Decrypt() }()
+		request := []byte{0, 0, 0, 8, 4, 210, 22, 47}
+		if err := w.FeedClient(request); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.FeedServer([]byte("N")); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		time.Sleep(2 * time.Second)
+		fakeTLS := []byte("\x16\x03\x03\x00\x10not-a-TLS-record")
+		if err := w.FeedClient(fakeTLS); err != nil {
+			t.Fatal(err)
+		}
+		_ = w.CloseClient()
+		_ = w.CloseServer()
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if len(packets) != 3 || w.upgrade.inner != nil {
+			t.Fatal("refusal lost plaintext or started TLS")
+		}
+		for _, want := range [][]byte{request, []byte("N"), fakeTLS} {
+			p := <-packets
+			if p.Protocol != "starttls" || p.Metadata["tls_depth"] != 0 || !bytes.Equal(p.Data, want) {
+				t.Fatalf("incorrect plaintext packet: %+v", p)
+			}
+		}
+	})
+}
+
+func TestTLSUpgradeLateKeysAfterFINAndExactHandoff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w, packets := newTLSUpgradeTest(types.DecryptOptions{TLSUpgrade: "postgres", RawChunks: true, KeyWaitTimeout: time.Second}, 16)
+		done := make(chan error, 1)
+		go func() { done <- w.Decrypt() }()
+		client, server := tlsUpgradeTestHellos(0x44)
+		secret := bytes.Repeat([]byte{0x11}, 32)
+		request, response := []byte("client\x00"), []byte("server\xff")
+		client = append(client, tls13RawTestRecord(t, secret, 0, request, 0x17)...)
+		server = append(server, tls13RawTestRecord(t, secret, 0, response, 0x17)...)
+		prelude := append([]byte{0, 0, 0, 8, 4, 210, 22, 47}, client...)
+		for _, b := range prelude {
+			if err := w.FeedClient([]byte{b}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := w.FeedServer(append([]byte("S"), server...)); err != nil {
+			t.Fatal(err)
+		}
+		_ = w.CloseClient()
+		_ = w.CloseServer()
+		synctest.Wait()
+		select {
+		case err := <-done:
+			t.Fatalf("FIN canceled late-key wait: %v", err)
+		default:
+		}
+		time.Sleep(500 * time.Millisecond)
+		tlsUpgradeTestSecrets(w, 0x44, secret)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		var plaintext [2][]byte
+		for len(packets) > 0 {
+			p := <-packets
+			if p.Protocol != "tls" {
+				continue
+			}
+			i := 1
+			if p.Direction == "request" {
+				i = 0
+			}
+			if p.Metadata["tls_depth"] != 1 || p.Metadata["parent_tls_depth"] != 0 || p.ConnectionID() != w.GetAddr().String() || p.Metadata["offset"] != uint64(len(plaintext[i])) {
+				t.Fatal("invalid layer metadata or offset", p.Metadata)
+			}
+			plaintext[i] = append(plaintext[i], p.Data...)
+		}
+		if !bytes.Equal(plaintext[0], request) || !bytes.Equal(plaintext[1], response) {
+			t.Fatal("TLS handoff lost or duplicated bytes", plaintext)
+		}
+		assertTLSBuffersReleased(t, w.upgrade.inner)
+	})
+}
+
+func TestTLSUpgradeOneDeadlineAcrossNegotiationAndTLS(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w, _ := newTLSUpgradeTest(types.DecryptOptions{TLSUpgrade: "postgres", RawChunks: true, KeyWaitTimeout: time.Second}, 16)
+		done := make(chan error, 1)
+		started := time.Now()
+		go func() { done <- w.Decrypt() }()
+		synctest.Wait()
+		time.Sleep(750 * time.Millisecond)
+		_ = w.FeedClient([]byte{0, 0, 0, 8, 4, 210, 22, 47})
+		_ = w.FeedServer([]byte("S"))
+		if err := <-done; !errors.Is(err, context.DeadlineExceeded) || time.Since(started) != time.Second {
+			t.Fatalf("upgrade restarted the deadline: %v, elapsed=%v", err, time.Since(started))
+		}
+		assertTLSBuffersReleased(t, w.upgrade.inner)
+	})
+}
+
+func TestTLSUpgradeNegotiationBackpressureAndTruncation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w, packets := newTLSUpgradeTest(types.DecryptOptions{TLSUpgrade: "postgres"}, 0)
+		fed := make(chan error, 1)
+		go func() { fed <- w.FeedClient([]byte{0, 0, 0, 8, 4, 210, 22, 47}) }()
+		synctest.Wait()
+		select {
+		case <-fed:
+			t.Fatal("slow consumer did not apply backpressure")
+		default:
+		}
+		p := <-packets
+		if p.Metadata["kind"] != "negotiation_chunk" || len(p.Data) != 8 {
+			t.Fatal(p)
+		}
+		if err := <-fed; err != nil {
+			t.Fatal(err)
+		}
+		_ = w.Close()
+		if err := w.Decrypt(); !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("missing upgrade response returned %v", err)
+		}
+	})
+}
+
+func TestTLSUpgradeHTTPSNestedLateSecretsAndEOFDrain(t *testing.T) {
+	for _, mode := range []string{"late_inner", "close_before_drain", "missing_inner"} {
+		t.Run(mode, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				diagnostics := make(chan types.Diagnostic, 16)
+				w, packets := newTLSUpgradeTest(types.DecryptOptions{TLSUpgrade: "https-connect", RawChunks: true, KeyWaitTimeout: time.Second, OnDiagnostic: func(d types.Diagnostic) { diagnostics <- d }}, 32)
+				outerSecret, innerSecret := bytes.Repeat([]byte{0x11}, 32), bytes.Repeat([]byte{0x22}, 32)
+				outerClient, outerServer := tlsUpgradeTestHellos(0x44)
+				innerClient, innerServer := tlsUpgradeTestHellos(0x66)
+				request, response := []byte("request\x00"), []byte("response\xff")
+				connect := []byte("CONNECT origin.example:443 HTTP/1.1\r\nHost: origin.example:443\r\n\r\n")
+				accepted := []byte("HTTP/1.1 200 Connection Established\r\n\r\n")
+				clientWire := append(innerClient, tls13RawTestRecord(t, innerSecret, 0, request, 0x17)...)
+				serverWire := append(innerServer, tls13RawTestRecord(t, innerSecret, 0, response[:1], 0x17)...)
+				serverTail := tls13RawTestRecord(t, innerSecret, 1, response[1:], 0x17)
+				outerClient = append(outerClient, tls13RawTestRecord(t, outerSecret, 0, connect, 0x17)...)
+				outerClient = append(outerClient, tls13RawTestRecord(t, outerSecret, 1, clientWire, 0x17)...)
+				outerServer = append(outerServer, tls13RawTestRecord(t, outerSecret, 0, append(bytes.Clone(accepted), serverWire...), 0x17)...)
+				outerServer = append(outerServer, tls13RawTestRecord(t, outerSecret, 1, serverTail, 0x17)...)
+				done := make(chan error, 1)
+				go func() { done <- w.Decrypt() }()
+				if err := w.FeedClient(outerClient); err != nil {
+					t.Fatal(err)
+				}
+				if err := w.FeedServer(outerServer); err != nil {
+					t.Fatal(err)
+				}
+				_ = w.CloseClient()
+				_ = w.CloseServer()
+				synctest.Wait()
+				if mode == "close_before_drain" {
+					tlsUpgradeTestSecrets(w, 0x66, innerSecret)
+				}
+				tlsUpgradeTestSecrets(w, 0x44, outerSecret)
+				if mode == "close_before_drain" {
+					_ = w.Close()
+				} else {
+					synctest.Wait()
+					select {
+					case err := <-done:
+						t.Fatalf("outer FIN canceled inner secret wait: %v", err)
+					default:
+					}
+					if mode == "late_inner" {
+						time.Sleep(500 * time.Millisecond)
+						tlsUpgradeTestSecrets(w, 0x66, innerSecret)
+					} else {
+						_ = w.Close()
+					}
+				}
+				err := <-done
+				if (err != nil) != (mode == "missing_inner") {
+					t.Fatalf("nested termination: %v", err)
+				}
+				var outerData, innerData [2][]byte
+				for len(packets) > 0 {
+					p := <-packets
+					if p.Protocol != "tls" {
+						continue
+					}
+					i := 1
+					if p.Direction == "request" {
+						i = 0
+					}
+					depth := p.Metadata["tls_depth"].(int)
+					if p.ConnectionID() != w.GetAddr().String() || p.Metadata["parent_tls_depth"] != depth-1 {
+						t.Fatal("nested identity changed", p.Metadata)
+					}
+					if depth == 1 {
+						outerData[i] = append(outerData[i], p.Data...)
+					} else {
+						innerData[i] = append(innerData[i], p.Data...)
+					}
+				}
+				if !bytes.Equal(outerData[0], append(bytes.Clone(connect), clientWire...)) || !bytes.Equal(outerData[1], append(append(bytes.Clone(accepted), serverWire...), serverTail...)) {
+					t.Fatal("outer authenticated bytes changed or vanished")
+				}
+				if mode == "missing_inner" {
+					if len(innerData[0])+len(innerData[1]) != 0 {
+						t.Fatal("missing keys emitted inner plaintext")
+					}
+					found := false
+					for len(diagnostics) > 0 {
+						d := <-diagnostics
+						found = found || d.Stage == "tunnel" && d.Code == "inner_tls_unavailable"
+					}
+					if !found {
+						t.Fatal("missing inner boundary diagnostic")
+					}
+				} else if !bytes.Equal(innerData[0], request) || !bytes.Equal(innerData[1], response) {
+					t.Fatal("inner handoff lost authenticated application bytes")
+				}
+				assertTLSBuffersReleased(t, w.upgrade.inner)
+				assertTLSBuffersReleased(t, w.upgrade.outer)
+			})
+		})
+	}
+}
+
+func TestTLSUpgradeInnerDeadlinePreservesLaterOuterBytes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w, packets := newTLSUpgradeTest(types.DecryptOptions{TLSUpgrade: "https-connect", RawChunks: true, KeyWaitTimeout: time.Second}, 32)
+		outerSecret, innerSecret := bytes.Repeat([]byte{0x11}, 32), bytes.Repeat([]byte{0x22}, 32)
+		outerClient, outerServer := tlsUpgradeTestHellos(0x44)
+		innerClient, innerServer := tlsUpgradeTestHellos(0x66)
+		tlsUpgradeTestSecrets(w, 0x44, outerSecret)
+		_ = w.FeedClient(outerClient)
+		_ = w.FeedServer(outerServer)
+		done := make(chan error, 1)
+		go func() { done <- w.Decrypt() }()
+		synctest.Wait()
+		request := append([]byte("CONNECT origin.example:443 HTTP/1.1\r\nHost: origin.example:443\r\n\r\n"), innerClient...)
+		response := append([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"), innerServer...)
+		_ = w.FeedClient(tls13RawTestRecord(t, outerSecret, 0, request, 0x17))
+		_ = w.FeedServer(tls13RawTestRecord(t, outerSecret, 0, response, 0x17))
+		synctest.Wait()
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if w.upgrade.outer.isClosed.Load() || !w.upgrade.inner.isClosed.Load() {
+			t.Fatal("inner timeout must close only the inner layer")
+		}
+		late := tls13RawTestRecord(t, innerSecret, 0, []byte("after-inner-timeout"), 0x17)
+		if err := w.FeedServer(tls13RawTestRecord(t, outerSecret, 1, late, 0x17)); err != nil {
+			t.Fatal("inner timeout rejected subsequent outer data", err)
+		}
+		_ = w.CloseClient()
+		_ = w.CloseServer()
+		if err := <-done; !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("inner deadline disappeared: %v", err)
+		}
+		var got []byte
+		for len(packets) > 0 {
+			p := <-packets
+			if p.Metadata["tls_depth"] == 2 {
+				t.Fatal("missing inner keys emitted plaintext")
+			}
+			if p.Protocol == "tls" && p.Direction == "response" {
+				got = append(got, p.Data...)
+			}
+		}
+		if !bytes.Equal(got, append(response, late...)) {
+			t.Fatal("outer bytes after inner deadline were lost")
+		}
+	})
+}
 
 func TestTLSHandshakeAndKeyWaitShareDeadline(t *testing.T) {
 	for _, phase := range []string{"client_hello", "partial_client_hello", "server_hello", "secrets", "default_timeout"} {

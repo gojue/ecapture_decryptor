@@ -67,7 +67,7 @@ pcap/pcapng + 外部 SSLKEYLOG / 内嵌 DSB
 - TCP 按序号重组并消除重传/回环重复包；同一四元组的新 SYN 创建新 `Generation`，重复 SYN 不创建新连接。双向数据归入同一连接，QUIC Initial 自带有效握手负载，不能丢弃。
 - channel API 的输出必须由调用方并发消费，函数返回后再由调用方关闭 channel。流 API 的 `emit` 串行调用；回调报错会停止输入，生产者仍需排空退出。
 - `input.Close()` 必须能中断阻塞读取。取消 context 无法中断调用方永久阻塞的 `emit`；保持背压，不使用无限队列或随意丢弃输出规避阻塞。
-- `RawChunks` 默认关闭；开启后输出已认证的 TLS 字节或连续 QUIC STREAM 字节，与应用解析互斥。chunk 不是应用消息；`offset`、`stream_id`、`stream_end` 的含义见 `docs/API.md`。
+- `RawChunks` 默认关闭；开启后输出已认证的 TLS 字节或连续 QUIC STREAM 字节，与同一层应用解析互斥。TLSUpgrade 可同时保留外层 raw 和内层应用输出。chunk 不是应用消息；`offset`、`stream_id`、`stream_end` 的含义见 `docs/API.md`。
 - `HTTPEvents` 为显式 HTTP 增量输出，与 `RawChunks` 互斥。正文 offset 以消息/方向为单位，SSE 和 HTTP/2 gRPC message 是额外的语义事件。增量 HTTP 和 raw QUIC 可超过累计 16 MiB，乱序缓存、QPACK 等待、可选 gzip 展开仍有上限。
 - 非空 `ApplicationProtocol` 作用于该次调用的所有连接，与 `RawChunks`、`HTTPEvents`、非零 `MaxDecodedBodyBytes` 互斥。DNS 输出 wire message，MQTT/Redis 输出完整线上控制包/RESP 值；元数据和资源契约见 `docs/API.md`，不要把原始字节误写成脱敏内容。
 - `OnDiagnostic` 可并发执行，必须及时返回且不能重入引擎。诊断仅含连接、阶段和固定原因码，不加入密钥、明文或底层 parser 错误文本；诊断不能替代终止错误返回。
@@ -75,9 +75,11 @@ pcap/pcapng + 外部 SSLKEYLOG / 内嵌 DSB
 - 保持现有缓存上限和关闭语义；退出需释放路由、队列、解析器引用与连接额度，正常 EOF 需处理已缓冲数据。不得通过删除限制、无界等待或持有路由锁执行阻塞关闭修复问题。
 - `DecryptedPacket.Data` 带 `json:"-"`：直接 JSON 编码不会自动携带明文正文。Go CLI 的显式转换器与 C API 的 JSON 输出行为不同，修改时同时检查消费者预期。
 
-HTTP/3 需要包含客户端 Initial/ClientHello 的双向 UDP 抓包和匹配 TLS 1.3 secrets。真实夹具验证 QUIC v1/v2 的 AES-128-GCM 双向多次 Key Update；AES-256-GCM/ChaCha20 更新仅有向量和状态测试，draft-29 未通过真实抓包验证。QUIC 每方向保留当前/上一代及下一代候选，详见 `docs/API.md`。独立 aioquic 夹具覆盖 v1/v2 × 三套件的握手/应用解密、CID 轮换/迁移、Retry/VN 和 accepted/rejected 0-RTT（不扩大 Key Update 的实测套件范围）；零长度 CID 仅在唯一原 tuple 路由，early data 输出边界见 API 文档。HTTP/3 已支持有界动态 QPACK、控制流、1xx/final/trailers、push 和 RESET_STREAM；双向动态 QPACK 的独立真实夹具使用 QUIC v1。decoder feedback 仅被动读取，不发送 ACK；消息与资源契约见 API 文档。HTTP/1 WebSocket 支持有界双向分片、控制帧和协商后的 permessage-deflate/context takeover。gRPC 语义仅在 HTTPEvents 的 HTTP/2 路径启用，保留无 schema 的消息字节，支持未压缩/gzip 和状态 trailers；不外推到 gRPC-Web、H3 或扩展 CONNECT。不要宣称已支持 TLS KeyUpdate、DATAGRAM 或 STARTTLS。C 的 `DecryptLiveTrafficToFile` 网卡接入仍是占位实现，E2E 验证其错误路径。
+HTTP/3 需要包含客户端 Initial/ClientHello 的双向 UDP 抓包和匹配 TLS 1.3 secrets。真实夹具验证 QUIC v1/v2 的 AES-128-GCM 双向多次 Key Update；AES-256-GCM/ChaCha20 更新仅有向量和状态测试，draft-29 未通过真实抓包验证。QUIC 每方向保留当前/上一代及下一代候选，详见 `docs/API.md`。独立 aioquic 夹具覆盖 v1/v2 × 三套件的握手/应用解密、CID 轮换/迁移、Retry/VN 和 accepted/rejected 0-RTT（不扩大 Key Update 的实测套件范围）；零长度 CID 仅在唯一原 tuple 路由，early data 输出边界见 API 文档。HTTP/3 已支持有界动态 QPACK、控制流、1xx/final/trailers、push 和 RESET_STREAM；双向动态 QPACK 的独立真实夹具使用 QUIC v1。decoder feedback 仅被动读取，不发送 ACK；消息与资源契约见 API 文档。HTTP/1 WebSocket 支持有界双向分片、控制帧和协商后的 permessage-deflate/context takeover。gRPC 语义仅在 HTTPEvents 的 HTTP/2 路径启用，保留无 schema 的消息字节，支持未压缩/gzip 和状态 trailers；不外推到 gRPC-Web、H3 或扩展 CONNECT。不要宣称已支持 TLS KeyUpdate 或 DATAGRAM。C 的 `DecryptLiveTrafficToFile` 网卡接入仍是占位实现，E2E 验证其错误路径。
 
 DNS 仅解析普通 QUERY（不含 AXFR/IXFR）：DoT 按连接内 ID 和问题唯一关联，DoH 支持 HTTP/1.x、2、3 GET/POST，DoQ 限客户端双向流的一问一答及 1-RTT。DoQ 必须显式选择；观察到经认证的 QUIC ALPN 时核对 `doq`/`h3`，缺少握手 secrets 时由调用方声明协议，不代表已验证协商结果。MQTT 仅支持 TLS 内 3.1.1 控制包，不跟踪 QoS ACK 状态或去重 DUP；Redis 仅支持定长 RESP2/RESP3，保留流水线和 Pub/Sub 配对，不包含 inline、流式 RESP、复制或 MONITOR。新增真实夹具由独立 Python TLS/QUIC 对端产生，不依赖 eCapture。
+
+`TLSUpgrade` 显式选择 SMTP/IMAP/POP3、LDAP、PostgreSQL SSLRequest、MySQL SSLRequest、HTTP/1 CONNECT 或 HTTPS CONNECT 内一层 TLS。仅处理一次协商，拒绝后持续明文，不扫描 TLS 魔数或重试升级；邮件/数据库应用解析不在此范围。输出以原 ConnectionID 与 tls_depth 区分层，HTTPS CONNECT 始终保留外层已认证 raw 字节，无内层密钥仍返回固定诊断及错误。所有阶段共用有界协商/密钥期限，详见 API 文档；不外推到 H2/H3 CONNECT、多层隧道或任意 Upgrade。
 
 ## 编译环境与命令
 

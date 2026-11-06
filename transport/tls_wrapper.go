@@ -19,6 +19,16 @@ import (
 // TLSDecryptorWrapper wraps TLSDecryptor to implement Decryptor interface
 type TLSDecryptorWrapper struct {
 	*TLSDecryptor
+	upgrade *tlsUpgradeDecryptor
+}
+
+// SetOptions selects the optional pre-TLS negotiation before any input is fed.
+func (w *TLSDecryptorWrapper) SetOptions(options types.DecryptOptions) {
+	w.TLSDecryptor.SetOptions(options)
+	w.upgrade = nil
+	if options.TLSUpgrade != "" {
+		w.upgrade = newTLSUpgradeDecryptor(w.TLSDecryptor, options)
+	}
 }
 
 // NewTLSDecryptorWrapper creates a new TLS decryptor wrapper
@@ -40,35 +50,65 @@ func (w *TLSDecryptorWrapper) GetAddr() types.ConnectionKey {
 
 // Decrypt starts the decryption process
 func (w *TLSDecryptorWrapper) Decrypt() error {
+	if w.upgrade != nil {
+		return w.upgrade.Decrypt()
+	}
 	return w.TLSDecryptor.Decrypt()
 }
 
 // FeedClient feeds client data to the decryptor
 func (w *TLSDecryptorWrapper) FeedClient(data []byte) error {
+	if w.upgrade != nil {
+		return w.upgrade.feed(data, true)
+	}
 	return w.TLSDecryptor.FeedClient(data)
 }
 
 // FeedServer feeds server data to the decryptor
 func (w *TLSDecryptorWrapper) FeedServer(data []byte) error {
+	if w.upgrade != nil {
+		return w.upgrade.feed(data, false)
+	}
 	return w.TLSDecryptor.FeedServer(data)
 }
 
 // SetPacketTime sets the packet timestamp
 func (w *TLSDecryptorWrapper) SetPacketTime(t time.Time) {
+	if w.upgrade != nil {
+		w.upgrade.SetPacketTime(t)
+		return
+	}
 	w.TLSDecryptor.SetPacketTime(t)
 }
 
 // CloseClient closes the client side
 func (w *TLSDecryptorWrapper) CloseClient() error {
+	if w.upgrade != nil {
+		return w.upgrade.closeSide(true)
+	}
 	return w.TLSDecryptor.CloseClient()
 }
 
 // CloseServer closes the server side
 func (w *TLSDecryptorWrapper) CloseServer() error {
+	if w.upgrade != nil {
+		return w.upgrade.closeSide(false)
+	}
 	return w.TLSDecryptor.CloseServer()
 }
 
 // Close closes the decryptor
 func (w *TLSDecryptorWrapper) Close() error {
+	if w.upgrade != nil {
+		return w.upgrade.Close()
+	}
 	return w.TLSDecryptor.Close()
+}
+
+func (w *TLSDecryptorWrapper) ObserveTCPReset() {
+	if w.upgrade != nil {
+		w.upgrade.observeReset()
+		return
+	}
+	w.TLSDecryptor.ObserveTCPReset()
 }

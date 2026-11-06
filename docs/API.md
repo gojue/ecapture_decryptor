@@ -148,18 +148,18 @@ raw 事件复用 `DecryptedPacket`：`Protocol` 为 `tls` 或 `quic`，`Data` �
 | 字段 | 类型和含义 |
 | --- | --- |
 | `kind` | `stream_chunk`，或不携带数据的 `stream_end` / QUIC `stream_reset` |
-| `offset` | `uint64`，TLS 按连接/方向，QUIC 按连接/方向/stream 的字节偏移 |
+| `offset` | `uint64`，TLS 按连接/方向（TLSUpgrade 还按 tls_depth），QUIC 按连接/方向/stream 的字节偏移 |
 | `end` | `bool`，QUIC 表示连续数据到达 FIN 或收到 RESET_STREAM；TLS 表示捕获输入结束 |
 | `stream_id` | QUIC 的 `uint64` stream ID；TLS 不设置 |
 | `error_code` | 仅 `stream_reset`，`uint64` 应用错误码；此时 `offset` 是最终大小，不保证此前所有字节都已捕获 |
 
-chunk 边界不是应用消息边界，raw 与应用解析互斥，不依赖 ALPN 或自动识别。
+chunk 边界不是应用消息边界，同一层的 raw 与应用解析互斥，不依赖 ALPN 或自动识别；TLSUpgrade 可同时交付外层 raw 与内层应用消息。
 TLS 终止错误时保留已认证字节并返回错误，不发送正常结束标记；捕获结束本身
 不证明应用消息完整。QUIC 只输出连续 STREAM 字节，已知 offset 缺口在关闭时报错。
 RESET_STREAM 释放该方向的重组和解析缓存，保留有界终止标记以去重；它不伪装为完整 HTTP 消息。
 0-RTT RESET 使用下述接受/拒绝规则和独立 early 空间，raw reset 同样带阶段/接受状态。
 STOP_SENDING 只表示请求对端停止，不能替代 RESET 或 FIN。
-不支持 DATAGRAM 输出、TLS KeyUpdate 或 STARTTLS；QUIC Key Update、
+不支持 DATAGRAM 输出或 TLS KeyUpdate；STARTTLS/CONNECT 见 [TLSUpgrade](#tlsupgrade)。QUIC Key Update、
 CID/Retry/VN 和 0-RTT 支持范围见下节。raw / HTTP 增量模式支持 QUIC 62 位 STREAM offset，完整消息和 CRYPTO 保留 16 MiB 的累计限制。
 
 `Diagnostic` 仅含连接标识、传输、阶段和固定原因码，不含底层错误字符串。
@@ -607,6 +607,31 @@ QPACK、SETTINGS 和消息顺序错误报告 `protocol/parse_failed`，不归为
 - 缺少/畸形 `grpc-status`、截断前缀/body、非法压缩标志或压缩校验失败会返回解析错误，已开始方向终止为 partial。RESET 保留 HTTP/2 error_code、释放未完成消息，不将半条消息当作成功输出。SDK 不合成缺失的业务状态，也不解释 status-details 的 Protobuf。
 
 单条编码消息和展开结果各限 16 MiB；每连接所有未完成 gRPC 消息的已接收 payload 共限 32 MiB，活动流仍适用 HTTP/2 限额。完整消息在 END_STREAM/EOF 前交付并释放，累计流长可超过 16 MiB。只拼接 body_chunk 才能还原 HTTP 正文，grpc_message 是额外语义视图。单元测试覆盖 unary/client/server/bidi streaming、长流和边界；独立 hyper-h2 + Python gzip 实际 TLS 流量覆盖四类调用、双向压缩、错误 trailers 和 trailers-only。基线为 [gRPC HTTP/2 协议](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md)。
+
+### TLSUpgrade
+
+`types.DecryptOptions{TLSUpgrade: "smtp", RawChunks: true}` 为 TCP 显式选择一次明文协商后 TLS；`TLSUpgrade: "https-connect"` 为外层 TLS 内的 HTTP/1 CONNECT 再解密一层 TLS。空值保留直接 TLS 的原行为，不按端口猜测，也不扫描任意 `0x16`。该选项作用于本次调用的所有连接，仅 Go 文件/流式 API 提供；文件入口需并发消费 packet channel，QUIC/DoQ 不接受该选项。`RawChunks`、`HTTPEvents`、`ApplicationProtocol` 继续按各自互斥规则选择升级后最内层的输出。
+
+| 值 | 本批协商范围与切换条件 |
+| --- | --- |
+| `smtp` | 服务端 greeting、EHLO/HELO、NOOP/RSET 与 STARTTLS；匹配完整最终 `220` 后切换，支持多行响应。DATA/AUTH/BDAT 等转入永久明文直通。 |
+| `imap` | 未认证 greeting、CAPABILITY/NOOP、带 tag 的 STARTTLS；必须收到对应 tag 的 OK，不能由 untagged OK 触发。literal、认证和其他操作不继续寻找升级。 |
+| `pop3` | 未认证 greeting、CAPA/NOOP、STLS；CAPA 多行以点终止；STLS 的完整 `+OK` 后升级，认证及其他操作保持明文。 |
+| `ldap` | 首个操作为带 StartTLS OID 的 BER ExtendedRequest；匹配 message ID 的 ExtendedResponse resultCode=0 后切换。仅明确长度，不接受任意 BER 内容中的 OID 字样。 |
+| `postgres` | 传统八字节 SSLRequest（80877103）与单字节 `S`；`N`/ErrorResponse 保持明文。GSSENCRequest、直接 TLS 协商另行处理。 |
+| `mysql` | Protocol 10 greeting 声明 CLIENT_PROTOCOL_41/CLIENT_SSL，加序号 1 的 32 字节 SSLRequest；SSLRequest 之后立即切换，不等待不存在的明文成功响应。 |
+| `connect` | 首轮 HTTP/1.0/1.1 CONNECT authority-form；任何 2xx 在响应头结束处切换，忽略成功响应的 Content-Length/Transfer-Encoding。 |
+| `https-connect` | 先认证解密外层 TLS，执行同一 CONNECT 协商，最多再解密一层 TLS；两层共享 keylog，各自使用 ClientHello random 查找 secrets。 |
+
+拒绝升级或遇到上述范围外的明文操作后，剩余字节持续作为明文直通，不在同一连接上再次尝试升级；失败后的伪 TLS 前缀不会进入 TLS 引擎。畸形协商返回错误；成功边界后同一块内的双向剩余字节精确交给既有 TLS 引擎。邮件/数据库选项只处理 TLS 协商，不增加对应应用消息解析器；这类载荷可用 `RawChunks`。HTTP/2/3 CONNECT、WebSocket 扩展 CONNECT、任意 Upgrade、重复代理认证及多层递归隧道不在此范围。
+
+所有输出保留原物理连接的 `ConnectionID()`、地址和 `Generation`，以连接 ID 与 `tls_depth` 区分层：普通明文前导为 0，升级后 TLS 为 1；HTTPS CONNECT 外层为 1，内层为 2。非零层还带 `parent_tls_depth`，并带 `upgrade_protocol`（所选值）。前导输出 `Protocol="starttls"`、`kind="negotiation_chunk"`，`Data` 为按方向拼接可还原的协商/拒绝后原始字节，chunk 不是完整消息；深度 0 的字节未经 TLS 认证。
+
+HTTPS CONNECT 始终额外输出 `Protocol="tls"`、深度 1 的已认证外层 raw chunks（含方向 offset 和结束事件），其中既有 CONNECT，也有承载内层 TLS 的线上字节；`starttls` 是同层协商的另一视图，不能把两者拼在一起。即使没有内层 secrets，已解出的外层字节仍然交付；内层握手/密钥未就绪而终止时报告固定 `tunnel/inner_tls_unavailable`，并保留终止错误。不会从内层密文伪造应用明文。
+
+每方向待判定前导/候选最多 64 KiB，判定期间累计输入最多 1 MiB、最多 4,096 步；成功或拒绝后释放协商缓存，直通阶段不累计历史数据。每层沿用 TLS 每方向 8 MiB 输入上限；一个物理连接最多一个内层解密器及一个有界输出转发器，父连接额度直到两层退出才释放。`KeyWaitTimeout` 从升级 worker 启动统一限制协商、外层与内层握手/密钥等待，阶段切换不延期，成功获得内层密钥或明确保持明文后停止该计时；之后仍有空闲回收。嵌套内层等待超时后结束内层，已就绪的外层继续交付到 EOF/空闲回收，最终仍返回内层错误。半条协商 EOF 返回错误，取消/回调失败沿用排空与背压契约。
+
+独立 [STARTTLS/CONNECT 夹具](../test/fixtures/http_tcp_capture/README.md#d09-tls-upgrade-and-connect-fixtures) 使用 Python 标准库 TLS/MemoryBIO 和真实 loopback 抓包，覆盖七类明文协商及 HTTPS CONNECT 的成功/拒绝连接、TLS 1.3 双向字节、外层/内层独立 secrets、文件和尾部 DSB 流式路径。协商规范依据 [RFC 3207](https://www.rfc-editor.org/rfc/rfc3207.html)、[RFC 2595](https://www.rfc-editor.org/rfc/rfc2595.html)、[RFC 4511](https://www.rfc-editor.org/rfc/rfc4511.html#section-4.14)、[PostgreSQL SSL 协商](https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-SSL)、[MySQL SSLRequest](https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_ssl_request.html) 和 [RFC 9110 CONNECT](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6)。
 
 ### ApplicationProtocol
 

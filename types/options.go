@@ -16,6 +16,10 @@ type DecryptOptions struct {
 	// ApplicationProtocol explicitly selects dot, doh, doq, mqtt (3.1.1), or redis.
 	// Empty retains HTTP detection. It cannot be combined with RawChunks/HTTPEvents.
 	ApplicationProtocol string
+	// TLSUpgrade selects one explicit TCP negotiation before TLS: smtp, imap,
+	// pop3, ldap, postgres, mysql, connect, or https-connect (one nested TLS layer).
+	// Empty starts directly with TLS. Output options apply to the upgraded layer.
+	TLSUpgrade string
 	// HTTPEvents emits incremental HTTP headers, body, SSE, HTTP/2 gRPC messages,
 	// trailers and terminal events.
 	HTTPEvents bool
@@ -38,6 +42,14 @@ type DecryptOptions struct {
 
 // Validate rejects conflicting output modes before consuming any input.
 func (o DecryptOptions) Validate() error {
+	switch o.TLSUpgrade {
+	case "", "smtp", "imap", "pop3", "ldap", "postgres", "mysql", "connect", "https-connect":
+	default:
+		return errors.New("unsupported TLSUpgrade")
+	}
+	if o.TLSUpgrade != "" && o.ApplicationProtocol == "doq" {
+		return errors.New("TLSUpgrade requires TCP, not DoQ")
+	}
 	switch o.ApplicationProtocol {
 	case "", "dot", "doh", "doq", "mqtt", "redis":
 	default:

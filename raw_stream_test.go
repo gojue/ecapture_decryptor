@@ -12,6 +12,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -605,16 +606,19 @@ func TestGRPCCaptureMessagesBeforeEOF(t *testing.T) {
 
 func TestApplicationProtocolOptionsBeforeInput(t *testing.T) {
 	for _, options := range []types.DecryptOptions{
+		{TLSUpgrade: "auto"}, {TLSUpgrade: "smtp", ApplicationProtocol: "doq"},
 		{ApplicationProtocol: "smtp"}, {ApplicationProtocol: "mqtt", RawChunks: true}, {ApplicationProtocol: "doh", HTTPEvents: true}, {ApplicationProtocol: "redis", MaxDecodedBodyBytes: 1},
 	} {
 		calls := 0
-		err := DecryptPcapngStreamWithOptions(context.Background(), io.NopCloser(bytes.NewReader(nil)), func(*types.DecryptedPacket) error { calls++; return nil }, options)
+		err := DecryptPcapngStreamWithOptions(context.Background(), io.NopCloser(nil), func(*types.DecryptedPacket) error { calls++; return nil }, options)
 		if err == nil || calls != 0 {
 			t.Fatalf("invalid options consumed input: %+v", options)
 		}
 	}
-	if err := DecryptWithConfig(NewDecryptorConfig().WithOptions(types.DecryptOptions{ApplicationProtocol: "dot"})); err == nil {
-		t.Fatal("explicit parser without output accepted")
+	for _, options := range []types.DecryptOptions{{ApplicationProtocol: "dot"}, {TLSUpgrade: "smtp"}, {TLSUpgrade: "https-connect", RawChunks: true}} {
+		if err := DecryptWithConfig(NewDecryptorConfig().WithOptions(options)); err == nil || !strings.Contains(err.Error(), "requires a packet channel") {
+			t.Fatal("explicit parsing without output accepted", err)
+		}
 	}
 }
 
@@ -829,6 +833,278 @@ func TestD08CancelAndCallbackFailure(t *testing.T) {
 						}
 					default:
 						t.Fatal("open capture did not stop")
+					}
+				})
+			})
+		}
+	}
+}
+
+func TestD09UpgradeCaptureAPIs(t *testing.T) {
+	for _, name := range []string{"smtp", "imap", "pop3", "ldap", "postgres", "mysql", "connect", "https_connect"} {
+		for _, output := range []string{"messages", "raw", "events"} {
+			for _, streaming := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/stream=%t", name, output, streaming), func(t *testing.T) {
+					options := types.DecryptOptions{TLSUpgrade: strings.ReplaceAll(name, "_", "-"), RawChunks: output == "raw", HTTPEvents: output == "events"}
+					path := "test/testdata/d09_" + name + ".pcapng"
+					depth := 1
+					if name == "https_connect" {
+						depth = 2
+					}
+					var packets []*types.DecryptedPacket
+					if streaming {
+						capture, client, server := quicDSBBlocks(t, path, "test/testdata/d09_upgrade.keys")
+						var innerClient, innerServer []byte
+						if depth == 2 {
+							_, innerClient, innerServer = quicDSBBlocks(t, path, "test/testdata/d09_inner.keys")
+						}
+						synctest.Test(t, func(t *testing.T) {
+							stream := newLiveStreamWithOptions(t, options)
+							stream.write(t, capture)
+							stream.write(t, server)
+							stream.write(t, client)
+							synctest.Wait()
+							stream.assertOpen(t)
+							if depth == 2 {
+								outer := false
+								for _, p := range stream.packets {
+									if p.Metadata["tls_depth"] == 2 {
+										t.Fatal("inner output without inner secrets")
+									}
+									outer = outer || p.Protocol == "tls" && p.Metadata["tls_depth"] == 1 && len(p.Data) > 0
+								}
+								if !outer {
+									t.Fatal("outer plaintext withheld while inner keys were missing")
+								}
+								stream.write(t, innerClient)
+								stream.write(t, innerServer)
+							}
+							synctest.Wait()
+							stream.assertOpen(t)
+							if !slices.ContainsFunc(stream.packets, func(p *types.DecryptedPacket) bool { return p.Metadata["tls_depth"] == depth && len(p.Data) > 0 }) {
+								t.Fatal("upgraded output delayed until EOF")
+							}
+							stream.write(t, client)
+							stream.write(t, server)
+							if err := stream.writer.Close(); err != nil {
+								t.Fatal(err)
+							}
+							synctest.Wait()
+							if err := <-stream.done; err != nil {
+								t.Fatal(err)
+							}
+							packets = stream.packets
+						})
+					} else {
+						packets, _ = decryptD09Capture(t, path, options, true)
+					}
+					connections := map[string]bool{}
+					plaintext := map[string][]byte{}
+					inner := map[string][]byte{}
+					var innerID string
+					ends := 0
+					for _, p := range packets {
+						connections[p.ConnectionID()] = true
+						if p.Protocol == "starttls" {
+							if p.Metadata["tls_depth"] != depth-1 || p.Metadata["upgrade_protocol"] != options.TLSUpgrade {
+								t.Fatal(p.Metadata)
+							}
+							key := p.ConnectionID() + "/" + p.Direction
+							plaintext[key] = append(plaintext[key], p.Data...)
+						}
+						if p.Metadata["tls_depth"] != depth {
+							continue
+						}
+						if p.Metadata["parent_tls_depth"] != depth-1 {
+							t.Fatal("missing parent layer", p.Metadata)
+						}
+						if innerID != "" && innerID != p.ConnectionID() {
+							t.Fatal("rejected connection produced TLS output")
+						}
+						innerID = p.ConnectionID()
+						if output == "events" {
+							if p.Metadata["kind"] == "end" {
+								ends++
+							}
+							if p.Metadata["kind"] != "body_chunk" {
+								continue
+							}
+						} else if output == "raw" {
+							if p.Protocol != "tls" || p.Metadata["offset"] != uint64(len(inner[p.Direction])) {
+								t.Fatal(p.Metadata)
+							}
+						} else if p.Protocol != "http/1.1" {
+							t.Fatal(p.Protocol)
+						}
+						inner[p.Direction] = append(inner[p.Direction], p.Data...)
+					}
+					if len(connections) != 2 || innerID == "" {
+						t.Fatalf("connections=%d upgraded=%q", len(connections), innerID)
+					}
+					refused := false
+					for key, data := range plaintext {
+						if strings.HasPrefix(key, innerID+"/") && bytes.Contains(data, []byte("HTTP/1.1 200 OK")) {
+							t.Fatal("decrypted application bytes leaked into negotiation output")
+						}
+						refused = refused || bytes.Contains(data, []byte("\x16\x03\x03\x00\x10not-a-TLS-record/"+name))
+					}
+					if !refused {
+						t.Fatal("rejected negotiation lost plaintext fake-TLS bytes")
+					}
+					for _, direction := range []string{"request", "response"} {
+						body := []byte("d09/" + name + "/" + direction + "\x00\r\n\xff")
+						want := body
+						if output != "events" {
+							header := "HTTP/1.1 200 OK\r\n"
+							if direction == "request" {
+								header = "POST /d09/" + name + " HTTP/1.1\r\nHost: fixture\r\n"
+							}
+							want = append([]byte(fmt.Sprintf("%sContent-Type: application/octet-stream\r\nContent-Length: %d\r\n\r\n", header, len(body))), body...)
+						}
+						if !bytes.Equal(inner[direction], want) {
+							t.Fatalf("%s bytes: %q, want %q", direction, inner[direction], want)
+						}
+					}
+					if output == "events" && ends != 2 {
+						t.Fatalf("HTTP terminal events %d", ends)
+					}
+				})
+			}
+		}
+	}
+}
+
+func decryptD09Capture(t *testing.T, path string, options types.DecryptOptions, innerKeys bool) ([]*types.DecryptedPacket, error) {
+	t.Helper()
+	keys, err := os.ReadFile("test/testdata/d09_upgrade.keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if innerKeys {
+		inner, err := os.ReadFile("test/testdata/d09_inner.keys")
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys = append(keys, inner...)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	ch := make(chan *types.DecryptedPacket)
+	done := make(chan struct{})
+	var packets []*types.DecryptedPacket
+	go func() {
+		for p := range ch {
+			packets = append(packets, p)
+		}
+		close(done)
+	}()
+	err = DecryptWithConfig(NewDecryptorConfig().WithPcapReader(f).WithSSLKeyLog(bytes.NewReader(keys)).WithPacketChan(ch).WithOptions(options).WithLogger(log.New(io.Discard, "", 0)))
+	close(ch)
+	<-done
+	if innerKeys && err != nil {
+		t.Fatal(err)
+	}
+	return packets, err
+}
+
+func TestD09MissingInnerSecretsPreservesOuter(t *testing.T) {
+	const path = "test/testdata/d09_https_connect.pcapng"
+	options := types.DecryptOptions{TLSUpgrade: "https-connect", KeyWaitTimeout: time.Second}
+	full, _ := decryptD09Capture(t, path, options, true)
+	var diagnostics []types.Diagnostic
+	var mu sync.Mutex
+	options.OnDiagnostic = func(d types.Diagnostic) { mu.Lock(); defer mu.Unlock(); diagnostics = append(diagnostics, d) }
+	partial, err := decryptD09Capture(t, path, options, false)
+	if err == nil {
+		t.Fatal("missing inner keys reported success")
+	}
+	outer := func(packets []*types.DecryptedPacket) map[string][]byte {
+		result := map[string][]byte{}
+		for _, p := range packets {
+			if p.Protocol == "tls" && p.Metadata["tls_depth"] == 1 {
+				key := p.ConnectionID() + "/" + p.Direction
+				result[key] = append(result[key], p.Data...)
+			}
+		}
+		return result
+	}
+	want, got := outer(full), outer(partial)
+	if len(want) != 4 || len(want) != len(got) {
+		t.Fatal("outer directions lost", len(want), len(got))
+	}
+	for key, data := range want {
+		if !bytes.Equal(data, got[key]) {
+			t.Fatal("available outer bytes changed without inner secrets")
+		}
+	}
+	for _, p := range partial {
+		if p.Metadata["tls_depth"] == 2 {
+			t.Fatal("unauthenticated inner plaintext emitted")
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.ContainsFunc(diagnostics, func(d types.Diagnostic) bool { return d.Stage == "tunnel" && d.Code == "inner_tls_unavailable" }) {
+		t.Fatal("missing fixed inner TLS diagnostic", diagnostics)
+	}
+}
+
+func TestD09CancelAndCallbackFailure(t *testing.T) {
+	for _, name := range []string{"smtp", "imap", "pop3", "ldap", "postgres", "mysql", "connect", "https_connect"} {
+		path := "test/testdata/d09_" + name + ".pcapng"
+		capture, client, server := quicDSBBlocks(t, path, "test/testdata/d09_upgrade.keys")
+		var innerClient, innerServer []byte
+		if name == "https_connect" {
+			_, innerClient, innerServer = quicDSBBlocks(t, path, "test/testdata/d09_inner.keys")
+		}
+		for _, canceled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/cancel=%t", name, canceled), func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					r, w := io.Pipe()
+					defer w.Close()
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					want := errors.New("upgraded consumer stopped")
+					done := make(chan error, 1)
+					calls, stopped := 0, false
+					go func() {
+						done <- DecryptPcapngStreamWithOptions(ctx, r, func(p *types.DecryptedPacket) error {
+							if stopped {
+								calls++
+							}
+							if p.Protocol == "http/1.1" && !stopped {
+								stopped = true
+								calls++
+								if canceled {
+									cancel()
+								} else {
+									return want
+								}
+							}
+							return nil
+						}, types.DecryptOptions{TLSUpgrade: strings.ReplaceAll(name, "_", "-")})
+					}()
+					go func() {
+						for _, b := range [][]byte{capture, client, server, innerClient, innerServer} {
+							if len(b) > 0 {
+								_, _ = w.Write(b)
+							}
+						}
+					}()
+					synctest.Wait()
+					select {
+					case err := <-done:
+						if canceled {
+							want = context.Canceled
+						}
+						if !errors.Is(err, want) || calls != 1 {
+							t.Fatalf("calls=%d err=%v", calls, err)
+						}
+					default:
+						t.Fatal("upgraded stream did not stop")
 					}
 				})
 			})

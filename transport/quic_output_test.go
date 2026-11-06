@@ -534,6 +534,12 @@ func TestQUICRawLongOffsetsAndPendingBounds(t *testing.T) {
 }
 
 func TestQUICApplicationSelectionAndALPN(t *testing.T) {
+	q, _ := newQUICOutputTest(t, types.DecryptOptions{TLSUpgrade: "smtp"})
+	if err := q.Decrypt(); err == nil {
+		t.Fatal("TCP upgrade accepted on QUIC")
+	}
+	assertQUICReleased(t, q)
+
 	for _, tc := range []struct {
 		selected, alpn string
 		raw, valid     bool
