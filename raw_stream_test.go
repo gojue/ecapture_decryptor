@@ -606,6 +606,7 @@ func TestGRPCCaptureMessagesBeforeEOF(t *testing.T) {
 
 func TestApplicationProtocolOptionsBeforeInput(t *testing.T) {
 	for _, options := range []types.DecryptOptions{
+		{UDPProtocol: "auto"}, {UDPProtocol: "dtls", ApplicationProtocol: "dot"}, {UDPProtocol: "dtls", TLSUpgrade: "smtp"}, {UDPProtocol: "dtls", HTTPEvents: true}, {UDPProtocol: "dtls", MaxDecodedBodyBytes: 1},
 		{TLSUpgrade: "auto"}, {TLSUpgrade: "smtp", ApplicationProtocol: "doq"},
 		{ApplicationProtocol: "smtp"}, {ApplicationProtocol: "mqtt", RawChunks: true}, {ApplicationProtocol: "doh", HTTPEvents: true}, {ApplicationProtocol: "redis", MaxDecodedBodyBytes: 1},
 	} {
@@ -615,7 +616,7 @@ func TestApplicationProtocolOptionsBeforeInput(t *testing.T) {
 			t.Fatalf("invalid options consumed input: %+v", options)
 		}
 	}
-	for _, options := range []types.DecryptOptions{{ApplicationProtocol: "dot"}, {TLSUpgrade: "smtp"}, {TLSUpgrade: "https-connect", RawChunks: true}} {
+	for _, options := range []types.DecryptOptions{{UDPProtocol: "dtls"}, {ApplicationProtocol: "dot"}, {TLSUpgrade: "smtp"}, {TLSUpgrade: "https-connect", RawChunks: true}} {
 		if err := DecryptWithConfig(NewDecryptorConfig().WithOptions(options)); err == nil || !strings.Contains(err.Error(), "requires a packet channel") {
 			t.Fatal("explicit parsing without output accepted", err)
 		}
@@ -1388,5 +1389,291 @@ func TestD10TLSCaptureInvalidSecrets(t *testing.T) {
 				t.Fatal("unconfirmed outer keys overstated ECH status", diagnostics)
 			}
 		})
+	}
+}
+
+func TestD11QUICDatagramCaptureAPIs(t *testing.T) {
+	const keyPath = "test/testdata/d11_datagram.keys"
+	keys, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, version := range []string{"v1", "v2"} {
+		path := "test/testdata/d11_datagram_" + version + ".pcapng"
+		for _, input := range []string{"file", "late_client", "late_server"} {
+			t.Run(version+"/"+input, func(t *testing.T) {
+				options := types.DecryptOptions{RawChunks: true}
+				var packets []*types.DecryptedPacket
+				if input == "file" {
+					packets, err = decryptTLSCapture(t, path, keys, options)
+					if err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					capture, client, server := quicDSBBlocks(t, path, keyPath)
+					if input == "late_server" {
+						client, server = server, client
+					}
+					synctest.Test(t, func(t *testing.T) {
+						stream := newLiveStreamWithOptions(t, options)
+						writeD11DuplicateCapture(t, stream.write, capture)
+						stream.write(t, client)
+						stream.write(t, server)
+						synctest.Wait()
+						stream.assertOpen(t)
+						if len(stream.packets) != 35 {
+							t.Fatalf("datagrams before EOF = %d, want 35", len(stream.packets))
+						}
+						stream.write(t, client)
+						stream.write(t, server)
+						if err := stream.writer.Close(); err != nil {
+							t.Fatal(err)
+						}
+						synctest.Wait()
+						if err := <-stream.done; err != nil {
+							t.Fatal(err)
+						}
+						packets = stream.packets
+					})
+				}
+				type flow struct {
+					mode              string
+					request, response []string
+				}
+				flows := map[string]*flow{}
+				for _, p := range packets {
+					if p.Protocol != "quic" || p.Transport != "udp" || p.Metadata["kind"] != "datagram" {
+						t.Fatalf("unexpected datagram output: %+v", p)
+					}
+					for _, key := range []string{"stream_id", "offset", "end"} {
+						if _, ok := p.Metadata[key]; ok {
+							t.Fatalf("datagram carries stream metadata %q", key)
+						}
+					}
+					f := flows[p.ConnectionID()]
+					if f == nil {
+						f = &flow{mode: "seed"}
+						flows[p.ConnectionID()] = f
+					}
+					if p.Metadata["encryption_level"] == "0rtt" {
+						mode, ok := p.Metadata["early_data"].(string)
+						if !ok || (mode != "accepted" && mode != "rejected") || p.Direction != "request" || string(p.Data) != "early\x00\xff" || f.mode != "seed" {
+							t.Fatalf("invalid early datagram: %+v", p)
+						}
+						f.mode = mode
+					} else if p.Metadata["encryption_level"] != "1rtt" {
+						t.Fatal("missing datagram encryption level", p.Metadata)
+					}
+					switch p.Direction {
+					case "request":
+						f.request = append(f.request, string(p.Data))
+					case "response":
+						f.response = append(f.response, string(p.Data))
+					default:
+						t.Fatal("unknown direction", p.Direction)
+					}
+				}
+				modes := map[string]int{}
+				for _, f := range flows {
+					want := []string{"", "\x00\xffD11", "repeat", "repeat", "tail"}
+					if f.mode != "seed" {
+						want = append([]string{"early\x00\xff"}, want...)
+					}
+					if !slices.Equal(f.response, want) {
+						t.Fatalf("%s response = %q, want %q", f.mode, f.response, want)
+					}
+					if f.mode == "rejected" {
+						want = append([]string{"early\x00\xff"}, want...)
+					}
+					if !slices.Equal(f.request, want) {
+						t.Fatalf("%s request = %q, want %q", f.mode, f.request, want)
+					}
+					modes[f.mode]++
+				}
+				if len(modes) != 3 || modes["seed"] != 1 || modes["accepted"] != 1 || modes["rejected"] != 1 {
+					t.Fatal("wrong connection/mode counts", modes)
+				}
+			})
+		}
+		t.Run(version+"/requires_raw", func(t *testing.T) {
+			packets, err := decryptTLSCapture(t, path, keys, types.DecryptOptions{})
+			if err == nil || len(packets) != 0 {
+				t.Fatalf("unknown ALPN without raw: outputs=%d err=%v", len(packets), err)
+			}
+		})
+	}
+}
+
+// Replay each real EPB twice to model duplicated capture input; packet bytes and
+// timestamps are unchanged. This checks record/packet identity, not payload dedupe.
+func writeD11DuplicateCapture(t *testing.T, write func(*testing.T, []byte), capture []byte) {
+	t.Helper()
+	for len(capture) > 0 {
+		if len(capture) < 12 {
+			t.Fatal("short capture block")
+		}
+		n := int(binary.LittleEndian.Uint32(capture[4:8]))
+		if n < 12 || n > len(capture) {
+			t.Fatal("invalid capture block length")
+		}
+		write(t, capture[:n])
+		if binary.LittleEndian.Uint32(capture[:4]) == 6 {
+			write(t, capture[:n])
+		}
+		capture = capture[n:]
+	}
+}
+
+func TestD11DTLSCaptureAPIs(t *testing.T) {
+	keys, err := os.ReadFile("test/testdata/d11_dtls.keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, suite := range []string{"aes128", "aes256"} {
+		path := "test/testdata/d11_dtls_" + suite + ".pcapng"
+		for _, raw := range []bool{false, true} {
+			for _, streaming := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/raw=%t/stream=%t", suite, raw, streaming), func(t *testing.T) {
+					options := types.DecryptOptions{UDPProtocol: "dtls", RawChunks: raw}
+					var packets []*types.DecryptedPacket
+					if !streaming {
+						var err error
+						packets, err = decryptTLSCapture(t, path, keys, options)
+						if err != nil {
+							t.Fatal(err)
+						}
+					} else {
+						capture, err := os.ReadFile(path)
+						if err != nil {
+							t.Fatal(err)
+						}
+						synctest.Test(t, func(t *testing.T) {
+							stream := newLiveStreamWithOptions(t, options)
+							writeD11DuplicateCapture(t, stream.write, capture)
+							synctest.Wait()
+							if len(stream.packets) != 0 {
+								t.Fatal("DTLS emitted before master secret")
+							}
+							stream.write(t, tlsFixtureDSB(t, keys))
+							synctest.Wait()
+							stream.assertOpen(t)
+							if len(stream.packets) != 8 {
+								t.Fatalf("DTLS datagrams before EOF=%d, want 8", len(stream.packets))
+							}
+							stream.write(t, tlsFixtureDSB(t, keys))
+							if err := stream.writer.Close(); err != nil {
+								t.Fatal(err)
+							}
+							synctest.Wait()
+							if err := <-stream.done; err != nil {
+								t.Fatal(err)
+							}
+							packets = stream.packets
+						})
+					}
+					connections, counts := map[string]bool{}, map[string]int{}
+					for _, p := range packets {
+						connections[p.ConnectionID()] = true
+						counts[p.Direction]++
+						want := "dtls request\x00\xff\r\n"
+						if p.Direction == "response" {
+							want = "dtls response\x00\xfe\r\n"
+						} else if p.Direction != "request" {
+							t.Fatal("invalid direction", p.Direction)
+						}
+						if p.Protocol != "dtls" || p.Transport != "udp" || p.Metadata["kind"] != "datagram" || p.Metadata["epoch"] != uint16(1) || p.Metadata["sequence"] != uint64(counts[p.Direction]) || string(p.Data) != want {
+							t.Fatalf("unexpected DTLS record: %+v", p)
+						}
+						for _, key := range []string{"offset", "end", "stream_id"} {
+							if _, ok := p.Metadata[key]; ok {
+								t.Fatal("DTLS record carries stream metadata", key)
+							}
+						}
+					}
+					if len(connections) != 1 || counts["request"] != 4 || counts["response"] != 4 {
+						t.Fatal("DTLS capture counts", len(connections), counts)
+					}
+				})
+			}
+		}
+		for _, invalid := range []string{"missing", "wrong"} {
+			t.Run(suite+"/"+invalid, func(t *testing.T) {
+				var bad []byte
+				if invalid == "wrong" {
+					for _, line := range bytes.Split(keys, []byte{'\n'}) {
+						f := bytes.Fields(line)
+						if len(f) == 3 && string(f[0]) == "CLIENT_RANDOM" {
+							f[2] = bytes.Repeat([]byte{'0'}, 96)
+							bad = append(bad, append(bytes.Join(f, []byte{' '}), '\n')...)
+						}
+					}
+				}
+				packets, err := decryptTLSCapture(t, path, bad, types.DecryptOptions{UDPProtocol: "dtls"})
+				if err == nil || len(packets) != 0 {
+					t.Fatalf("invalid DTLS keys: output=%d err=%v", len(packets), err)
+				}
+			})
+		}
+	}
+}
+
+func TestD11DatagramCallbackFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name, key string
+		options   types.DecryptOptions
+	}{
+		{"datagram_v1", "datagram", types.DecryptOptions{RawChunks: true}},
+		{"datagram_v2", "datagram", types.DecryptOptions{RawChunks: true}},
+		{"dtls_aes128", "dtls", types.DecryptOptions{UDPProtocol: "dtls"}},
+		{"dtls_aes256", "dtls", types.DecryptOptions{UDPProtocol: "dtls"}},
+	} {
+		capture, err := os.ReadFile("test/testdata/d11_" + tc.name + ".pcapng")
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys, err := os.ReadFile("test/testdata/d11_" + tc.key + ".keys")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, canceled := range []bool{false, true} {
+			if canceled && tc.options.UDPProtocol != "dtls" {
+				continue
+			}
+			t.Run(fmt.Sprintf("%s/cancel=%t", tc.name, canceled), func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					r, w := io.Pipe()
+					defer w.Close()
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					want := errors.New("datagram consumer stopped")
+					calls := 0
+					done := make(chan error, 1)
+					go func() {
+						done <- DecryptPcapngStreamWithOptions(ctx, r, func(*types.DecryptedPacket) error {
+							calls++
+							if canceled {
+								cancel()
+								return nil
+							}
+							return want
+						}, tc.options)
+					}()
+					keyBlock := tlsFixtureDSB(t, keys)
+					go func() { _, _ = w.Write(capture); _, _ = w.Write(keyBlock) }()
+					synctest.Wait()
+					select {
+					case err := <-done:
+						if canceled {
+							want = context.Canceled
+						}
+						if !errors.Is(err, want) || calls != 1 {
+							t.Fatalf("calls=%d err=%v", calls, err)
+						}
+					default:
+						t.Fatal("datagram stream did not stop and drain")
+					}
+				})
+			})
+		}
 	}
 }

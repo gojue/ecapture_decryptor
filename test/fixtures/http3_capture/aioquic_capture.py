@@ -16,7 +16,7 @@ from aioquic.asyncio import QuicConnectionProtocol, connect, serve
 from aioquic.h3.connection import H3Connection, Setting, FrameType, HeadersState, encode_frame
 from aioquic.h3.events import DataReceived, HeadersReceived, PushPromiseReceived
 from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.events import HandshakeCompleted, StreamReset
+from aioquic.quic.events import DatagramFrameReceived, HandshakeCompleted, StreamReset
 from aioquic.quic.logger import QuicLogger
 from aioquic.tls import CipherSuite
 
@@ -330,11 +330,89 @@ async def run(args):
     print(json.dumps(HTTP.evidence, indent=2))
 
 
+class DatagramPeer(QuicConnectionProtocol):
+    """Independent RFC 9221 endpoint; no HTTP or stream framing."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.received = asyncio.Queue()
+        self.handshake = None
+
+    def quic_event_received(self, event):
+        if isinstance(event, HandshakeCompleted):
+            self.handshake = event
+        elif isinstance(event, DatagramFrameReceived):
+            if self._quic.configuration.is_client:
+                self.received.put_nowait(event.data)
+            else:
+                self._quic.send_datagram_frame(event.data)
+                self.transmit()
+
+
+async def run_datagram(args):
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=True)
+    qlog, evidence = QuicLogger(), []
+    payloads = [b"", b"\x00\xffD11", b"repeat", b"repeat", b"tail"]
+    early = b"early\x00\xff"
+    with (output / "d11_datagram.keys").open("w") as secrets:
+        for version, port in [(1, 44465), (0x6B3343CF, 44466)]:
+            tickets, received = {}, []
+            for mode in ["seed", "accepted", "rejected"]:
+                if mode == "rejected":
+                    tickets.clear()
+                common = dict(alpn_protocols=["fixture-datagram"], supported_versions=[version],
+                    cipher_suites=[CipherSuite.AES_128_GCM_SHA256], secrets_log_file=secrets,
+                    quic_logger=qlog, max_datagram_frame_size=65535)
+                config = QuicConfiguration(is_client=False, **common)
+                config.load_cert_chain(args.cert, args.key)
+                server = await serve("127.0.0.1", port, configuration=config, create_protocol=DatagramPeer,
+                    session_ticket_fetcher=tickets.get,
+                    session_ticket_handler=lambda ticket: tickets.__setitem__(ticket.ticket, ticket))
+                config = QuicConfiguration(is_client=True, verify_mode=ssl.CERT_NONE,
+                    session_ticket=received[-1] if mode != "seed" else None, **common)
+                try:
+                    async with connect("127.0.0.1", port, configuration=config, create_protocol=DatagramPeer,
+                            session_ticket_handler=received.append, wait_connected=(mode == "seed")) as client:
+                        if mode != "seed":
+                            client._quic.send_datagram_frame(early)
+                            client.transmit()
+                            await client.wait_connected()
+                        assert client.handshake.early_data_accepted == (mode == "accepted")
+                        assert client._quic._version == version
+                        assert client._quic.tls.key_schedule.cipher_suite == CipherSuite.AES_128_GCM_SHA256
+                        # DATAGRAM is not retransmitted by QUIC. The application
+                        # explicitly resends rejected early bytes as a new 1-RTT message.
+                        if mode == "rejected":
+                            client._quic.send_datagram_frame(early)
+                        for payload in payloads:
+                            client._quic.send_datagram_frame(payload)
+                        client.transmit()
+                        expected = ([early] if mode != "seed" else []) + payloads
+                        actual = [await asyncio.wait_for(client.received.get(), 10) for _ in expected]
+                        assert actual == expected, (mode, actual)
+                        await asyncio.sleep(0.05)
+                        assert client.received.empty()
+                        assert received
+                        evidence.append(dict(version=hex(version), mode=mode, suite="AES_128_GCM_SHA256",
+                            resumed=client.handshake.session_resumed,
+                            early_accepted=client.handshake.early_data_accepted,
+                            responses=[x.hex() for x in actual]))
+                finally:
+                    server.close()
+                await asyncio.sleep(0.05)
+    (output / "datagram.qlog").write_text(json.dumps(qlog.to_dict()))
+    (output / "datagram-evidence.json").write_text(json.dumps(evidence, indent=2))
+    print(json.dumps(evidence, indent=2))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cert", required=True)
     parser.add_argument("--key", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--dynamic", action="store_true", help="generate the D05 dynamic QPACK/message fixture")
+    parser.add_argument("--datagram", action="store_true", help="generate the D11 QUIC DATAGRAM fixture")
     args = parser.parse_args()
-    asyncio.run(run_dynamic(args) if args.dynamic else run(args))
+    if args.dynamic and args.datagram:
+        parser.error("choose one fixture mode")
+    asyncio.run(run_datagram(args) if args.datagram else run_dynamic(args) if args.dynamic else run(args))

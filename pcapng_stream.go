@@ -49,7 +49,7 @@ func DecryptPcapngStreamWithOptions(ctx context.Context, input io.ReadCloser, em
 			callbackMu.Lock()
 			failed := callbackErr != nil
 			callbackMu.Unlock()
-			if failed || (options.HTTPEvents || options.ApplicationProtocol != "" || options.TLSUpgrade != "") && ctx.Err() != nil {
+			if failed || (options.HTTPEvents || options.ApplicationProtocol != "" || options.TLSUpgrade != "" || options.UDPProtocol == "dtls") && ctx.Err() != nil {
 				continue // Drain producers after reporting the first callback failure.
 			}
 			if err := emit(packet); err != nil {

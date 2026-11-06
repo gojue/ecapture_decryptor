@@ -119,6 +119,9 @@ func init() {
 
 	// Register UDP/QUIC decryptor
 	RegisterDecryptor("udp", func(key types.ConnectionKey, f *DecryptorFactory) types.Decryptor {
+		if f.options.UDPProtocol == "dtls" {
+			return transport.NewDTLSDecryptor(key, f.keyLog, f.packetChan)
+		}
 		return transport.NewQUICDecryptor(
 			key,
 			f.keyLog,

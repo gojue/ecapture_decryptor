@@ -97,7 +97,7 @@ func DecryptWithConfig(config *DecryptorConfig) error {
 	if err := config.options.Validate(); err != nil {
 		return err
 	}
-	if (config.options.HTTPEvents || config.options.ApplicationProtocol != "" || config.options.TLSUpgrade != "") && config.packetChan == nil {
+	if (config.options.HTTPEvents || config.options.ApplicationProtocol != "" || config.options.TLSUpgrade != "" || config.options.UDPProtocol == "dtls") && config.packetChan == nil {
 		return errors.New("application parsing requires a packet channel")
 	}
 	if config.logger == nil {
@@ -397,7 +397,11 @@ func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.Tr
 		ProcessName: "decryptor",
 	}
 	if key.Proto == types.TransportProtocolUDP {
-		e.handleQUICPacket(key, transportLayer.GetPayload(), packetTime)
+		if e.factory.options.UDPProtocol == "dtls" {
+			e.handleDTLSPacket(key, transportLayer.GetPayload(), packetTime)
+		} else {
+			e.handleQUICPacket(key, transportLayer.GetPayload(), packetTime)
+		}
 		return
 	}
 	rkey := key.Reverse()
@@ -565,5 +569,74 @@ func (e *DecryptorEngine) closeAllConnections() {
 	e.mu.RUnlock()
 	for _, dec := range connections {
 		_ = dec.Close()
+	}
+}
+
+// DTLS has no CID routing or TCP SYN. One captured UDP tuple identifies the
+// association until EOF/idle reclamation; cookie retries remain on that tuple.
+func (e *DecryptorEngine) handleDTLSPacket(key types.ConnectionKey, data []byte, at time.Time) {
+	base, reverse := key.String(), key.Reverse().String()
+	e.mu.Lock()
+	ct, reversed := e.conntrack[base], false
+	mapKey := base
+	if ct == nil {
+		ct, reversed, mapKey = e.conntrack[reverse], true, reverse
+	}
+	if ct != nil {
+		e.lastActivity[mapKey] = time.Now()
+	}
+	e.mu.Unlock()
+	if ct == nil {
+		e.mu.Lock()
+		if e.active >= e.factory.options.ConnectionLimit() {
+			e.mu.Unlock()
+			if !e.limitReported {
+				e.limitReported = true
+				e.factory.options.Report(key, "input", "connection_limit")
+				e.recordConnectionError(errors.New("active connection limit exceeded"))
+			}
+			return
+		}
+		e.nextGeneration++
+		key.Generation = e.nextGeneration
+		e.mu.Unlock()
+		ct = e.factory.Create(key)
+		if ct == nil {
+			return
+		}
+		mapKey, reversed = base, false
+		e.mu.Lock()
+		e.conntrack[mapKey] = ct
+		if e.lastActivity == nil {
+			e.lastActivity = make(map[string]time.Time)
+		}
+		e.lastActivity[mapKey] = time.Now()
+		e.active++
+		e.connections.Add(1)
+		e.mu.Unlock()
+		go func() {
+			defer e.connections.Done()
+			if err := ct.Decrypt(); err != nil {
+				e.recordConnectionError(fmt.Errorf("decrypt DTLS connection %s: %w", ct.GetAddr(), err))
+			}
+			e.mu.Lock()
+			if e.conntrack[mapKey] == ct {
+				delete(e.conntrack, mapKey)
+				delete(e.lastActivity, mapKey)
+			}
+			e.active--
+			e.mu.Unlock()
+		}()
+	}
+	ct.SetPacketTime(at)
+	var err error
+	if reversed {
+		err = ct.FeedServer(data)
+	} else {
+		err = ct.FeedClient(data)
+	}
+	if err != nil {
+		e.recordConnectionError(err)
+		_ = ct.Close()
 	}
 }

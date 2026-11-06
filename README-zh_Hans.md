@@ -57,6 +57,8 @@ Go API 可通过 `TLSUpgrade` 显式选择 SMTP、IMAP、POP3、LDAP、PostgreSQ
 
 TLS 1.3 支持经认证的分方向 KeyUpdate 与 record 序号重置、跨 record 握手消息、普通 HRR 和会话恢复。early data 与 ECH 需要对应密钥，并明确区分接受状态和随机数关联边界。各套件实测证据及未支持组合见 [TLS 能力矩阵](docs/API.md#tls-版本与状态)。
 
+QUIC raw 模式保留 RFC 9221 DATAGRAM 消息边界，支持空消息及明确的 early-data 状态。Go 调用方可用 `UDPProtocol: "dtls"` 选择 DTLS 1.2 ECDHE-RSA AES-128/256-GCM 数据报，密钥为 `CLIENT_RANDOM` master secret。[输出契约及限制](docs/API.md#数据报输出)不包含 WebTransport、MASQUE 或 WebRTC 应用支持。
+
 ### QUIC / HTTP/3 输入要求
 
 解密 HTTP/3 需要包含客户端 Initial（其中有 ClientHello）的双向 UDP 抓包，以及匹配该连接的 TLS 1.3 SSLKEYLOG。密钥可作为外部文件传入，也可放在 pcapng 的 DSB 中。解析器按 QUIC 连接、包号和 STREAM 偏移重组数据，再按 HTTP/3 请求流输出 `http/3` 的 `DecryptedPacket`。

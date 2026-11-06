@@ -10,8 +10,12 @@ import (
 
 // DecryptOptions controls output and connection resource boundaries.
 type DecryptOptions struct {
-	// RawChunks emits authenticated TLS bytes or QUIC STREAM chunks instead of
-	// parsed application messages. Chunk boundaries are not message boundaries.
+	// UDPProtocol selects "dtls" for DTLS 1.2 AES-GCM datagram output.
+	// Empty or "quic" retains QUIC. TCP continues to use TLS.
+	UDPProtocol string
+	// RawChunks emits authenticated TLS bytes, QUIC STREAM chunks and QUIC
+	// DATAGRAM messages instead of parsed application messages. Stream chunk
+	// boundaries are not message boundaries; DATAGRAM boundaries are preserved.
 	RawChunks bool
 	// ApplicationProtocol explicitly selects dot, doh, doq, mqtt (3.1.1), or redis.
 	// Empty retains HTTP detection. It cannot be combined with RawChunks/HTTPEvents.
@@ -42,6 +46,15 @@ type DecryptOptions struct {
 
 // Validate rejects conflicting output modes before consuming any input.
 func (o DecryptOptions) Validate() error {
+	switch o.UDPProtocol {
+	case "", "quic":
+	case "dtls":
+		if o.ApplicationProtocol != "" || o.TLSUpgrade != "" || o.HTTPEvents || o.MaxDecodedBodyBytes != 0 {
+			return errors.New("DTLS conflicts with application/HTTP/upgrade options")
+		}
+	default:
+		return errors.New("unsupported UDPProtocol")
+	}
 	switch o.TLSUpgrade {
 	case "", "smtp", "imap", "pop3", "ldap", "postgres", "mysql", "connect", "https-connect":
 	default:

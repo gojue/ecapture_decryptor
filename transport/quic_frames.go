@@ -335,6 +335,9 @@ func (q *QUICDecryptor) parseQUICFrames(plaintext []byte, level int, isClient bo
 				return err
 			}
 		case frameType == 0x30 || frameType == 0x31:
+			if level != quicLevelApplication && level != quicLevelEarly || level == quicLevelEarly && !isClient {
+				return errors.New("QUIC DATAGRAM at invalid encryption level")
+			}
 			length := uint64(len(data))
 			if frameType == 0x31 {
 				var err error
@@ -343,8 +346,20 @@ func (q *QUICDecryptor) parseQUICFrames(plaintext []byte, level int, isClient bo
 					return err
 				}
 			}
-			if _, err := consumeQUICBytes(&data, length); err != nil {
+			part, err := consumeQUICBytes(&data, length)
+			if err != nil {
 				return err
+			}
+			if q.options.RawChunks && q.packetChan != nil {
+				waitEarly := isClient && (q.flow.early.seen && q.flow.early.status == "" || q.flow.pendingLevels[0][quicLevelEarly] || q.flow.retryingEarly)
+				if level == quicLevelEarly || waitEarly {
+					if err := q.queueQUICEarly(quicEarlyFrame{data: part, datagram: true, application: level == quicLevelApplication, at: at}); err != nil {
+						reported = true
+						return err
+					}
+				} else {
+					q.emitQUICDatagram(part, isClient, at)
+				}
 			}
 		default:
 			q.options.Report(q.connectionInfo, "protocol", "unsupported_frame")
@@ -487,6 +502,17 @@ func (q *QUICDecryptor) annotateQUICEarly(packet *types.DecryptedPacket) {
 	}
 }
 
+func (q *QUICDecryptor) emitQUICDatagram(data []byte, isClient bool, at time.Time) {
+	direction := "response"
+	if isClient {
+		direction = "request"
+	}
+	packet := types.NewDecryptedPacket(types.TransportProtocolUDP, "quic", direction, bytes.Clone(data), at, q.connectionInfo)
+	packet.WithMetadata("kind", "datagram").WithMetadata("encryption_level", "1rtt")
+	q.annotateQUICEarly(packet)
+	q.packetChan <- packet
+}
+
 // ServerHello selects the suite. Only authenticated EncryptedExtensions can
 // confirm that early data was accepted; packet decryption alone cannot do so.
 func (q *QUICDecryptor) observeServerCrypto(level int, offset uint64, data []byte) error {
@@ -564,7 +590,10 @@ func (q *QUICDecryptor) observeServerCrypto(level int, offset uint64, data []byt
 			if q.flow.early.seen {
 				q.options.Report(q.connectionInfo, "handshake", "early_data_"+status)
 			}
-			return q.flushQUICEarly()
+			if !q.flow.pendingLevels[0][quicLevelEarly] && !q.flow.retryingEarly {
+				return q.flushQUICEarly()
+			}
+			return nil
 		}
 		buffer.Next(size + 4)
 	}
@@ -588,11 +617,14 @@ func (q *QUICDecryptor) queueQUICEarly(frame quicEarlyFrame) error {
 	frame.data = bytes.Clone(frame.data)
 	early.frames = append(early.frames, frame)
 	early.bytes += len(frame.data)
-	if early.status != "" {
+	if early.status != "" && !q.flow.pendingLevels[0][quicLevelEarly] && !q.flow.retryingEarly {
 		return q.flushQUICEarly()
 	}
 	if early.since.IsZero() {
 		early.since = time.Now()
+		if pending := q.flow.pendingSince; !pending.IsZero() && pending.Before(early.since) {
+			early.since = pending
+		}
 	}
 	return nil
 }
@@ -618,17 +650,26 @@ func (q *QUICDecryptor) flushQUICEarly() error {
 		q.flow.streams, early.streams = early.streams, q.flow.streams
 		defer func() { q.flow.streams, early.streams = early.streams, q.flow.streams }()
 	}
-	early.emitting = true
 	defer func() { early.emitting = false }()
-	for _, frame := range frames {
-		var err error
-		if frame.reset {
-			err = q.resetQUICStream(frame.id, frame.offset, frame.errorCode, true, frame.at)
-		} else {
-			err = q.feedQUICStream(frame.id, frame.offset, frame.data, frame.fin, true, frame.at)
-		}
-		if err != nil {
-			return err
+	// A late early secret can authenticate 0-RTT after 1-RTT was queued. Deliver
+	// the early phase first without sorting or reassembling DATAGRAM messages.
+	for _, application := range []bool{false, true} {
+		early.emitting = !application
+		for _, frame := range frames {
+			if frame.application != application {
+				continue
+			}
+			var err error
+			if frame.datagram {
+				q.emitQUICDatagram(frame.data, true, frame.at)
+			} else if frame.reset {
+				err = q.resetQUICStream(frame.id, frame.offset, frame.errorCode, true, frame.at)
+			} else {
+				err = q.feedQUICStream(frame.id, frame.offset, frame.data, frame.fin, true, frame.at)
+			}
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -656,7 +697,9 @@ func (q *QUICDecryptor) quicWaitExpired() error {
 		}
 	}
 	if !q.flow.early.since.IsZero() && time.Since(q.flow.early.since) >= q.options.SecretWaitTimeout() {
-		return q.finishQUICEarly()
+		if err := q.finishQUICEarly(); err != nil {
+			return err
+		}
 	}
 	q.options.Report(q.connectionInfo, "keys", "key_wait_timeout")
 	return errors.New("timed out waiting for QUIC secrets")

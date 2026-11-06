@@ -57,6 +57,8 @@ Go callers can explicitly select `TLSUpgrade` for SMTP, IMAP, POP3, LDAP, Postgr
 
 TLS 1.3 supports authenticated, directional KeyUpdate with record sequence resets, fragmented handshake messages, ordinary HRR and session resumption. Early data and ECH require their corresponding secrets and retain explicit acceptance/association boundaries. See the [TLS version, suite and state evidence](docs/API.md#tls-版本与状态); unsupported combinations are listed there.
 
+QUIC raw mode preserves RFC 9221 DATAGRAM message boundaries, including empty messages and explicit early-data status. Go callers can select `UDPProtocol: "dtls"` for DTLS 1.2 ECDHE-RSA AES-128/256-GCM datagrams with `CLIENT_RANDOM` secrets. See [datagram output and limits](docs/API.md#数据报输出); this does not add WebTransport, MASQUE or WebRTC application support.
+
 ### QUIC / HTTP/3 input requirements
 
 Decrypting HTTP/3 requires a bidirectional UDP capture that includes the client Initial (containing the ClientHello), plus the matching TLS 1.3 SSLKEYLOG. Keys may be provided as an external file or inside the pcapng DSB. The parser reassembles data by QUIC connection, packet number, and STREAM offset, then emits `http/3` `DecryptedPacket` values per HTTP/3 request stream.
