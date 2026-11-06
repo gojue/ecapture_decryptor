@@ -999,6 +999,10 @@ func (p *HTTP3StreamParser) resetStream(id uint64, client bool, meta map[string]
 	if p.quicErr != nil {
 		return p.quicErr
 	}
+	if err := p.events.resetDoH(id); err != nil {
+		p.quicErr = err
+		return err
+	}
 	if id&2 != 0 {
 		u := p.quicUni[id]
 		if u != nil && u.typed && (u.kind == 0 || u.kind == 2 || u.kind == 3) {
@@ -1053,7 +1057,7 @@ func (p *HTTP3StreamParser) closeHTTP3() error {
 	}
 	p.quicClosed = true
 	defer p.events.abort()
-	incomplete := false
+	incomplete := p.events.incompleteDoH()
 	for _, s := range p.quicStreams {
 		for _, m := range []*http3QUICMessage{&s.request, &s.response} {
 			if m.started && !m.finished {

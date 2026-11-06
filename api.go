@@ -97,8 +97,8 @@ func DecryptWithConfig(config *DecryptorConfig) error {
 	if err := config.options.Validate(); err != nil {
 		return err
 	}
-	if config.options.HTTPEvents && config.packetChan == nil {
-		return errors.New("HTTPEvents requires a packet channel")
+	if (config.options.HTTPEvents || config.options.ApplicationProtocol != "") && config.packetChan == nil {
+		return errors.New("application parsing requires a packet channel")
 	}
 	if config.logger == nil {
 		config.logger = log.New(os.Stdout, "", 0)
@@ -539,10 +539,8 @@ func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.Tr
 		}
 	}
 	if tcp, ok := transportLayer.(*transport.TCPAdapter); ok && tcp.RST {
-		if e.factory.options.HTTPEvents {
-			if reset, ok := ct.(interface{ ObserveTCPReset() }); ok {
-				reset.ObserveTCPReset()
-			}
+		if reset, ok := ct.(interface{ ObserveTCPReset() }); ok {
+			reset.ObserveTCPReset()
 		}
 		// End both byte streams but preserve the bounded wait for a late DSB.
 		// Close also cancels key acquisition and is reserved for engine shutdown.

@@ -228,7 +228,7 @@ func (q *QUICDecryptor) parseQUICFrames(plaintext []byte, level int, isClient bo
 					return err
 				}
 			}
-			if level == quicLevelApplication && (q.http3Parser != nil || q.options.RawChunks && q.packetChan != nil) {
+			if level == quicLevelApplication && (q.http3Parser != nil || q.doqParser != nil || q.options.RawChunks && q.packetChan != nil) {
 				if err := q.feedQUICStream(id, offset, part, frameType&1 != 0, isClient, at); err != nil {
 					reported = true
 					return err
@@ -423,7 +423,7 @@ func (q *QUICDecryptor) feedQUICStream(id, offset uint64, data []byte, fin, isCl
 		last := complete && index == len(parts)-1
 		if q.options.RawChunks {
 			q.emitQUICChunk(id, next, part, last, isClient, at)
-		} else if err := q.http3Parser.FeedQUICStream(id, isClient, part, last, at); err != nil {
+		} else if err := q.feedApplicationStream(id, isClient, part, last, at); err != nil {
 			q.reportHTTP3Error(err)
 			return err
 		}
@@ -432,7 +432,7 @@ func (q *QUICDecryptor) feedQUICStream(id, offset uint64, data []byte, fin, isCl
 	if complete && len(parts) == 0 {
 		if q.options.RawChunks {
 			q.emitQUICChunk(id, next, nil, true, isClient, at)
-		} else if err := q.http3Parser.FeedQUICStream(id, isClient, nil, true, at); err != nil {
+		} else if err := q.feedApplicationStream(id, isClient, nil, true, at); err != nil {
 			q.reportHTTP3Error(err)
 			return err
 		}
@@ -529,6 +529,7 @@ func (q *QUICDecryptor) observeServerCrypto(level int, offset uint64, data []byt
 				return errors.New("invalid QUIC EncryptedExtensions")
 			}
 			status := "rejected"
+			seenALPN := false
 			for ext := body[2:]; len(ext) > 0; {
 				if len(ext) < 4 {
 					return errors.New("truncated QUIC TLS extension")
@@ -536,6 +537,19 @@ func (q *QUICDecryptor) observeServerCrypto(level int, offset uint64, data []byt
 				typ, n := binary.BigEndian.Uint16(ext), int(binary.BigEndian.Uint16(ext[2:]))
 				if n > len(ext)-4 {
 					return errors.New("truncated QUIC TLS extension body")
+				}
+				if typ == 16 {
+					if seenALPN {
+						return errors.New("duplicate QUIC ALPN selection")
+					}
+					seenALPN = true
+					value := ext[4 : 4+n]
+					if len(value) < 3 || int(binary.BigEndian.Uint16(value)) != len(value)-2 || int(value[2]) != len(value)-3 || value[2] == 0 {
+						return errors.New("invalid QUIC ALPN selection")
+					}
+					if err := q.checkApplicationALPN(string(value[3:])); err != nil {
+						return err
+					}
 				}
 				if typ == 42 {
 					if n != 0 || status == "accepted" {
@@ -589,6 +603,11 @@ func (q *QUICDecryptor) flushQUICEarly() error {
 	early.frames, early.bytes, early.since = nil, 0, time.Time{}
 	if !q.options.RawChunks && early.status != "accepted" {
 		return nil
+	}
+	if q.doqParser != nil && len(frames) != 0 {
+		err := errors.New("DoQ early data is not supported")
+		q.reportHTTP3Error(err)
+		return err
 	}
 	// Rejected / unconfirmed raw bytes use a separate offset space. Accepted
 	// data shares the normal assembler, suppressing duplicate 1-RTT delivery.
@@ -684,7 +703,12 @@ func (q *QUICDecryptor) resetQUICStream(id, final, code uint64, client bool, at 
 	s.finished = true
 	s.pending = nil
 	s.pendingBytes = 0
-	if q.http3Parser != nil {
+	if q.doqParser != nil {
+		if err := q.doqParser.ResetQUICStream(id, client, code); err != nil {
+			q.reportHTTP3Error(err)
+			return err
+		}
+	} else if q.http3Parser != nil {
 		if err := q.http3Parser.ResetQUICStreamWithCode(id, client, code); err != nil {
 			q.reportHTTP3Error(err)
 			return err
@@ -711,4 +735,31 @@ func (q *QUICDecryptor) reportHTTP3Error(err error) {
 	q.options.Report(q.connectionInfo, "protocol", code)
 	q.flow.terminalErr = err
 	_ = q.Close()
+}
+
+func (q *QUICDecryptor) feedApplicationStream(id uint64, client bool, data []byte, fin bool, at time.Time) error {
+	if q.doqParser != nil {
+		if q.flow.early.emitting {
+			return errors.New("DoQ early data is not supported")
+		}
+		return q.doqParser.FeedQUICStream(id, client, data, fin, at)
+	}
+	return q.http3Parser.FeedQUICStream(id, client, data, fin, at)
+}
+func (q *QUICDecryptor) checkApplicationALPN(alpn string) error {
+	if q.options.RawChunks {
+		return nil
+	}
+	expected := "h3"
+	if q.options.ApplicationProtocol == "doq" {
+		expected = "doq"
+	}
+	if alpn != expected && !(expected == "h3" && alpn == "h3-29") {
+		err := errors.New("QUIC ALPN does not match the selected application parser; use explicit raw output")
+		q.options.Report(q.connectionInfo, "protocol", "unsupported_protocol")
+		q.flow.terminalErr = err
+		_ = q.Close()
+		return err
+	}
+	return nil
 }

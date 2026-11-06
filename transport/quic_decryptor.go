@@ -86,6 +86,7 @@ type QUICDecryptor struct {
 
 	// HTTP/3 parser for HAR output
 	http3Parser *protocol.HTTP3StreamParser
+	doqParser   *protocol.DoQStreamParser
 }
 
 // QUICKeys holds encryption keys for a direction
@@ -188,10 +189,17 @@ func NewQUICDecryptor(ci types.ConnectionKey, keyLog *crypto.KeyLogStore, logger
 func (q *QUICDecryptor) SetOptions(options types.DecryptOptions) {
 	q.options = options
 	q.http3Parser = nil
+	q.doqParser = nil
+	if options.ApplicationProtocol == "doq" && q.packetChan != nil {
+		q.doqParser = protocol.NewDoQStreamParser(q.connectionInfo, q.packetChan)
+		return
+	}
 	if !options.RawChunks && q.packetChan != nil {
 		q.http3Parser = protocol.NewHTTP3StreamParser(q.connectionInfo, q.packetChan)
 		if options.HTTPEvents {
 			q.http3Parser.EnableHTTPEvents(options.MaxDecodedBodyBytes)
+		} else if options.ApplicationProtocol == "doh" {
+			q.http3Parser.EnableDNSOverHTTP()
 		}
 	}
 }
@@ -225,14 +233,19 @@ func (q *QUICDecryptor) Decrypt() (result error) {
 		result = errors.Join(result, q.inputErr)
 		q.mu.Unlock()
 		q.flow = newQUICFlowState()
-		if q.http3Parser != nil && q.options.HTTPEvents {
+		if q.http3Parser != nil && (q.options.HTTPEvents || q.options.ApplicationProtocol == "doh") {
 			q.http3Parser.AbortHTTPEvents()
 		}
 		q.http3Parser = nil
+		q.doqParser = nil
 		q.clientInitialKeys, q.serverInitialKeys = nil, nil
 		q.destConnID = nil
 		q.routingHandler = nil
 	}()
+	if name := q.options.ApplicationProtocol; name != "" && name != "doh" && name != "doq" {
+		q.options.Report(q.connectionInfo, "protocol", "unsupported_protocol")
+		return errors.New("selected application protocol is not supported over QUIC")
+	}
 	updates := q.keyLog.Updates()
 	for {
 		q.mu.Lock()
@@ -335,6 +348,12 @@ func (q *QUICDecryptor) Decrypt() (result error) {
 			}
 			if q.http3Parser != nil {
 				if err := q.http3Parser.Close(); err != nil {
+					q.reportHTTP3Error(err)
+					q.appendQUICError(err)
+				}
+			}
+			if q.doqParser != nil {
+				if err := q.doqParser.CloseQUICStreams(); err != nil {
 					q.reportHTTP3Error(err)
 					q.appendQUICError(err)
 				}

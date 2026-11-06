@@ -287,6 +287,63 @@ func TestQUICEarlyAcceptanceDeadlineReleasesState(t *testing.T) {
 	})
 }
 
+func TestDoQRejectsAcceptedEarlyStreamAndReset(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		frame []byte
+	}{
+		{"stream", []byte{0x0b, 0, 1, 0}},
+		{"reset", []byte{4, 0, 0, 0}},
+	} {
+		for _, status := range []string{"accepted", "rejected"} {
+			t.Run(tc.name+"/"+status, func(t *testing.T) {
+				q, out := newQUICOutputTest(t, types.DecryptOptions{ApplicationProtocol: "doq"})
+				if err := q.parseQUICFrames(tc.frame, quicLevelEarly, true, time.Time{}); err != nil {
+					t.Fatal(err)
+				}
+				if len(out) != 0 || len(q.flow.streams) != 0 {
+					t.Fatal("DoQ early frame escaped acceptance wait")
+				}
+				// Authenticated EncryptedExtensions selects doq and resolves whether
+				// queued early data was accepted before application dispatch.
+				ee := []byte{8, 0, 0, 12, 0, 10, 0, 16, 0, 6, 0, 4, 3, 'd', 'o', 'q'}
+				if status == "accepted" {
+					ee[3], ee[5] = 16, 14
+					ee = append(ee, 0, 42, 0, 0)
+				}
+				err := q.observeServerCrypto(quicLevelHandshake, 0, ee)
+				if status == "accepted" {
+					if err == nil || err.Error() != "DoQ early data is not supported" || q.flow.terminalErr != err {
+						t.Fatalf("accepted early %s: %v, terminal=%v", tc.name, err, q.flow.terminalErr)
+					}
+				} else if err != nil {
+					t.Fatal(err)
+				}
+				if len(out) != 0 || len(q.flow.streams) != 0 || len(q.flow.early.frames) != 0 || q.flow.early.bytes != 0 {
+					t.Fatal("DoQ early frame emitted output or retained stream state")
+				}
+				if status == "rejected" {
+					// Rejection must leave the stream ID available for ordinary 1-RTT.
+					if err := q.parseQUICFrames([]byte{4, 0, 0, 0}, quicLevelApplication, true, time.Time{}); err != nil {
+						t.Fatal(err)
+					}
+					if len(out) != 1 || (<-out).Metadata["kind"] != "reset" {
+						t.Fatal("1-RTT reset was lost after rejected early data")
+					}
+				}
+				_ = q.Close()
+				if err := q.Decrypt(); (err != nil) != (status == "accepted") {
+					t.Fatalf("connection result after %s early data: %v", status, err)
+				}
+				assertQUICReleased(t, q)
+				if q.doqParser != nil {
+					t.Fatal("terminated connection retained DoQ parser")
+				}
+			})
+		}
+	}
+}
+
 func TestQUICCIDLimitsAndOutOfOrderRetirement(t *testing.T) {
 	q, _ := newQUICOutputTest(t, types.DecryptOptions{})
 	var adds, retires int

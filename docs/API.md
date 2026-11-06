@@ -94,7 +94,7 @@ func DecryptLiveTraffic(
 #### DecryptPcapngStreamWithOptions / WithOptions
 
 旧的 `DecryptPcapngStream(ctx, input, emit)` 保持默认应用消息输出。
-显式 raw 输出及不含明文/密钥的诊断可通过以下入口选择：
+显式 raw 输出、[DNS/MQTT/Redis 解析](#applicationprotocol)及不含明文/密钥的诊断可通过以下入口选择：
 
 ```go
 options := types.DecryptOptions{
@@ -608,6 +608,55 @@ QPACK、SETTINGS 和消息顺序错误报告 `protocol/parse_failed`，不归为
 
 单条编码消息和展开结果各限 16 MiB；每连接所有未完成 gRPC 消息的已接收 payload 共限 32 MiB，活动流仍适用 HTTP/2 限额。完整消息在 END_STREAM/EOF 前交付并释放，累计流长可超过 16 MiB。只拼接 body_chunk 才能还原 HTTP 正文，grpc_message 是额外语义视图。单元测试覆盖 unary/client/server/bidi streaming、长流和边界；独立 hyper-h2 + Python gzip 实际 TLS 流量覆盖四类调用、双向压缩、错误 trailers 和 trailers-only。基线为 [gRPC HTTP/2 协议](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md)。
 
+### ApplicationProtocol
+
+Go 文件和流式 API 可通过 `types.DecryptOptions{ApplicationProtocol: "doh"}` 显式选择应用协议。允许值为 `dot`、`doh`、`doq`、`mqtt`、`redis`；空值保留现有 HTTP/WebSocket 识别。该选择作用于本次解密的连接，不是端口过滤器，也不自动按端口切换协议。它与 `RawChunks`、`HTTPEvents`、非零 `MaxDecodedBodyBytes` 互斥；非法值和选项冲突在读取输入前返回错误。文件入口必须提供并发消费的 packet channel；流式入口沿用串行回调和背压。CLI/C 示例尚未增加这些选项。
+
+```go
+err := ecapture_decryptor.DecryptPcapngStreamWithOptions(ctx, input, emit,
+    types.DecryptOptions{ApplicationProtocol: "doh"})
+// 文件入口：config.WithOptions(types.DecryptOptions{ApplicationProtocol: "doh"})
+```
+
+`dot`、`mqtt`、`redis` 用于 TLS/TCP；`doh` 用于 HTTP/1.x、HTTP/2 或 HTTP/3；`doq` 用于 QUIC。UDP/QUIC 上选择 TCP 专用协议、TLS 上选择 `doq` 会失败。QUIC 在解密握手并观察到服务端 ALPN 时检查其是否匹配：DoQ 要求 `doq`，HTTP/3/DoH 要求 `h3`（也识别 `h3-29`，不扩大 draft-29 的实测范围）。缺少握手 secrets 时无法检查协商结果，显式选择是调用方对协议的声明；未知协议可使用 raw 输出。各 parser 的错误和资源超限仍分别报告 `protocol/parse_failed`、`protocol/resource_limit`，终止错误不被诊断替代。
+
+#### DNS
+
+三种传输均支持普通 DNS QUERY，拒绝 AXFR/IXFR 和其他 opcode。校验完整 wire 长度、名称/压缩指针、记录边界和 OPT 位置；未知 RR 的内容保留在线上字节中，不提供完整的 RR 类型语义。`Protocol="dns"`，`Data` 为完整 DNS wire message，不含 DoT/DoQ 的两字节长度或 HTTP framing。
+
+- **DoT**：两字节长度前缀可跨 TLS record，支持粘连和流水线。按连接、DNS ID、问题名称/类型/类配对，名称匹配忽略 ASCII 大小写；同 ID 的不同问题可逆序返回。响应没有唯一候选时输出 `matched=false`，不猜测关联。无 question 的错误响应也必须只有唯一候选。
+- **DoH**：GET 的单个 `dns` 参数使用无填充 base64url；POST 及成功响应要求无参数的 `application/dns-message`。只接受未编码/identity 正文，不展开 HTTP gzip。按 HTTP 请求/stream 关联并核对 DNS ID 和问题；完整 HTTP 消息结束后交付 DNS。非 2xx 最终响应输出空 `Data` 的 `kind="http_error"` 和整数 `status`，不伪装成 DNS 响应。取消释放关联状态；不支持 HTTP push。
+- **DoQ**：仅支持 1-RTT。每条客户端发起的双向流恰好包含一个请求和一个响应，均为两字节长度前缀且 DNS ID 必须为 0；每方向在 FIN 验证完整性后输出。拒绝单向/服务端发起流、流复用和 EDNS TCP keepalive。响应先到时有界等待请求并核对问题。RESET_STREAM 输出空 `Data` 的 `kind="reset"`、`error_code`（uint64），释放该事务；完成和 reset 标记保留用于去重。
+
+正常消息的 `kind="message"`。用 `ConnectionID()`、`request_id` 和方向关联事务，不能只用 DNS ID：
+
+| 元数据 | 类型与含义 |
+| --- | --- |
+| `transport` | `dot`、`doh` 或 `doq`；外层 `DecryptedPacket.Transport` 仍为 `tcp`/`udp`。 |
+| `id`、`opcode`、`rcode` | uint16；`rcode` 包含 EDNS 扩展响应码。`qr`、`truncated` 为 bool。 |
+| `questions`、`answers` | `[]map[string]any`；问题含 `name`、`type`/`class`（uint16），答案另含 `ttl`（uint32），常见 RR 还含 `address`、`target`、`preference` 或 `text`。四个 section 的 `*_count` 为 int。 |
+| `request_id` | uint64，限本连接：DoT 从 1 编号，仅已关联响应携带；DoH 使用 HTTP 请求编号/stream ID；DoQ 为 `stream_id/4+1`。 |
+| `matched` | bool；成功关联的响应为 true。DoT 未匹配响应为 false；请求不表示配对已完成。 |
+| `stream_id` | DoH/DoQ 的 uint64；DoH HTTP/1 从 1 编号，HTTP/2、3 与 DoQ 使用线上 stream ID。DoH 另带 `http_protocol`；DoQ 消息带 `stream_end=true`。 |
+
+每条 DNS wire 最多 65,535 字节、64 个问题、四个 section 合计 1,024 条记录。DoT 最多 1,024 个待配对请求和 1 MiB 问题关联数据。DoH 待请求/待响应各最多 1,024 条，共享 4 MiB 正文/关联字节预算，另有最多 1,024 个取消标记，并受底层 HTTP 头部、流和 QPACK 上限约束。DoQ 最多 1,024 个流标记（含已完成/reset）、4 MiB 缓冲及 1 MiB 问题关联数据，仍受 QUIC 重组上限约束。EOF 半条 DNS 报文会报错；DoH/DoQ 尚未完成的事务也会报错，DoT 在完整报文边界允许尚无响应。独立 TLS/QUIC 发生器见 [DNS 夹具说明](../test/fixtures/http3_capture/README.md)。
+
+#### MQTT
+
+`ApplicationProtocol: "mqtt"` 支持 TLS 内的 MQTT **3.1.1**，要求观察到客户端 CONNECT；支持 CONNECT/CONNACK、双向 PUBLISH（QoS 0/1/2）、订阅/退订及其确认、PUBACK/PUBREC/PUBREL/PUBCOMP、PINGREQ/PINGRESP 和 DISCONNECT。校验固定头、最短 Remaining Length、包方向、UTF-8 字符串及 topic/filter。MQTT 5、MQTT over WebSocket 不在此入口范围内。解析器不跟踪 ACK 事务状态、不合并 DUP 重发，也不推断 exactly-once 投递结果。
+
+`Protocol="mqtt"`，`Data` 保留完整控制包（含固定头和 payload）。`kind` 为 `control`、`publish`、`subscribe` 或 `unsubscribe`；`packet_type`（byte）、`packet_name` 描述包类型，`message_index`（uint64）在每方向从 0 编号。PUBLISH 含 `topic`、`qos`（byte）、`dup`/`retain`（bool），QoS > 0 时含 `packet_id`（uint16）；`payload_offset`/`payload_length`（int）定位 `Data` 内的业务字节。订阅包含 `topics`、`requested_qos`，确认包保留 `packet_id` 和相应返回码；CONNECT 含 `protocol_level`、`keep_alive`、`client_id`、`clean_session`、`will`。这些字段描述已观察到的报文，不构成请求/响应配对。
+
+完整包及每方向缓冲各最多 16 MiB；单包 topic/返回码列表最多 1,024 项。完整包输出后释放，不累计历史包。EOF 半包返回错误；完整包边界无需看到 CONNACK、后续 ACK 或 DISCONNECT。`Data` 可能包含 CONNECT 凭据及二进制业务内容，元数据不额外复制密码。独立真实 TLS 夹具见 [TCP 夹具说明](../test/fixtures/http_tcp_capture/README.md)。
+
+#### Redis
+
+`ApplicationProtocol: "redis"` 支持 TLS 内以 bulk string 数组编码的命令，以及定长 RESP2/RESP3 值，包括嵌套聚合、map/set、RESP3 push/attribute。普通响应按连接内请求顺序配对；Pub/Sub 订阅确认可对应同一请求的多个确认，消息推送和 attribute 不消耗普通响应位置。RESP2 Pub/Sub 分类依赖已观察到的订阅状态，RESP3 使用显式 push 类型。不支持 inline 命令、流式/未知长度 RESP、MONITOR、复制命令（SYNC/PSYNC/REPLCONF）及 CLIENT REPLY。
+
+`Protocol="redis"`，`Data` 为原始完整 RESP 值，保留二进制字符串，不新增递归值对象；AUTH 等命令的凭据也保留在原始字节中。`kind` 为 `request`、`response`、`push` 或 `attribute`，`resp_type` 为线上首字符。请求含从 1 开始的 `request_id`（uint64）、大写 `command`、`argument_count`（int）；已配对响应带相同 ID/命令，早到的普通响应有界等待请求成帧；EOF 仍没有候选时输出 `unsolicited=true`。订阅确认等待对应命令，普通 RESP3 push 和 attribute 不等待。push 含 `push_type`；订阅确认另带 `subscription_count`（int）及可关联的 ID/命令。attribute 独立交付，不合并进后续值。
+
+每个编码后的完整值最多 16 MiB，单行 64 KiB、嵌套深度 32、元素数 65,536；命令名最多 128 字节。每连接待响应请求和订阅各最多 1,024 项，订阅键总计最多 64 KiB；早到响应队列最多 1,024 个完整值、合计 16 MiB。完整值持续交付后释放，累计连接流量不受单值限额限制。EOF 半个值或尚有待响应请求返回错误，已建立的订阅本身不导致 EOF 错误。独立真实 TLS 夹具见 [TCP 夹具说明](../test/fixtures/http_tcp_capture/README.md)。
+
 ---
 
 ## 🔐 支持的协议
@@ -619,6 +668,9 @@ QPACK、SETTINGS 和消息顺序错误报告 `protocol/parse_failed`，不归为
 | HTTP/3 | `http/3` | ✅ 有界消息解析 | QUIC + 动态 QPACK；边界见上节 |
 | WebSocket | `websocket` | ✅ HTTP/1 Upgrade | 双向分片、控制帧、permessage-deflate；边界见上节 |
 | gRPC | `http/2` + `grpc_message` | ✅ 显式增量语义 | HTTPEvents；未压缩/gzip 消息与状态 trailers |
+| DNS | `dns` | ✅ 显式选择 | DoT、DoH（HTTP/1.x、2、3）、DoQ（1-RTT）；普通 QUERY |
+| MQTT | `mqtt` | ✅ 显式选择 | TLS 内 MQTT 3.1.1 控制包；不跟踪 ACK 投递状态 |
+| Redis | `redis` | ✅ 显式选择 | TLS 内定长 RESP2/RESP3、流水线配对及 Pub/Sub |
 
 ---
 
