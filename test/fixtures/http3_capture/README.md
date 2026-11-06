@@ -356,3 +356,43 @@ DSB, and raw reconstruction. Duplicate DSB does not duplicate messages; blocked
 headers resume before EOF. RFC 9204 Appendix B vectors, wrapping insert counts,
 invalid SETTINGS, eviction, limits, reset and deadline tests complement this
 capture. Dynamic HTTP/3 on v2 and early RESET remain outside real-capture coverage.
+
+## Incremental HTTP and SSE fixture
+
+The Go fixture's `stream-fixture` mode starts independent standard-library
+TLS HTTP/1.1 and HTTP/2 peers and quic-go HTTP/3 peers on loopback. All three
+flush three SSE records separately. In `long` mode they also transfer
+17,825,829 bytes per response. Byte `i` is `i % 251`. The client checks every
+byte and the negotiated HTTP version. The SDK replays the capture separately.
+
+Run from this fixture module on the Linux VM. Use `mode=sse` for the small
+committed fixture and `mode=long` for the larger on-demand regression.
+
+```sh
+work=$(mktemp -d)
+mode=long
+GOWORK=off go build -o "$work/traffic" .
+sudo -n dumpcap -i lo -B 64 -f 'udp port 44433 or tcp port 44435 or tcp port 44436' \
+  -w - > "$work/http_events_$mode.pcapng" 2> "$work/capture.log" &
+cap_pid=$!
+trap 'sudo -n kill -INT "$cap_pid" 2>/dev/null || true' EXIT
+sleep 1
+QUIC_GO_DISABLE_GSO=true SSLKEYLOGFILE="$work/http_events_$mode.keys" \
+  "$work/traffic" stream-fixture "$mode"
+sleep 1
+sudo -n kill -INT "$cap_pid"
+wait "$cap_pid"
+trap - EXIT
+cd ../../..
+HTTP_EVENT_LONG_FIXTURE="$work/http_events_long" GOWORK=off go test -race \
+  -run 'TestHTTPEventCaptureAPIs|TestHTTPEventsCaptureBeforeEOF' .
+```
+
+The committed SSE capture has 71 packets. The validation VM also captured
+21,224 packets in long mode, with zero reported drops in both runs. The long
+capture stays in the VM work directory. The test checks external keylog/file
+and DSB/non-seekable stream paths, per-direction offsets, exact body bytes,
+terminal events and raw QUIC STREAM payloads. The small fixture is also fed a
+packet at a time with input held open to verify dispatch before the third SSE
+record and before response completion. Unit regressions cover single large
+HTTP chunks/frames, gzip limits, reset, truncation and blocked consumers.

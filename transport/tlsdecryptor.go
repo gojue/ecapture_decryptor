@@ -34,6 +34,7 @@ type DecryptedData struct {
 
 // TLSDecryptor decrypts TLS traffic using standard crypto/tls
 type TLSDecryptor struct {
+	serverEnded, tcpReset    atomic.Bool
 	ConnectionInfo           types.ConnectionKey
 	keyLog                   *crypto.KeyLogStore
 	clientIn                 *crypto.StreamBuffer
@@ -201,6 +202,7 @@ func (td *TLSDecryptor) queueRequest(data []byte) {
 		for _, response := range td.pendingResponses {
 			td.parser.FeedResponse(response)
 		}
+		td.checkEventParser()
 	}
 	if td.protocolDetected {
 		td.pendingResponses = nil
@@ -240,6 +242,7 @@ func (td *TLSDecryptor) queueResponse(data []byte) {
 	}
 	if td.parser != nil {
 		td.parser.FeedResponse(data)
+		td.checkEventParser()
 	} else if !td.protocolDetected && td.packetChan != nil {
 		// Decryption can finish on the server side before the client request
 		// selects a protocol parser. Preserve these bytes in record order.
@@ -462,6 +465,10 @@ func (td *TLSDecryptor) processClientRecords() {
 				continue
 			}
 			td.recordFailure("decrypt", "authentication_failed", err)
+			if td.options.HTTPEvents {
+				td.abortInput()
+				return
+			}
 			td.logger.Printf("Decrypt error (client): %v", err)
 			continue
 		}
@@ -540,6 +547,10 @@ func (td *TLSDecryptor) processServerRecords() {
 				continue
 			}
 			td.recordFailure("decrypt", "authentication_failed", err)
+			if td.options.HTTPEvents {
+				td.abortInput()
+				return
+			}
 			td.logger.Printf("Decrypt error (server): %v", err)
 			continue
 		}
@@ -554,6 +565,9 @@ func (td *TLSDecryptor) processServerRecords() {
 		}
 
 		// Only output application data records
+		if actualContentType == 0x15 && len(plaintext) == 2 && plaintext[1] == 0 {
+			td.serverEnded.Store(true)
+		} // TLS close_notify
 		if actualContentType != 0x17 {
 			continue
 		}
@@ -578,7 +592,12 @@ func (td *TLSDecryptor) CloseClient() error {
 	return nil
 }
 
+// ObserveTCPReset records the transport termination while allowing late keys
+// to unlock authenticated bytes already buffered before the reset.
+func (td *TLSDecryptor) ObserveTCPReset() { td.tcpReset.Store(true) }
+
 func (td *TLSDecryptor) CloseServer() error {
+	td.serverEnded.Store(true)
 	_ = td.serverIn.Close()
 	// Process any remaining records
 	td.handshakeMu.RLock()
@@ -623,7 +642,7 @@ func (td *TLSDecryptor) Close() error {
 		parser := td.parser
 		td.protocolMu.RUnlock()
 
-		if parser != nil && !td.aborted.Load() {
+		if parser != nil && !td.options.HTTPEvents && !td.aborted.Load() {
 			parser.Flush()
 		}
 		// Final flush of any remaining queued data
@@ -722,12 +741,23 @@ func (td *TLSDecryptor) Decrypt() error {
 	td.protocolMu.RUnlock()
 	// Close can run before this goroutine finishes draining queued TLS records.
 	// Flush again after the drain so close-delimited HTTP/1.0 bodies are emitted.
-	if parser != nil && !td.aborted.Load() {
+	if events, ok := parser.(interface{ FinishHTTPEvents(string) }); ok && td.options.HTTPEvents {
+		reason := ""
+		switch {
+		case incomplete || td.aborted.Load():
+			reason = "partial"
+		case td.tcpReset.Load():
+			reason = "reset"
+		case !td.serverEnded.Load():
+			reason = "capture_eof"
+		}
+		events.FinishHTTPEvents(reason)
+	} else if parser != nil && !td.aborted.Load() {
 		parser.Flush()
 	}
 	if errorParser, ok := parser.(interface{ Err() error }); ok {
 		if err := errorParser.Err(); err != nil {
-			td.recordFailure("protocol", "parse_failed", err)
+			td.recordParserFailure(err)
 		}
 	}
 	td.errMu.Lock()
@@ -919,10 +949,44 @@ func (td *TLSDecryptor) detectProtocolLocked(data []byte) {
 	// Use protocol registry to detect and create the appropriate parser
 	parser, protocolName := protocol.DetectProtocol(data, td.ConnectionInfo, td.packetChan)
 	if parser != nil {
+		if td.options.HTTPEvents {
+			events, ok := parser.(interface{ EnableHTTPEvents(int64) })
+			if !ok {
+				td.recordFailure("protocol", "unsupported_protocol", errors.New("selected parser does not support HTTP events"))
+				td.abortInput()
+				return
+			}
+			events.EnableHTTPEvents(td.options.MaxDecodedBodyBytes)
+		}
 		td.parser = parser
 		td.parser.SetPacketTime(td.packetTime)
 		td.logger.Printf("Detected %s protocol for %s", protocolName, td.ConnectionInfo)
 	} else {
-		td.options.Report(td.ConnectionInfo, "protocol", "unsupported_protocol")
+		if td.options.HTTPEvents {
+			td.recordFailure("protocol", "unsupported_protocol", errors.New("unrecognized HTTP event protocol"))
+			td.abortInput()
+		} else {
+			td.options.Report(td.ConnectionInfo, "protocol", "unsupported_protocol")
+		}
+	}
+}
+
+func (td *TLSDecryptor) recordParserFailure(err error) {
+	code := "parse_failed"
+	if errors.Is(err, protocol.ErrHTTPEventLimit) {
+		code = "resource_limit"
+	}
+	td.recordFailure("protocol", code, err)
+}
+
+// Called under protocolMu after feeding authenticated application data.
+func (td *TLSDecryptor) checkEventParser() {
+	if td.options.HTTPEvents {
+		if p, ok := td.parser.(interface{ Err() error }); ok {
+			if err := p.Err(); err != nil {
+				td.recordParserFailure(err)
+				td.abortInput()
+			}
+		}
 	}
 }

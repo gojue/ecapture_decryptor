@@ -67,6 +67,7 @@ pcap/pcapng + 外部 SSLKEYLOG / 内嵌 DSB
 - channel API 的输出必须由调用方并发消费，函数返回后再由调用方关闭 channel。流 API 的 `emit` 串行调用；回调报错会停止输入，生产者仍需排空退出。
 - `input.Close()` 必须能中断阻塞读取。取消 context 无法中断调用方永久阻塞的 `emit`；保持背压，不使用无限队列或随意丢弃输出规避阻塞。
 - `RawChunks` 默认关闭；开启后输出已认证的 TLS 字节或连续 QUIC STREAM 字节，与应用解析互斥。chunk 不是应用消息；`offset`、`stream_id`、`stream_end` 的含义见 `docs/API.md`。
+- `HTTPEvents` 为显式 HTTP 增量输出，与 `RawChunks` 互斥。正文 offset 以消息/方向为单位，SSE 是额外的语义事件。增量 HTTP 和 raw QUIC 可超过累计 16 MiB，乱序缓存、QPACK 等待、可选 gzip 展开仍有上限。
 - `OnDiagnostic` 可并发执行，必须及时返回且不能重入引擎。诊断仅含连接、阶段和固定原因码，不加入密钥、明文或底层 parser 错误文本；诊断不能替代终止错误返回。
 - 默认 `KeyWaitTimeout=30s`、`IdleTimeout=5min`、`MaxConnections=1024`；非正值使用默认值。期限依据实际时间，不能使用抓包时间戳；连接额度包括仍在退出的 worker。
 - 保持现有缓存上限和关闭语义；退出需释放路由、队列、解析器引用与连接额度，正常 EOF 需处理已缓冲数据。不得通过删除限制、无界等待或持有路由锁执行阻塞关闭修复问题。

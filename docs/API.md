@@ -132,7 +132,7 @@ QUIC 的待解密包会由密钥更新唤醒重试，不需要新的 UDP 包或�
 固定缓存边界：TLS 每方向输入 8 MiB，server-first 和旧 stdout 响应队列各
 8 MiB / 65,536 块；QUIC 输入及待密钥队列各 32 MiB / 65,536 包，每连接最多
 1,024 个方向化 stream 状态（含完成标记）。TCP 每方向乱序重组保持 4 MiB，
-QUIC 每个 STREAM/CRYPTO assembler 保持 16 MiB，两者各最多 65,536 个乱序片段。
+QUIC 每个 STREAM/CRYPTO assembler 的乱序载荷最多 16 MiB、65,536 个片段。连接的 STREAM 乱序缓存合计最多 32 MiB、65,536 个片段，包括独立的 early 空间。
 超限报告 `resource_limit` 并终止该连接。这些是各组件上限，不是整个引擎的统一
 内存预算；现有应用 parser 上限继续有效。
 
@@ -160,7 +160,7 @@ RESET_STREAM 释放该方向的重组和解析缓存，保留有界终止标记�
 0-RTT RESET 使用下述接受/拒绝规则和独立 early 空间，raw reset 同样带阶段/接受状态。
 STOP_SENDING 只表示请求对端停止，不能替代 RESET 或 FIN。
 不支持 DATAGRAM 输出、TLS KeyUpdate 或 STARTTLS；QUIC Key Update、
-CID/Retry/VN 和 0-RTT 支持范围见下节。现有 QUIC 16 MiB stream offset 上限仍适用。
+CID/Retry/VN 和 0-RTT 支持范围见下节。raw / HTTP 增量模式支持 QUIC 62 位 STREAM offset，完整消息和 CRYPTO 保留 16 MiB 的累计限制。
 
 `Diagnostic` 仅含连接标识、传输、阶段和固定原因码，不含底层错误字符串。
 典型原因包括 `waiting_secret`、`missing_secret`、`missing_client_hello`、
@@ -172,6 +172,38 @@ secret 时，无法区分仅含加密握手的记录与缺少正确密钥的应�
 诊断用于解释输出缺失，不保证每个包一条，也不替代函数返回的终止错误。
 
 ---
+
+#### HTTP 增量事件
+
+Go 文件和流式入口均接受 `types.DecryptOptions{HTTPEvents: true}`。文件入口需要并发消费 packet channel。零值选项输出完整应用消息。HTTPEvents 和 RawChunks 互斥，选项冲突在读取输入前返回错误。CLI/HAR 和 C 示例使用默认完整消息模式。
+
+```go
+err := ecapture_decryptor.DecryptPcapngStreamWithOptions(ctx, input,
+    func(p *types.DecryptedPacket) error {
+        if p.Metadata["kind"] == "sse" {
+            fmt.Printf("%s %s\n", p.Metadata["event"], p.Data)
+        }
+        return nil
+    }, types.DecryptOptions{HTTPEvents: true})
+```
+
+`Protocol` 记录 HTTP 版本。用 `ConnectionID()`、`stream_id`（`uint64`）和 `Direction` 定位事件。HTTP/1 按请求头的到达顺序从 1 编号，配对的响应使用同一编号。HTTP/2 和 HTTP/3 使用线上 stream ID。每条消息的每个方向独立从 offset 0 开始，多个流和连接允许交错。捕获时间戳不参与排序。
+
+| `Metadata["kind"]` | 交付内容和顺序 |
+| --- | --- |
+| `headers` | `headers` 是独立的 `http.Header`。请求有 `method` 和 `url`（HTTP/1）或 `path`（HTTP/2、3），响应有整数 `status`。1xx 附 `informational=true`，随后仍可收到最终 headers。HTTP/3 push 的 headers 携带 `push_id`、`parent_stream_id` 和 promise 元数据。 |
+| `body_chunk` | `Data` 为已去除 HTTP framing 的正文，最多 32 KiB。`offset` 是本片段首字节的正文位置。只拼接这一类事件即可重建正文。 |
+| `sse` | 对 `text/event-stream` 响应，空行结束一条事件时额外交付。`Data` 是多行 data 字段以换行拼接后的 UTF-8 数据。`event` 默认是 `message`，`last_event_id` 保留最近的 id，已观察到有效 retry 时带 `retry_ms`（`uint64`）。`offset` 指向触发派发的行结束符之后。EOF 时仅有半条 SSE 记录则不派发。 |
+| `trailers` | 独立的 `trailers` 字段，offset 为已交付正文长度。 |
+| `end` | 当前方向正常结束，offset 为正文总长度。 |
+| `reset` | 已开始的方向被取消，offset 为已经交付的正文长度。HTTP/2 RST_STREAM 结束该 stream 两个仍打开的方向，HTTP/3 RESET_STREAM 结束发送方向，两者携带 `error_code`。CANCEL_PUSH 和 TCP RST 也可终止已开始的消息。 |
+| `partial` | 已开始但被截断或无法继续解析的方向。offset 为已经交付的正文长度，调用方同时处理 API 的终止错误。每个已开始方向只交付一次终止事件。 |
+
+只有 `body_chunk` 和 `sse` 带正文数据。回调串行运行，channel 和回调速度对解密器施加背压。调用方取消 context 或让回调返回错误后，以 API 返回值作为终止信号。HTTP/1 固定长度和 chunked 正文按各自边界结束。close-delimited 响应在连接排空时区分已观察到的服务端 FIN / TLS close_notify 与只有抓包 EOF 的截断，后者交付 partial 并返回错误。
+
+默认保留 Content-Encoding 的原始正文。将 `MaxDecodedBodyBytes` 设为正数（例如 `8 << 20`）会启用单层 gzip 的增量展开，值为每条消息的展开字节上限。此时 headers 带 `decoded_encoding="gzip"`，原始 Content-Length 和 Content-Encoding 仍描述线上编码。body、SSE 和 offset 均基于展开后的字节。超过额度或校验失败会终止该消息，已交付字节按 partial 处理。其他编码或组合编码原样交付 body。SSE 解析适用于未编码、identity 或成功选择 gzip 展开的正文。
+
+HTTP/1 的初始头与 trailers、HTTP/2 的压缩/展开字段节、SSE 单行和累计 data 分别限制为 64 KiB。每连接最多 1024 个活动消息方向、16 个同时展开的 gzip 正文，HTTP/1 最多等待 1024 个响应，HTTP/2 最多保留 1024 个活动流和 1024 个 reset 标记。QUIC 按未消费和乱序字节计费，已交付正文不会积累成完整消息。H3 的 QPACK 等待和未关联 push 仍适用原缓存上限。超限报告 `resource_limit`，协议或内容解析失败报告 `protocol/parse_failed`。增量入口支持常规 HTTP/1、HTTP/2 和 HTTP/3，WebSocket/CONNECT 升级以及 HTTP/2 PUSH_PROMISE 仍有协议边界。SSE 事件字段依照 [HTML EventSource 规范](https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation)。
 
 #### QUIC Key Update
 
@@ -241,7 +273,7 @@ VN 最多观察 16 个非零版本，拒绝异常列表；只有后续受支持�
 
 接受/拒绝诊断为 `handshake/early_data_accepted` / `early_data_rejected`，没有明文或密钥。
 raw 的 rejected/unknown early assembler 与正常 STREAM 分开，各受现有 stream 数量、
-16 MiB offset 与片段上限限制。流式 API 仍按既有背压契约交付，不启动无限输出队列。
+16 MiB 乱序字节与片段上限限制。流式 API 仍按既有背压契约交付，不启动无限输出队列。
 
 独立真实夹具与固定向量覆盖 v1/v2 × AES-128-GCM/AES-256-GCM/ChaCha20-Poly1305。
 实际 18 条连接产生 24 次请求/响应，其中 6 条经过迁移，6 条接受 early data，6 条拒绝后
@@ -538,9 +570,9 @@ for packet := range packetChan {
 - CLI HAR 配对只使用普通请求和最终响应；信息响应与 push 不冒充原请求的最终响应。JSON/SDK 消费者可以按上述 `kind` 区分；`Data` 的 JSON 排除规则不变。
 - SETTINGS 必须是控制流首帧，拒绝重复控制/QPACK 流、重复/保留 SETTINGS、非法帧位置及关键流关闭。未知合法帧/单向流跳过；不按其声明长度分配内存。
 
-上限：每方向实际动态表 64 KiB、每个解码字段节 64 KiB（按 name + value + 32 计）/1024 字段；每方向最多 64 条阻塞流，同时受对端 SETTINGS 限制。解析器最多保留 1024 个流标记、128 个 push；每个未关联 push 最多 16 个信息响应；待 SETTINGS 重放每方向最多 4096 个片段。连接内消息/流缓冲和待重放字节共 32 MiB，单消息/底层 QUIC stream offset 仍为 16 MiB。超限返回终止错误并报告 `protocol/resource_limit`，不跳过失败断言或扩大缓存。
+上限：每方向实际动态表 64 KiB、每个解码字段节 64 KiB（按 name + value + 32 计）/1024 字段；每方向最多 64 条阻塞流，同时受对端 SETTINGS 限制。解析器最多保留 1024 个流标记、128 个 push；每个未关联 push 最多 16 个信息响应；待 SETTINGS 重放每方向最多 4096 个片段。连接内消息/流缓冲和待重放字节共 32 MiB，完整消息模式的单消息和 QUIC STREAM offset 上限为 16 MiB。超限返回终止错误并报告 `protocol/resource_limit`，不跳过失败断言或扩大缓存。
 
-QPACK、SETTINGS 和消息顺序错误报告 `protocol/parse_failed`，不归为密码学认证失败。阻塞压缩/未关联 push 使用实际时间的 `KeyWaitTimeout`，逾期报告 `protocol/parse_timeout`；EOF 尚有不完整状态也返回错误。RESET、取消和关闭释放等待数据，正常结束仅保留有界去重/关联信息；输出继续遵守串行背压。缺失必要 encoder 历史或 SETTINGS 的片段捕获不能保证动态解码。扩展 CONNECT、长流增量输出以及 DATAGRAM 不在此支持范围。
+QPACK、SETTINGS 和消息顺序错误报告 `protocol/parse_failed`，不归为密码学认证失败。阻塞压缩/未关联 push 使用实际时间的 `KeyWaitTimeout`，逾期报告 `protocol/parse_timeout`；EOF 尚有不完整状态也返回错误。RESET、取消和关闭释放等待数据，正常结束仅保留有界去重/关联信息；输出继续遵守串行背压。缺失必要 encoder 历史或 SETTINGS 的片段捕获不能保证动态解码。长流使用下述 HTTP 增量事件契约。扩展 CONNECT 和 DATAGRAM 属于后续协议范围。
 
 独立 `http3_dynamic_aioquic` 夹具及 [复现步骤](../test/fixtures/http3_capture/README.md#dynamic-qpack-and-message-state-fixture) 覆盖 QUIC v1、两条连接、双向动态表、延迟/拆分 encoder、103→200→trailers、push/reset；v2 的动态 HTTP/3 组合和 0-RTT RESET 尚无真实夹具，后者仅有状态回归。
 

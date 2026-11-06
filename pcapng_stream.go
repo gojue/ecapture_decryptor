@@ -31,6 +31,9 @@ func DecryptPcapngStreamWithOptions(ctx context.Context, input io.ReadCloser, em
 	if ctx == nil || input == nil || emit == nil {
 		return errors.New("context, pcapng input and packet callback are required")
 	}
+	if err := options.Validate(); err != nil {
+		return err
+	}
 	keyLog := crypto.NewKeyLogStore()
 	reader := &pcapngBlockReader{source: input, onTLSSecrets: func(payload []byte) error {
 		_, err := keyLog.Write(payload)
@@ -46,7 +49,7 @@ func DecryptPcapngStreamWithOptions(ctx context.Context, input io.ReadCloser, em
 			callbackMu.Lock()
 			failed := callbackErr != nil
 			callbackMu.Unlock()
-			if failed {
+			if failed || options.HTTPEvents && ctx.Err() != nil {
 				continue // Drain producers after reporting the first callback failure.
 			}
 			if err := emit(packet); err != nil {

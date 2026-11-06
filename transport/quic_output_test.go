@@ -496,3 +496,39 @@ func TestQUICResetFinalSizeAndDirection(t *testing.T) {
 		t.Fatal(diagnostics)
 	}
 }
+
+func TestQUICRawLongOffsetsAndPendingBounds(t *testing.T) {
+	q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true})
+	block := make([]byte, 32<<10)
+	const total = 17<<20 + 37
+	for pos := 0; pos < total; {
+		n := min(len(block), total-pos)
+		for i := range block[:n] {
+			block[i] = byte((pos + i) % 251)
+		}
+		if err := q.feedQUICStream(4, uint64(pos), block[:n], pos+n == total, true, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		p := <-out
+		if p.Metadata["offset"] != uint64(pos) || p.Metadata["end"] != (pos+n == total) || !bytes.Equal(p.Data, block[:n]) {
+			t.Fatal(pos, p.Metadata)
+		}
+		pos += n
+	}
+	if err := q.feedQUICStream(4, total-2, block[:2], true, true, time.Now()); err != nil || len(out) != 0 {
+		t.Fatal("retransmission after long FIN", err)
+	}
+	if err := q.feedQUICStream(8, 1<<62, nil, false, true, time.Now()); !errors.Is(err, errQUICStreamLimit) {
+		t.Fatal(err)
+	}
+	q, _ = newQUICOutputTest(t, types.DecryptOptions{RawChunks: true})
+	gap := make([]byte, 1<<20)
+	for id := 0; id < 32; id++ {
+		if err := q.feedQUICStream(uint64(id*4), 1<<30, gap, false, true, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := q.feedQUICStream(128, 1<<30, []byte{0}, false, true, time.Now()); !errors.Is(err, errQUICBufferLimit) {
+		t.Fatal("aggregate out-of-order storage", err)
+	}
+}

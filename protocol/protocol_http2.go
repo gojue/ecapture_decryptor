@@ -17,6 +17,9 @@ import (
 	"sync"
 	"time"
 
+	"errors"
+	"strconv"
+
 	"github.com/gojue/ecapture_decryptor/types"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
@@ -56,6 +59,7 @@ type HTTP2StreamParser struct {
 	serverBuffer bytes.Buffer
 
 	// 标记是否为HTTP/2连接
+	events   *http2Events
 	isHTTP2  bool
 	parseErr error
 }
@@ -139,6 +143,10 @@ func (p *HTTP2StreamParser) FeedRequest(data []byte) {
 	if p.parseErr != nil {
 		return
 	}
+	if p.events != nil {
+		p.parseErr = p.feedHTTPEvents(data, true)
+		return
+	}
 	if p.clientBuffer.Len()+len(data) > maxHTTP2BufferedBytes {
 		p.parseErr = fmt.Errorf("HTTP/2 client frame buffer exceeds %d-byte limit", maxHTTP2BufferedBytes)
 		p.clientBuffer.Reset()
@@ -183,6 +191,10 @@ func (p *HTTP2StreamParser) FeedResponse(data []byte) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.parseErr != nil {
+		return
+	}
+	if p.events != nil {
+		p.parseErr = p.feedHTTPEvents(data, false)
 		return
 	}
 	if p.serverBuffer.Len()+len(data) > maxHTTP2BufferedBytes {
@@ -603,6 +615,10 @@ func (p *HTTP2StreamParser) outputRequest(stream *http2Stream) {
 func (p *HTTP2StreamParser) Flush() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.events != nil {
+		p.finishEvents("")
+		return
+	}
 	if p.parseErr != nil {
 		return
 	}
@@ -636,4 +652,352 @@ var _ io.Closer = (*HTTP2StreamParser)(nil)
 func (p *HTTP2StreamParser) Close() error {
 	p.Flush()
 	return nil
+}
+
+type h2EventHalf struct {
+	body            *eventBody
+	ended, trailers bool
+}
+type h2EventStream [2]h2EventHalf
+type h2EventInput struct {
+	headerID           uint32
+	headerBlock        []byte
+	headerFin          bool
+	dataID             uint32
+	remaining, padding int
+	padded, dataFin    bool
+}
+type http2Events struct {
+	output  *eventOutput
+	streams map[uint32]*h2EventStream
+	reset   map[uint32]bool
+	input   [2]h2EventInput
+	closed  bool
+}
+
+var errHTTP2Event = errors.New("invalid HTTP/2 event stream")
+
+func (p *HTTP2StreamParser) EnableHTTPEvents(limit int64) {
+	p.events = &http2Events{output: newEventOutput(p.addr, p.packetChan, limit), streams: make(map[uint32]*h2EventStream), reset: make(map[uint32]bool)}
+	p.clientDecoder.SetMaxStringLength(eventFieldLimit)
+	p.serverDecoder.SetMaxStringLength(eventFieldLimit)
+}
+
+func (p *HTTP2StreamParser) feedHTTPEvents(data []byte, client bool) error {
+	if p.events.closed {
+		return io.ErrClosedPipe
+	}
+	buf := &p.serverBuffer
+	if client {
+		buf = &p.clientBuffer
+	}
+	for len(data) > 0 {
+		n := min(len(data), eventChunkSize)
+		if buf.Len()+n > maxHTTP2BufferedBytes+eventChunkSize {
+			return ErrHTTPEventLimit
+		}
+		buf.Write(data[:n])
+		data = data[n:]
+		if !p.clientPrefaceReceived {
+			if !client {
+				continue
+			}
+			size := min(buf.Len(), len(http2Preface))
+			if !bytes.Equal(buf.Bytes()[:size], http2Preface[:size]) {
+				return errHTTP2Event
+			}
+			if size < len(http2Preface) {
+				continue
+			}
+			buf.Next(size)
+			p.clientPrefaceReceived = true
+			p.isHTTP2 = true
+		}
+		if err := p.parseEventFrames(buf, client); err != nil {
+			return err
+		}
+		if client && p.serverBuffer.Len() > 0 {
+			if err := p.parseEventFrames(&p.serverBuffer, false); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+func (p *HTTP2StreamParser) parseEventFrames(buf *bytes.Buffer, client bool) error {
+	e := p.events
+	side := http3Side(client)
+	in := &e.input[side]
+	if e.closed {
+		return io.ErrClosedPipe
+	}
+	for {
+		if in.dataID != 0 {
+			stream := e.streams[in.dataID]
+			if in.padded {
+				if buf.Len() == 0 {
+					return nil
+				}
+				in.padding = int(buf.Next(1)[0])
+				in.remaining--
+				in.padded = false
+				if in.remaining < in.padding {
+					return errHTTP2Event
+				}
+			}
+			n := min(in.remaining-in.padding, buf.Len())
+			part := buf.Next(n)
+			// An opposite-direction RST can arrive between fragments of this DATA.
+			if stream != nil {
+				body := stream[side].body
+				body.at = p.packetTime
+				if err := body.write(part); err != nil {
+					return err
+				}
+			}
+			in.remaining -= n
+			if in.remaining > in.padding {
+				return nil
+			}
+			skipped := min(in.padding, buf.Len())
+			buf.Next(skipped)
+			in.padding -= skipped
+			in.remaining -= skipped
+			if in.remaining != 0 {
+				return nil
+			}
+			id := in.dataID
+			in.dataID = 0
+			if in.dataFin && stream != nil {
+				if err := e.end(id, side); err != nil {
+					return err
+				}
+			}
+		}
+		if buf.Len() < 9 {
+			return nil
+		}
+		head := buf.Bytes()
+		length := int(head[0])<<16 | int(head[1])<<8 | int(head[2])
+		typ := http2.FrameType(head[3])
+		flags := http2.Flags(head[4])
+		id := binary.BigEndian.Uint32(head[5:9]) & 0x7fffffff
+		if in.headerID != 0 && (typ != http2.FrameContinuation || id != in.headerID) {
+			return errHTTP2Event
+		}
+		if typ == http2.FrameData {
+			s := e.streams[id]
+			if id == 0 || !e.reset[id] && (s == nil || s[side].body == nil || s[side].ended || s[side].trailers) {
+				return errHTTP2Event
+			}
+			buf.Next(9)
+			in.dataID = id
+			in.remaining = length
+			in.padding = 0
+			in.padded = flags.Has(http2.FlagDataPadded)
+			in.dataFin = flags.Has(http2.FlagDataEndStream)
+			if in.padded && length == 0 {
+				return errHTTP2Event
+			}
+			continue
+		}
+		if (typ == http2.FrameHeaders || typ == http2.FrameContinuation || typ == http2.FrameSettings) && length > eventFieldLimit {
+			return ErrHTTPEventLimit
+		}
+		if buf.Len() < 9+length {
+			return nil
+		}
+		buf.Next(9)
+		payload := buf.Next(length)
+		switch typ {
+		case http2.FrameHeaders:
+			if id == 0 {
+				return errHTTP2Event
+			}
+			if flags.Has(http2.FlagHeadersPadded) {
+				if len(payload) == 0 || int(payload[0]) >= len(payload) {
+					return errHTTP2Event
+				}
+				payload = payload[1 : len(payload)-int(payload[0])]
+			}
+			if flags.Has(http2.FlagHeadersPriority) {
+				if len(payload) < 5 {
+					return errHTTP2Event
+				}
+				payload = payload[5:]
+			}
+			in.headerID = id
+			in.headerFin = flags.Has(http2.FlagHeadersEndStream)
+			fallthrough
+		case http2.FrameContinuation:
+			if in.headerID == 0 || in.headerID != id {
+				return errHTTP2Event
+			}
+			if len(in.headerBlock)+len(payload) > eventFieldLimit {
+				return ErrHTTPEventLimit
+			}
+			in.headerBlock = append(in.headerBlock, payload...)
+			if flags.Has(http2.FlagHeadersEndHeaders) {
+				if err := p.eventHeaders(id, client, in.headerBlock, in.headerFin); err != nil {
+					return err
+				}
+				in.headerBlock = nil
+				in.headerID = 0
+			}
+		case http2.FrameRSTStream:
+			if id == 0 || length != 4 {
+				return errHTTP2Event
+			}
+			if !e.reset[id] && len(e.reset) >= 1024 {
+				return ErrHTTPEventLimit
+			}
+			e.reset[id] = true
+			if s := e.streams[id]; s != nil {
+				for i := range s {
+					if s[i].body != nil {
+						s[i].body.at = p.packetTime
+						_ = s[i].body.finish("reset", map[string]any{"error_code": uint64(binary.BigEndian.Uint32(payload))})
+					}
+				}
+				delete(e.streams, id)
+			}
+		case http2.FrameSettings:
+			if id != 0 || len(payload)%6 != 0 || flags.Has(http2.FlagSettingsAck) && len(payload) != 0 {
+				return errHTTP2Event
+			}
+			for len(payload) > 0 {
+				if binary.BigEndian.Uint16(payload) == 1 {
+					dec := p.clientDecoder
+					if client {
+						dec = p.serverDecoder
+					}
+					dec.SetAllowedMaxDynamicTableSize(min(binary.BigEndian.Uint32(payload[2:]), uint32(eventFieldLimit)))
+				}
+				payload = payload[6:]
+			}
+		case http2.FramePushPromise:
+			return errors.New("HTTP/2 PUSH_PROMISE is unsupported in HTTP event mode")
+		}
+	}
+}
+
+func (p *HTTP2StreamParser) eventHeaders(id uint32, client bool, block []byte, fin bool) error {
+	dec := p.serverDecoder
+	if client {
+		dec = p.clientDecoder
+	}
+	fields := make([]qpackField, 0, 8)
+	size := 0
+	dec.SetEmitFunc(func(f hpack.HeaderField) {
+		size += len(f.Name) + len(f.Value) + 32
+		if size <= eventFieldLimit && len(fields) <= maxHTTP3Fields {
+			fields = append(fields, qpackField{f.Name, f.Value})
+		}
+	})
+	_, err := dec.Write(block)
+	dec.SetEmitFunc(nil)
+	if err != nil {
+		return err
+	}
+	if err = dec.Close(); err != nil {
+		return err
+	}
+	if size > eventFieldLimit || len(fields) > maxHTTP3Fields {
+		return ErrHTTPEventLimit
+	}
+	e := p.events
+	if e.reset[id] {
+		return nil
+	} // HPACK above still advances for in-flight headers.
+	s := e.streams[id]
+	if s == nil {
+		if len(e.streams) >= 1024 {
+			return ErrHTTPEventLimit
+		}
+		s = &h2EventStream{}
+		e.streams[id] = s
+	}
+	side := http3Side(client)
+	half := &s[side]
+	trailer := half.body != nil
+	if half.ended || half.trailers {
+		return errHTTP2Event
+	}
+	h, err := parseHTTP3Headers(fields, client, trailer)
+	if err != nil {
+		return errHTTP2Event
+	}
+	if trailer {
+		if !fin {
+			return errHTTP2Event
+		}
+		half.body.at = p.packetTime
+		if err := half.body.trailers(h.headers); err != nil {
+			return err
+		}
+		half.trailers = true
+	} else {
+		info := !client && h.status[0] == '1'
+		if info && fin {
+			return errHTTP2Event
+		}
+		meta := map[string]any{}
+		if client {
+			meta["method"] = h.method
+			meta["path"] = h.path
+			meta["scheme"] = h.scheme
+			meta["authority"] = h.authority
+		} else {
+			meta["status"], _ = strconv.Atoi(h.status)
+		}
+		body, err := e.output.headers("http/2", uint64(id), client, p.packetTime, h.headers, meta, info)
+		if err != nil {
+			return err
+		}
+		if !info {
+			half.body = body
+		}
+	}
+	if fin {
+		return e.end(id, side)
+	}
+	return nil
+}
+func (e *http2Events) end(id uint32, side int) error {
+	s := e.streams[id]
+	s[side].ended = true
+	err := s[side].body.finish("end", nil)
+	if s[1-side].ended {
+		delete(e.streams, id)
+	}
+	return err
+}
+func (p *HTTP2StreamParser) FinishHTTPEvents(reason string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.finishEvents(reason)
+}
+func (p *HTTP2StreamParser) finishEvents(reason string) {
+	e := p.events
+	if e == nil || e.closed {
+		return
+	}
+	e.closed = true
+	incomplete := len(e.output.active) > 0 || p.clientBuffer.Len()+p.serverBuffer.Len() > 0
+	for _, in := range e.input {
+		incomplete = incomplete || in.headerID != 0 || in.dataID != 0
+	}
+	if reason != "reset" && reason != "partial" && p.parseErr == nil && incomplete {
+		p.parseErr = io.ErrUnexpectedEOF
+	}
+	if reason == "reset" {
+		e.output.finishAll("reset")
+	} else {
+		e.output.abort()
+	}
+	e.streams = nil
+	e.reset = nil
+	e.input = [2]h2EventInput{}
+	p.clientBuffer = bytes.Buffer{}
+	p.serverBuffer = bytes.Buffer{}
 }

@@ -3,6 +3,8 @@ package protocol
 import (
 	"bytes"
 	"net"
+	"net/http"
+	"slices"
 	"strings"
 	"testing"
 
@@ -156,5 +158,108 @@ func TestHTTP2MultiplexedBodiesOnOneConnection(t *testing.T) {
 		got[3]["request"].Metadata["method"] != "GET" || got[3]["request"].Metadata["path"] != "/small" ||
 		got[3]["response"].Metadata["status"] != 200 {
 		t.Fatalf("HTTP/2 streams crossed or lost data: %#v", got)
+	}
+}
+
+func TestHTTP2EventsDirectionsResetAndContinuation(t *testing.T) {
+	out := make(chan *types.DecryptedPacket, 24)
+	p := NewHTTP2StreamParser(types.ConnectionKey{Proto: "tcp"}, out)
+	p.EnableHTTPEvents(0)
+	var c, s bytes.Buffer
+	c.WriteString(http2.ClientPreface)
+	cf := http2.NewFramer(&c, nil)
+	sf := http2.NewFramer(&s, nil)
+	req := encodeHTTP2Headers(t, hpack.HeaderField{Name: ":method", Value: "POST"}, hpack.HeaderField{Name: ":scheme", Value: "https"}, hpack.HeaderField{Name: ":path", Value: "/"})
+	if err := cf.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: req[:2]}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cf.WriteContinuation(1, true, req[2:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := cf.WriteData(1, false, []byte("upload")); err != nil {
+		t.Fatal(err)
+	}
+	p.FeedRequest(c.Bytes())
+	resp := encodeHTTP2Headers(t, hpack.HeaderField{Name: ":status", Value: "200"})
+	if err := sf.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, EndHeaders: true, BlockFragment: resp}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sf.WriteDataPadded(1, false, []byte("ok"), make([]byte, 3)); err != nil {
+		t.Fatal(err)
+	}
+	trail := encodeHTTP2Headers(t, hpack.HeaderField{Name: "x-last", Value: "done"})
+	if err := sf.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, EndStream: true, BlockFragment: trail[:1]}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sf.WriteContinuation(1, true, trail[1:]); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range s.Bytes() {
+		p.FeedResponse([]byte{v})
+	}
+	c.Reset()
+	if err := cf.WriteRSTStream(1, http2.ErrCodeCancel); err != nil {
+		t.Fatal(err)
+	}
+	p.FeedRequest(c.Bytes())
+	p.Flush()
+	p.Flush()
+	if p.Err() != nil {
+		t.Fatal(p.Err())
+	}
+	var response bytes.Buffer
+	var order []string
+	for len(out) > 0 {
+		v := <-out
+		kind := v.Metadata["kind"].(string)
+		if v.Direction == "response" {
+			order = append(order, kind)
+			if kind == "body_chunk" {
+				response.Write(v.Data)
+			}
+			if kind == "trailers" && v.Metadata["trailers"].(http.Header).Get("X-Last") != "done" {
+				t.Fatal(v.Metadata)
+			}
+		} else if kind == "reset" && (v.Metadata["offset"] != uint64(6) || v.Metadata["error_code"] != uint64(http2.ErrCodeCancel)) {
+			t.Fatal(v.Metadata)
+		}
+	}
+	if response.String() != "ok" || !slices.Equal(order, []string{"headers", "body_chunk", "body_chunk", "trailers", "end"}) {
+		t.Fatal(order, response.String())
+	}
+}
+
+func TestHTTP2EventsResetDuringData(t *testing.T) {
+	out := make(chan *types.DecryptedPacket, 16)
+	p := NewHTTP2StreamParser(types.ConnectionKey{Proto: "tcp"}, out)
+	p.EnableHTTPEvents(0)
+	var c, s bytes.Buffer
+	c.WriteString(http2.ClientPreface)
+	cf := http2.NewFramer(&c, nil)
+	sf := http2.NewFramer(&s, nil)
+	req := encodeHTTP2Headers(t, hpack.HeaderField{Name: ":method", Value: "POST"}, hpack.HeaderField{Name: ":scheme", Value: "https"}, hpack.HeaderField{Name: ":path", Value: "/"})
+	if err := cf.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, EndHeaders: true, BlockFragment: req}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cf.WriteData(1, true, []byte("abcd")); err != nil {
+		t.Fatal(err)
+	}
+	p.FeedRequest(c.Bytes()[:c.Len()-2])
+	if err := sf.WriteRSTStream(1, http2.ErrCodeCancel); err != nil {
+		t.Fatal(err)
+	}
+	p.FeedResponse(s.Bytes())
+	p.FeedRequest(c.Bytes()[c.Len()-2:])
+	if p.Err() != nil {
+		t.Fatal(p.Err())
+	}
+	p.Flush()
+	if len(out) != 3 {
+		t.Fatalf("events=%d", len(out))
+	}
+	<-out
+	body, rst := <-out, <-out
+	if string(body.Data) != "ab" || rst.Metadata["kind"] != "reset" || rst.Metadata["offset"] != uint64(2) {
+		t.Fatal(body.Metadata, rst.Metadata)
 	}
 }
