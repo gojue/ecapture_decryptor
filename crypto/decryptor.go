@@ -7,6 +7,7 @@
 package crypto
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -26,7 +27,9 @@ type RecordDecryptor struct {
 	cipherSuite uint16
 	aead        cipher.AEAD
 	seq         uint64
-	iv          []byte     // For TLS 1.3
+	iv          []byte // For TLS 1.3
+	secret      []byte // Current TLS 1.3 traffic secret; replaced on KeyUpdate.
+	exhausted   bool
 	mu          sync.Mutex // protects seq and ensures thread-safe decryption
 	// For TLS 1.2 and earlier with CBC mode
 	blockCipher cipher.Block
@@ -45,8 +48,11 @@ func NewRecordDecryptor(version uint16, cipherSuite uint16, trafficSecret []byte
 
 	// Get cipher suite config from registry
 	config, ok := GetCipherSuite(cipherSuite)
-	if !ok || config.Version == TLSVersion12 {
+	if version != tls.VersionTLS13 || !ok || config.Version == TLSVersion12 {
 		return nil, fmt.Errorf("unsupported TLS 1.3 cipher suite: 0x%04x", cipherSuite)
+	}
+	if len(trafficSecret) != config.HashFunc().Size() {
+		return nil, fmt.Errorf("invalid TLS 1.3 traffic secret length")
 	}
 
 	// Derive key and IV using HKDF-Expand-Label
@@ -61,7 +67,30 @@ func NewRecordDecryptor(version uint16, cipherSuite uint16, trafficSecret []byte
 	}
 
 	rd.iv = iv
+	rd.secret = bytes.Clone(trafficSecret)
 	return rd, nil
+}
+
+// UpdateTrafficSecret advances this direction after the caller has authenticated
+// a complete KeyUpdate under the old key (RFC 8446 7.2). It never probes future
+// generations to recover from authentication failures.
+func (rd *RecordDecryptor) UpdateTrafficSecret() error {
+	rd.mu.Lock()
+	defer rd.mu.Unlock()
+	config, ok := GetCipherSuite(rd.cipherSuite)
+	if rd.version != tls.VersionTLS13 || !ok || len(rd.secret) == 0 {
+		return fmt.Errorf("TLS KeyUpdate requires a TLS 1.3 traffic secret")
+	}
+	secret := hkdfExpandLabel(config.HashFunc, rd.secret, "traffic upd", nil, config.HashFunc().Size())
+	next, err := NewRecordDecryptor(rd.version, rd.cipherSuite, secret)
+	if err != nil {
+		return err
+	}
+	clear(rd.secret)
+	clear(rd.iv)
+	rd.aead, rd.iv, rd.secret = next.aead, next.iv, next.secret
+	rd.seq, rd.exhausted = 0, false
+	return nil
 }
 
 // hkdfExpandLabel implements HKDF-Expand-Label from RFC 8446
@@ -99,7 +128,7 @@ func NewRecordDecryptorTLS12(version uint16, cipherSuite uint16, masterSecret, c
 
 	// Get cipher suite config from registry
 	config, ok := GetCipherSuite(cipherSuite)
-	if !ok {
+	if !ok || config.Version == TLSVersion13 {
 		return nil, fmt.Errorf("unsupported cipher suite: 0x%04x", cipherSuite)
 	}
 
@@ -214,6 +243,9 @@ func pHash(hashFunc func() hash.Hash, secret, seed []byte, n int) []byte {
 func (rd *RecordDecryptor) Decrypt(record []byte) ([]byte, byte, error) {
 	rd.mu.Lock()
 	defer rd.mu.Unlock()
+	if rd.exhausted {
+		return nil, 0, fmt.Errorf("TLS record sequence exhausted")
+	}
 
 	if len(record) < 5 {
 		return nil, 0, fmt.Errorf("record too short")
@@ -304,7 +336,11 @@ func (rd *RecordDecryptor) decryptAEAD(recordType byte, version uint16, payload 
 		return nil, 0, fmt.Errorf("AEAD decryption failed: %w", err)
 	}
 
-	rd.seq++
+	if rd.seq == ^uint64(0) {
+		rd.exhausted = true
+	} else {
+		rd.seq++
+	}
 
 	// For TLS 1.3, remove content type padding and extract actual type
 	actualContentType := recordType
@@ -315,9 +351,12 @@ func (rd *RecordDecryptor) decryptAEAD(recordType byte, version uint16, payload 
 			n--
 		}
 		if n == 0 {
-			return []byte{}, 0, nil
+			return nil, 0, fmt.Errorf("invalid TLS 1.3 inner plaintext")
 		}
 		actualContentType = plaintext[n-1]
+		if actualContentType != 0x16 && actualContentType != 0x17 && actualContentType != 0x15 {
+			return nil, 0, fmt.Errorf("invalid TLS 1.3 inner content type")
+		}
 		plaintext = plaintext[:n-1]
 	}
 

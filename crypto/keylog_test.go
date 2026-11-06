@@ -309,3 +309,49 @@ func importTestKeyLog(store *KeyLogStore, content string, streaming bool) error 
 	}
 	return store.LoadFromReader(strings.NewReader(content))
 }
+
+func TestECHKeyLogExactAssociationAndCloning(t *testing.T) {
+	store := NewKeyLogStore()
+	outer := bytes.Repeat([]byte{0x32}, 32)
+	inner := bytes.Repeat([]byte{0x21}, 32)
+	outerHex := hex.EncodeToString(outer)
+	updated := store.Updates()
+	// Arrival order is independent of the TLS traffic-secret records.
+	if _, err := store.Write([]byte("ECH_CONFIG " + strings.ToUpper(outerHex) + " 010203\n")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-updated:
+	default:
+		t.Fatal("ECH_CONFIG did not notify")
+	}
+	secret := bytes.Repeat([]byte{0x44}, 32)
+	store.AddSecret("ECH_SECRET", outerHex, secret)
+	store.AddSecret("CLIENT_TRAFFIC_SECRET_0", hex.EncodeToString(inner), []byte{9})
+	secret[0] = 0
+	got := store.GetSecrets(outer)
+	if got == nil || got.ECHSecret[0] != 0x44 || !bytes.Equal(got.ECHConfig, []byte{1, 2, 3}) || len(got.ClientTrafficSecret) != 0 {
+		t.Fatal("ECH labels not isolated on exact outer random")
+	}
+	got.ECHSecret[0] = 0
+	got.ECHConfig[0] = 0
+	again := store.GetSecrets(outer)
+	if again.ECHSecret[0] != 0x44 || again.ECHConfig[0] != 1 {
+		t.Fatal("ECH snapshot aliases store")
+	}
+	if got := store.GetSecrets(inner); got == nil || len(got.ECHConfig) != 0 || len(got.ECHSecret) != 0 || !bytes.Equal(got.ClientTrafficSecret, []byte{9}) {
+		t.Fatal("inner and outer identities mixed")
+	}
+	before := store.secretBytes
+	for _, bad := range []string{"00", "zz" + outerHex[2:], outerHex + "00"} {
+		store.AddSecret("ECH_SECRET", bad, []byte{1})
+	}
+	if store.secretBytes != before || len(store.secrets) != 2 {
+		t.Fatal("malformed ECH random allocated storage")
+	}
+	store.secretBytes = maxKeyLogSecretBytes
+	_, err := store.Write([]byte("ECH_CONFIG " + outerHex + " 01020304\n"))
+	if !errors.Is(err, ErrKeyLogResourceLimit) || len(store.GetSecrets(outer).ECHConfig) != 3 {
+		t.Fatal("ECH import bypassed secret-byte budget")
+	}
+}

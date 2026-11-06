@@ -7,228 +7,579 @@
 package crypto
 
 import (
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/binary"
-	"fmt"
+	"errors"
+	"hash"
 	"io"
+
+	"golang.org/x/crypto/hkdf"
 )
 
-// readHandshakeMessage reads TLS records from the stream until a full handshake message is assembled.
+const maxHandshakeMessage = 1 << 20
+
+var ErrHandshakeResourceLimit = errors.New("TLS handshake resource limit exceeded")
+var errInvalidHandshake = errors.New("invalid TLS handshake message")
+
+// HandshakeAssembler frames authenticated handshake fragments. A complete
+// message owns its bytes; only the current incomplete message is retained.
+// The caller serializes access and validates encryption-epoch boundaries.
+type HandshakeAssembler struct {
+	pending []byte
+	err     error
+}
+
+func (a *HandshakeAssembler) Feed(data []byte) (messages [][]byte, err error) {
+	if a.err != nil {
+		return nil, a.err
+	}
+	for len(data) > 0 {
+		size := 4
+		if len(a.pending) >= 4 {
+			size += int(a.pending[1])<<16 | int(a.pending[2])<<8 | int(a.pending[3])
+			if size > maxHandshakeMessage {
+				a.pending = nil
+				a.err = ErrHandshakeResourceLimit
+				return nil, a.err
+			}
+		}
+		n := min(size-len(a.pending), len(data))
+		a.pending = append(a.pending, data[:n]...)
+		data = data[n:]
+		if len(a.pending) < 4 {
+			continue
+		}
+		size = 4 + int(a.pending[1])<<16 + int(a.pending[2])<<8 + int(a.pending[3])
+		if size > maxHandshakeMessage || len(messages) >= 4096 {
+			a.pending = nil
+			a.err = ErrHandshakeResourceLimit
+			return nil, a.err
+		}
+		if len(a.pending) == size {
+			messages = append(messages, a.pending)
+			a.pending = nil
+		}
+	}
+	return messages, nil
+}
+func (a *HandshakeAssembler) Pending() bool { return len(a.pending) != 0 }
+func (a *HandshakeAssembler) Reset()        { a.pending = nil; a.err = nil }
+
+// readHandshakeMessage accepts a split four-byte header and preserves every
+// following message from its final plaintext record for subsequent processing.
 func readHandshakeMessage(s *StreamBuffer) ([]byte, error) {
-	// Read the first record to get the handshake message header
-	record, err := s.ReadRecord()
-	if err != nil {
-		return nil, err
-	}
-
-	if len(record) < 5+4 { // Record header + handshake header
-		return nil, fmt.Errorf("handshake record too short")
-	}
-
-	handshakeData := record[5:]
-	if handshakeData[0] == 0x14 { // ChangeCipherSpec
-		// This can happen in TLS 1.2. We should read the next record.
-		return readHandshakeMessage(s)
-	}
-
-	// Handshake message length (3 bytes)
-	msgLen := int(handshakeData[1])<<16 | int(handshakeData[2])<<8 | int(handshakeData[3])
-	totalHandshakeMsgLen := 4 + msgLen // type + length + body
-
-	// Keep reading records if the full message hasn't been received
-	for len(handshakeData) < totalHandshakeMsgLen {
-		nextRecord, err := s.ReadRecord()
+	var message []byte
+	size := 4
+	for records := 0; ; records++ {
+		if records >= 4096 {
+			return nil, ErrHandshakeResourceLimit
+		}
+		record, err := s.ReadRecord()
 		if err != nil {
-			if err == io.EOF {
-				return nil, fmt.Errorf("handshake message truncated, unexpected EOF")
+			if len(message) != 0 && errors.Is(err, io.EOF) {
+				return nil, io.ErrUnexpectedEOF
 			}
 			return nil, err
 		}
-		if len(nextRecord) < 5 {
-			return nil, fmt.Errorf("invalid subsequent record")
+		if len(record) < 5 || record[1] != 3 || len(record)-5 > 16384 {
+			return nil, errInvalidHandshake
 		}
-		handshakeData = append(handshakeData, nextRecord[5:]...)
+		if record[0] == 20 && bytes.Equal(record[5:], []byte{1}) && len(message) == 0 {
+			continue
+		}
+		if record[0] != 22 || len(record) == 5 {
+			return nil, errInvalidHandshake
+		}
+		data := record[5:]
+		for len(data) > 0 {
+			n := min(size-len(message), len(data))
+			message = append(message, data[:n]...)
+			data = data[n:]
+			if len(message) < 4 {
+				break
+			}
+			size = 4 + int(message[1])<<16 + int(message[2])<<8 + int(message[3])
+			if size > maxHandshakeMessage {
+				return nil, ErrHandshakeResourceLimit
+			}
+			if len(message) == size {
+				if len(data) > 0 {
+					tail := append(bytes.Clone(record[:5]), data...)
+					binary.BigEndian.PutUint16(tail[3:5], uint16(len(data)))
+					if err := s.unreadRecord(tail); err != nil {
+						return nil, err
+					}
+				}
+				return message, nil
+			}
+		}
 	}
-
-	// Return the full handshake message (without record layer headers)
-	return handshakeData[:totalHandshakeMsgLen], nil
 }
 
-// ExtractClientRandom extracts the client random from a ClientHello record
-func ExtractClientRandom(s *StreamBuffer) ([]byte, error) {
-	handshake, err := readHandshakeMessage(s)
+type helloExtension struct {
+	typ   uint16
+	data  []byte
+	start int
+}
+
+func parseHelloExtensions(message []byte, offset int) ([]helloExtension, error) {
+	if offset == len(message) {
+		return nil, nil
+	}
+	if offset+2 > len(message) || int(binary.BigEndian.Uint16(message[offset:])) != len(message)-offset-2 {
+		return nil, errInvalidHandshake
+	}
+	var extensions []helloExtension
+	seen := make(map[uint16]bool)
+	for p := offset + 2; p < len(message); {
+		if p+4 > len(message) {
+			return nil, errInvalidHandshake
+		}
+		typ, n := binary.BigEndian.Uint16(message[p:]), int(binary.BigEndian.Uint16(message[p+2:]))
+		if seen[typ] || n > len(message)-p-4 {
+			return nil, errInvalidHandshake
+		}
+		if len(extensions) >= 1024 {
+			return nil, ErrHandshakeResourceLimit
+		}
+		seen[typ] = true
+		extensions = append(extensions, helloExtension{typ, message[p+4 : p+4+n], p + 4})
+		p += 4 + n
+	}
+	return extensions, nil
+}
+func validHandshake(message []byte, typ byte) bool {
+	return len(message) >= 4 && len(message) <= maxHandshakeMessage && message[0] == typ &&
+		4+int(message[1])<<16+int(message[2])<<8+int(message[3]) == len(message)
+}
+
+// ClientHelloInfo retains the complete wire handshake for ECH authentication;
+// Random always names this message, never an inferred or searched keylog entry.
+type ClientHelloInfo struct {
+	Random          []byte
+	EarlyData       bool
+	ECHOffered      bool
+	Message         []byte
+	extensions      []helloExtension
+	extensionOffset int
+	sessionID       []byte
+}
+
+// ReadClientHello reads one complete plaintext ClientHello, preserving tails.
+func ReadClientHello(s *StreamBuffer) (*ClientHelloInfo, error) {
+	message, err := readHandshakeMessage(s)
 	if err != nil {
 		return nil, err
 	}
-
-	// Handshake message type (1 byte) should be ClientHello (0x01)
-	if handshake[0] != 0x01 {
-		return nil, fmt.Errorf("not a ClientHello message: got 0x%02x", handshake[0])
+	return parseClientHello(message)
+}
+func parseClientHello(message []byte) (*ClientHelloInfo, error) {
+	if !validHandshake(message, 1) || len(message) < 39 {
+		return nil, errInvalidHandshake
 	}
-
-	// Handshake message length (3 bytes)
-	msgLen := int(handshake[1])<<16 | int(handshake[2])<<8 | int(handshake[3])
-
-	if len(handshake) < 4+msgLen {
-		return nil, fmt.Errorf("handshake message truncated")
+	message = bytes.Clone(message)
+	p := 38
+	sid := int(message[p])
+	p++
+	if sid > 32 || p+sid+2 > len(message) {
+		return nil, errInvalidHandshake
 	}
-
-	msg := handshake[4 : 4+msgLen]
-
-	// ClientHello structure:
-	// - Version (2 bytes)
-	// - Random (32 bytes)
-	if len(msg) < 2+32 {
-		return nil, fmt.Errorf("ClientHello too short")
+	session := message[p : p+sid]
+	p += sid
+	suites := int(binary.BigEndian.Uint16(message[p:]))
+	p += 2
+	if suites < 2 || suites%2 != 0 || p+suites+1 > len(message) {
+		return nil, errInvalidHandshake
 	}
-
-	// Skip version (2 bytes), return random (32 bytes)
-	random := make([]byte, 32)
-	copy(random, msg[2:34])
-
-	return random, nil
+	p += suites
+	compression := int(message[p])
+	p++
+	if compression == 0 || p+compression > len(message) {
+		return nil, errInvalidHandshake
+	}
+	p += compression
+	extensions, err := parseHelloExtensions(message, p)
+	if err != nil {
+		return nil, err
+	}
+	result := &ClientHelloInfo{Random: bytes.Clone(message[6:38]), Message: message, extensions: extensions, extensionOffset: p, sessionID: session}
+	for _, e := range extensions {
+		switch e.typ {
+		case 42:
+			if len(e.data) != 0 {
+				return nil, errInvalidHandshake
+			}
+			result.EarlyData = true
+		case 0xfe0d:
+			if len(e.data) == 0 || e.data[0] > 1 || e.data[0] == 1 && len(e.data) != 1 {
+				return nil, errInvalidHandshake
+			}
+			result.ECHOffered = e.data[0] == 0
+		}
+	}
+	return result, nil
 }
 
-// ExtractServerRandom extracts the server random from a ServerHello record
+func ExtractClientRandom(s *StreamBuffer) ([]byte, error) {
+	hello, err := ReadClientHello(s)
+	if err != nil {
+		return nil, err
+	}
+	return hello.Random, nil
+}
 func ExtractServerRandom(handshake []byte) ([]byte, error) {
-	if len(handshake) < 4 {
-		return nil, fmt.Errorf("handshake message too short")
+	if !validHandshake(handshake, 2) || len(handshake) < 38 {
+		return nil, errInvalidHandshake
 	}
-
-	// Handshake message type (1 byte) should be ServerHello (0x02)
-	if handshake[0] != 0x02 {
-		return nil, fmt.Errorf("not a ServerHello message: got 0x%02x", handshake[0])
-	}
-
-	// Handshake message length (3 bytes)
-	msgLen := int(handshake[1])<<16 | int(handshake[2])<<8 | int(handshake[3])
-
-	if len(handshake) < 4+msgLen {
-		return nil, fmt.Errorf("handshake message truncated")
-	}
-
-	msg := handshake[4 : 4+msgLen]
-
-	// ServerHello structure:
-	// - Version (2 bytes)
-	// - Random (32 bytes)
-	if len(msg) < 2+32 {
-		return nil, fmt.Errorf("ServerHello too short")
-	}
-
-	// Skip version (2 bytes), return random (32 bytes)
-	random := make([]byte, 32)
-	copy(random, msg[2:34])
-
-	return random, nil
+	return bytes.Clone(handshake[6:38]), nil
 }
 
-// ParseServerHello extracts version and cipher suite from ServerHello
-func ParseServerHello(s *StreamBuffer) (version uint16, cipherSuite uint16, handshakeMsg []byte, err error) {
-	handshake, err := readHandshakeMessage(s)
+func serverHello(message []byte) (version, suite uint16, extensions []helloExtension, err error) {
+	if !validHandshake(message, 2) || len(message) < 42 {
+		return 0, 0, nil, errInvalidHandshake
+	}
+	sid := int(message[38])
+	p := 39 + sid
+	if sid > 32 || p+3 > len(message) || message[p+2] != 0 {
+		return 0, 0, nil, errInvalidHandshake
+	}
+	version, suite = binary.BigEndian.Uint16(message[4:]), binary.BigEndian.Uint16(message[p:])
+	extensions, err = parseHelloExtensions(message, p+3)
 	if err != nil {
 		return 0, 0, nil, err
 	}
-	handshakeMsg = handshake
-
-	if len(handshake) < 4 {
-		return 0, 0, nil, fmt.Errorf("handshake message too short")
-	}
-
-	// Handshake message type (1 byte) should be ServerHello (0x02)
-	if handshake[0] != 0x02 {
-		return 0, 0, nil, fmt.Errorf("not a ServerHello message")
-	}
-
-	// Handshake message length (3 bytes)
-	msgLen := int(handshake[1])<<16 | int(handshake[2])<<8 | int(handshake[3])
-
-	if len(handshake) < 4+msgLen {
-		return 0, 0, nil, fmt.Errorf("handshake message truncated")
-	}
-
-	msg := handshake[4 : 4+msgLen]
-
-	// ServerHello structure:
-	// - Version (2 bytes)
-	// - Random (32 bytes)
-	// - Session ID length (1 byte)
-	// - Session ID (variable)
-	// - Cipher suite (2 bytes)
-	// - Compression method (1 byte)
-	// - Extensions (optional)
-
-	if len(msg) < 2+32+1 {
-		return 0, 0, nil, fmt.Errorf("ServerHello too short")
-	}
-
-	// Parse version
-	version = binary.BigEndian.Uint16(msg[0:2])
-
-	// Skip random (32 bytes)
-	pos := 2 + 32
-
-	// Parse session ID
-	sessionIDLen := int(msg[pos])
-	pos++
-
-	if len(msg) < pos+sessionIDLen+2 {
-		return 0, 0, nil, fmt.Errorf("ServerHello truncated at session ID")
-	}
-
-	pos += sessionIDLen
-
-	// Parse cipher suite
-	cipherSuite = binary.BigEndian.Uint16(msg[pos : pos+2])
-	pos += 2
-
-	// Skip compression method
-	pos++
-
-	// Check for extensions (TLS 1.3 uses supported_versions extension)
-	if len(msg) > pos+2 {
-		extensionsLen := binary.BigEndian.Uint16(msg[pos : pos+2])
-		pos += 2
-
-		if len(msg) >= pos+int(extensionsLen) {
-			// Parse extensions to find supported_versions
-			extensions := msg[pos : pos+int(extensionsLen)]
-			actualVersion := parseSupportedVersionExtension(extensions)
-			if actualVersion != 0 {
-				version = actualVersion
+	for _, e := range extensions {
+		if e.typ == 43 {
+			if len(e.data) != 2 {
+				return 0, 0, nil, errInvalidHandshake
 			}
+			version = binary.BigEndian.Uint16(e.data)
+		}
+		if e.typ == 41 && len(e.data) != 2 {
+			return 0, 0, nil, errInvalidHandshake
 		}
 	}
-
-	return version, cipherSuite, handshakeMsg, nil
+	return version, suite, extensions, nil
 }
 
-// parseSupportedVersionExtension extracts the TLS version from supported_versions extension
-func parseSupportedVersionExtension(extensions []byte) uint16 {
-	pos := 0
-	for pos+4 <= len(extensions) {
-		extType := binary.BigEndian.Uint16(extensions[pos : pos+2])
-		extLen := binary.BigEndian.Uint16(extensions[pos+2 : pos+4])
-		pos += 4
-
-		if pos+int(extLen) > len(extensions) {
-			break
-		}
-
-		// supported_versions extension type is 43 (0x002b)
-		if extType == 43 {
-			if int(extLen) >= 2 {
-				// In ServerHello, this contains a single version
-				return binary.BigEndian.Uint16(extensions[pos : pos+2])
-			}
-		}
-
-		pos += int(extLen)
+// ParseServerHello returns one ServerHello or HelloRetryRequest. Callers must
+// handle HRR before selecting application keys and must reject repeated HRR.
+func ParseServerHello(s *StreamBuffer) (version uint16, cipherSuite uint16, handshakeMsg []byte, err error) {
+	handshakeMsg, err = readHandshakeMessage(s)
+	if err != nil {
+		return 0, 0, nil, err
 	}
-
-	return 0
+	version, cipherSuite, _, err = serverHello(handshakeMsg)
+	return
 }
 
-// TLS version constants
+var helloRetryRandom = []byte{0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c}
+
+func IsHelloRetryRequest(message []byte) bool {
+	return validHandshake(message, 2) && len(message) >= 38 && bytes.Equal(message[6:38], helloRetryRandom)
+}
+func ServerHelloResumed(message []byte) bool {
+	version, _, extensions, err := serverHello(message)
+	if err != nil || version != VersionTLS13 || IsHelloRetryRequest(message) {
+		return false
+	}
+	for _, e := range extensions {
+		if e.typ == 41 {
+			return true
+		}
+	}
+	return false
+}
+
+var (
+	ErrECHSecretsUnavailable = errors.New("ECH keylog material unavailable")
+	ErrECHUnsupported        = errors.New("unsupported ECH parameters or retry")
+	ErrECHAuthentication     = errors.New("ECH authentication failed")
+	ErrECHInvalid            = errors.New("invalid ECH encoding")
+)
+
+// ResolveECHClientHello authenticates the encrypted ClientHello with RFC 9850
+// ECH_SECRET/ECH_CONFIG attached to its exact outer random. Only a verified
+// RFC 9849 acceptance confirmation selects the inner random for TLS key lookup.
+// It supports the mandatory X25519/HKDF-SHA256/AES-128-GCM ECH suite, without HRR.
+func ResolveECHClientHello(outer *ClientHelloInfo, serverMessage []byte, secrets *TLSSecrets) (*ClientHelloInfo, string, error) {
+	if outer == nil {
+		return nil, "unknown", ErrECHInvalid
+	}
+	// Reparse the exported wire value so caller mutation cannot detach offsets
+	// or random metadata from the authenticated ClientHello.
+	outer, err := parseClientHello(outer.Message)
+	if err != nil {
+		return nil, "unknown", ErrECHInvalid
+	}
+	if !outer.ECHOffered {
+		return outer, "not_offered", nil
+	}
+	if IsHelloRetryRequest(serverMessage) {
+		return nil, "unknown", ErrECHUnsupported
+	}
+	version, suite, _, err := serverHello(serverMessage)
+	if err != nil {
+		return nil, "unknown", ErrECHInvalid
+	}
+	if version != VersionTLS13 {
+		return outer, "rejected", nil
+	}
+	if secrets == nil || len(secrets.ECHSecret) == 0 || len(secrets.ECHConfig) == 0 {
+		return nil, "unknown", ErrECHSecretsUnavailable
+	}
+	var ech helloExtension
+	for _, e := range outer.extensions {
+		if e.typ == 0xfd00 {
+			return nil, "unknown", ErrECHInvalid
+		}
+		if e.typ == 0xfe0d {
+			ech = e
+		}
+	}
+	data := ech.data
+	if len(data) < 10 || data[0] != 0 {
+		return nil, "unknown", ErrECHInvalid
+	}
+	kdf, aead := binary.BigEndian.Uint16(data[1:]), binary.BigEndian.Uint16(data[3:])
+	if kdf != 1 || aead != 1 {
+		return nil, "unknown", ErrECHUnsupported
+	}
+	enc := int(binary.BigEndian.Uint16(data[6:]))
+	if enc != 32 {
+		return nil, "unknown", ErrECHUnsupported
+	}
+	p := 8 + enc
+	if p+2 > len(data) {
+		return nil, "unknown", ErrECHInvalid
+	}
+	n := int(binary.BigEndian.Uint16(data[p:]))
+	p += 2
+	if n < 16 || n != len(data)-p {
+		return nil, "unknown", ErrECHInvalid
+	}
+	if err := validateECHConfig(secrets.ECHConfig, data[5]); err != nil {
+		return nil, "unknown", err
+	}
+	protection, nonce, err := echProtection(secrets.ECHSecret, secrets.ECHConfig)
+	if err != nil {
+		return nil, "unknown", err
+	}
+	// ClientHelloOuterAAD omits the handshake header and replaces only the
+	// encrypted payload with zeros; the enc, length and other fields stay bound.
+	aad := bytes.Clone(outer.Message[4:])
+	clear(aad[ech.start+p-4 : ech.start+p-4+n])
+	encoded, err := protection.Open(nil, nonce, data[p:], aad)
+	if err != nil {
+		return nil, "unknown", ErrECHAuthentication
+	}
+	inner, err := decodeECHInner(outer, encoded)
+	if err != nil {
+		return nil, "unknown", err
+	}
+	var newHash func() hash.Hash
+	switch suite {
+	case 0x1301, 0x1303:
+		newHash = sha256.New
+	case 0x1302:
+		newHash = sha512.New384
+	default:
+		return nil, "unknown", ErrECHUnsupported
+	}
+	modified := bytes.Clone(serverMessage)
+	clear(modified[30:38])
+	transcript := newHash()
+	transcript.Write(inner.Message)
+	transcript.Write(modified)
+	context := transcript.Sum(nil)
+	secret := hkdf.Extract(newHash, inner.Random, nil)
+	label := []byte("tls13 ech accept confirmation")
+	info := append([]byte{0, 8, byte(len(label))}, label...)
+	info = append(info, byte(len(context)))
+	info = append(info, context...)
+	confirmation := make([]byte, 8)
+	if _, err := io.ReadFull(hkdf.Expand(newHash, secret, info), confirmation); err != nil {
+		return nil, "unknown", ErrECHInvalid
+	}
+	if !hmac.Equal(confirmation, serverMessage[30:38]) {
+		return outer, "rejected", nil
+	}
+	return inner, "accepted", nil
+}
+
+func validateECHConfig(config []byte, id byte) error {
+	if len(config) < 12 || binary.BigEndian.Uint16(config) != 0xfe0d || int(binary.BigEndian.Uint16(config[2:])) != len(config)-4 || config[4] != id {
+		return ErrECHInvalid
+	}
+	if binary.BigEndian.Uint16(config[5:]) != 0x20 {
+		return ErrECHUnsupported
+	}
+	keyLen := int(binary.BigEndian.Uint16(config[7:]))
+	p := 9 + keyLen
+	if keyLen != 32 || p+2 > len(config) {
+		return ErrECHInvalid
+	}
+	suites := int(binary.BigEndian.Uint16(config[p:]))
+	p += 2
+	if suites < 4 || suites%4 != 0 || p+suites+2 > len(config) {
+		return ErrECHInvalid
+	}
+	matched := false
+	for end := p + suites; p < end; p += 4 {
+		matched = matched || binary.BigEndian.Uint16(config[p:]) == 1 && binary.BigEndian.Uint16(config[p+2:]) == 1
+	}
+	if !matched {
+		return ErrECHUnsupported
+	}
+	p++ // maximum_name_length is a padding hint, not a hostname bound.
+	nameLen := int(config[p])
+	p++
+	if nameLen == 0 || p+nameLen+2 > len(config) {
+		return ErrECHInvalid
+	}
+	p += nameLen
+	extensions, err := parseHelloExtensions(config, p)
+	if err != nil {
+		return ErrECHInvalid
+	}
+	for _, e := range extensions {
+		if e.typ&0x8000 != 0 {
+			return ErrECHUnsupported
+		}
+	}
+	return nil
+}
+
+// RFC 9180 base-mode key schedule, beginning at the logged KEM shared_secret.
+// crypto/hpke does not expose importing an already-derived shared secret.
+func echProtection(shared, config []byte) (cipher.AEAD, []byte, error) {
+	if len(shared) != 32 {
+		return nil, nil, ErrECHInvalid
+	}
+	suite := []byte{'H', 'P', 'K', 'E', 0, 0x20, 0, 1, 0, 1}
+	extract := func(salt []byte, label string, ikm []byte) []byte {
+		h := hmac.New(sha256.New, salt)
+		h.Write([]byte("HPKE-v1"))
+		h.Write(suite)
+		h.Write([]byte(label))
+		h.Write(ikm)
+		return h.Sum(nil)
+	}
+	info := append([]byte("tls ech\x00"), config...)
+	context := append([]byte{0}, extract(nil, "psk_id_hash", nil)...)
+	context = append(context, extract(nil, "info_hash", info)...)
+	secret := extract(shared, "secret", nil)
+	expand := func(label string, n int) []byte {
+		info := append([]byte{0, byte(n)}, []byte("HPKE-v1")...)
+		info = append(info, suite...)
+		info = append(info, label...)
+		info = append(info, context...)
+		result := make([]byte, n)
+		_, _ = io.ReadFull(hkdf.Expand(sha256.New, secret, info), result)
+		return result
+	}
+	block, err := aes.NewCipher(expand("key", 16))
+	if err != nil {
+		return nil, nil, ErrECHInvalid
+	}
+	aead, err := cipher.NewGCM(block)
+	return aead, expand("base_nonce", 12), err
+}
+
+func decodeECHInner(outer *ClientHelloInfo, encoded []byte) (*ClientHelloInfo, error) {
+	if len(encoded) < 40 || encoded[34] != 0 {
+		return nil, ErrECHInvalid
+	}
+	p := 35
+	suites := int(binary.BigEndian.Uint16(encoded[p:]))
+	p += 2
+	if suites < 2 || suites%2 != 0 || p+suites+1 > len(encoded) {
+		return nil, ErrECHInvalid
+	}
+	p += suites
+	compression := int(encoded[p])
+	p++
+	if compression == 0 || p+compression+2 > len(encoded) {
+		return nil, ErrECHInvalid
+	}
+	p += compression
+	end := p + 2 + int(binary.BigEndian.Uint16(encoded[p:]))
+	if end > len(encoded) {
+		return nil, ErrECHInvalid
+	}
+	for _, padding := range encoded[end:] {
+		if padding != 0 {
+			return nil, ErrECHInvalid
+		}
+	}
+	message := handshakeEncoding(1, encoded[:end])
+	compressed, err := parseClientHello(message)
+	if err != nil {
+		return nil, ErrECHInvalid
+	}
+	var extensions []byte
+	seen := make(map[uint16]bool)
+	for _, e := range compressed.extensions {
+		if e.typ != 0xfd00 {
+			seen[e.typ] = true
+		}
+	}
+	innerECH := false
+	for _, e := range compressed.extensions {
+		if e.typ != 0xfd00 {
+			extensions = append(extensions, message[e.start-4:e.start+len(e.data)]...)
+			innerECH = innerECH || e.typ == 0xfe0d && bytes.Equal(e.data, []byte{1})
+			continue
+		}
+		if len(e.data) < 3 || len(e.data) != int(e.data[0])+1 || e.data[0]%2 != 0 {
+			return nil, ErrECHInvalid
+		}
+		last := -1
+		for i := 1; i < len(e.data); i += 2 {
+			typ := binary.BigEndian.Uint16(e.data[i:])
+			if typ == 0xfe0d || typ == 0xfd00 || seen[typ] {
+				return nil, ErrECHInvalid
+			}
+			found := -1
+			for j := last + 1; j < len(outer.extensions); j++ {
+				if outer.extensions[j].typ == typ {
+					found = j
+					break
+				}
+			}
+			if found < 0 {
+				return nil, ErrECHInvalid
+			}
+			x := outer.extensions[found]
+			extensions = append(extensions, outer.Message[x.start-4:x.start+len(x.data)]...)
+			seen[typ], last = true, found
+		}
+	}
+	if !innerECH || len(extensions) > 65535 {
+		return nil, ErrECHInvalid
+	}
+	body := append(bytes.Clone(encoded[:34]), byte(len(outer.sessionID)))
+	body = append(body, outer.sessionID...)
+	body = append(body, encoded[35:p]...)
+	body = append(body, byte(len(extensions)>>8), byte(len(extensions)))
+	body = append(body, extensions...)
+	inner, err := parseClientHello(handshakeEncoding(1, body))
+	if err != nil || bytes.Equal(inner.Random, outer.Random) {
+		return nil, ErrECHInvalid
+	}
+	return inner, nil
+}
+
+func handshakeEncoding(typ byte, body []byte) []byte {
+	message := []byte{typ, byte(len(body) >> 16), byte(len(body) >> 8), byte(len(body))}
+	return append(message, body...)
+}
+
 const (
 	VersionTLS10 = 0x0301
 	VersionTLS11 = 0x0302

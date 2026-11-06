@@ -56,6 +56,8 @@ type TLSSecrets struct {
 	MasterSecret                 []byte // For TLS 1.2 and earlier
 	ClientEarlyTrafficSecret     []byte // For 0-RTT
 	ExporterSecret               []byte // Exporter secret
+	ECHSecret                    []byte // RFC 9850 HPKE shared_secret, indexed by outer random
+	ECHConfig                    []byte // RFC 9850 serialized ECHConfig, indexed by outer random
 }
 
 // NewKeyLogStore constructs an empty KeyLogStore.
@@ -140,6 +142,16 @@ func (kl *KeyLogStore) addSecretLocked(label, clientRandomHex string, secret []b
 		target = &s.ClientEarlyTrafficSecret
 	case "EXPORTER_SECRET":
 		target = &s.ExporterSecret
+	case "ECH_SECRET", "ECH_CONFIG":
+		random, err := hex.DecodeString(key)
+		if err != nil || len(random) != 32 {
+			return nil
+		}
+		if label == "ECH_SECRET" {
+			target = &s.ECHSecret
+		} else {
+			target = &s.ECHConfig
+		}
 	default:
 		return nil
 	}
@@ -241,6 +253,8 @@ func cloneSecrets(s *TLSSecrets) *TLSSecrets {
 	clone.MasterSecret = bytes.Clone(s.MasterSecret)
 	clone.ClientEarlyTrafficSecret = bytes.Clone(s.ClientEarlyTrafficSecret)
 	clone.ExporterSecret = bytes.Clone(s.ExporterSecret)
+	clone.ECHSecret = bytes.Clone(s.ECHSecret)
+	clone.ECHConfig = bytes.Clone(s.ECHConfig)
 	return &clone
 }
 

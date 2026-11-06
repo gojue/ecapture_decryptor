@@ -260,3 +260,99 @@ The negotiation transcripts follow [SMTP STARTTLS](https://www.rfc-editor.org/rf
 [PostgreSQL SSLRequest](https://www.postgresql.org/docs/18/protocol-flow.html#PROTOCOL-FLOW-SSL),
 [MySQL SSLRequest](https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_ssl_request.html)
 and [HTTP CONNECT](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.6).
+
+## D10 TLS state fixtures
+
+`tls_d10_openssl.c` and `tls_d10_ech.go` are standalone peers, independent of
+the SDK and eCapture. Both are excluded from ordinary Go package builds and
+must be compiled explicitly. The C peer uses OpenSSL's public APIs and real
+TCP sockets; the Go peer uses Go 1.26 `crypto/tls` and `crypto/ecdh`. Neither
+program writes capture files or synthesizes encrypted network records.
+
+The Go ECH pair was captured in 31 packets with zero drops.
+The OpenSSL matrix was captured with OpenSSL **3.5.5** on the Linux VM: 308
+packets and zero reported drops. Endpoint assertions verify actual negotiated
+ciphers, resumed sessions, early-data status and sent handshake messages.
+The two Go ECH modes also assert accepted/rejected outcomes independently.
+
+| Mode / `d10_MODE.pcapng` | TCP port | Connections / HTTP exchanges | Scope |
+| --- | ---: | --- | --- |
+| `ku_aes128` | 44454 | 1 / 6 | TLS 1.3 AES-128-GCM/SHA256, three KeyUpdates per direction |
+| `ku_aes256` | 44455 | 1 / 6 | TLS 1.3 AES-256-GCM/SHA384, three KeyUpdates per direction |
+| `ku_chacha` | 44456 | 1 / 6 | TLS 1.3 ChaCha20-Poly1305/SHA256, three KeyUpdates per direction |
+| `hrr` | 44457 | 1 / 1 | TLS 1.3 AES-128-GCM, client X25519 first share, server P-256; one actual HRR |
+| `early` | 44458 | 4 / 4 | TLS 1.3 AES-128-GCM seed, ordinary resumption, accepted early data, rejected early data |
+| `tls12_resume` | 44459 | 2 / 2 | TLS 1.2 ECDHE-RSA-AES256-GCM-SHA384, seed and resumed session |
+| `ech_accepted` | 44460 | 1 / 1 | Go TLS 1.3 AES-128-GCM; accepted X25519/HKDF-SHA256/AES-128-GCM ECH |
+| `ech_rejected` | 44461 | 1 / 0 | Different server ECH configuration; expected ECHRejectionError and retry config, no application data |
+| `grease` | 44462 | 1 / 1 | OpenSSL TLS 1.3 AES-128-GCM, opaque GREASE-style ECH extension, ordinary outer handshake |
+
+Each successful HTTP exchange has an exact request:
+`GET /d10/MODE/INDEX HTTP/1.1\r\nHost: fixture\r\n\r\n`.
+Its response is `HTTP/1.1 200 OK\r\nContent-Length: N\r\n\r\n` followed by
+`d10/MODE/INDEX\n`, where N is that body's byte length. KeyUpdate indices are
+0 through 5 on one connection; other indices identify the connection, starting
+at 0. Writes split the first three HTTP bytes into a separate TLS record.
+No mail/database semantics or external service is involved.
+
+The C message callback records actual outgoing KeyUpdates, including one
+`update_requested` and two `update_not_requested` messages in each direction.
+Both peers check every HTTP byte after the updates. The HRR callback compares
+the complete reserved ServerHello random. Early-data connection 2 is accepted
+and sends EndOfEarlyData; connection 3 is rejected and retransmits the same
+request at 1-RTT. Connections 1, 2 and 3 all assert session reuse. The fixture
+does not disable OpenSSL anti-replay protection or claim TLS 1.2 renegotiation.
+
+`d10_openssl.keys` contains the seven C modes' real OpenSSL keylog callbacks,
+including handshake, application and client early traffic secrets.
+`d10_ech.keys` contains Go's normal keylog output plus RFC 9850 `ECH_SECRET`
+and `ECH_CONFIG`. Go 1.26 does not log those two labels itself: a read-only
+connection observer extracts the actual outer random and encapsulated key,
+then derives DHKEM's shared secret using the generator-owned X25519 private
+key and standard HKDF. The logged config is one complete ECHConfig, not an
+ECHConfigList. ECH labels use OuterRandom; accepted TLS traffic labels use
+InnerRandom. The observer never alters transmitted bytes. No ECH+HRR or ECH
+early-data combination is claimed by these captures.
+
+Reproduce from the repository root on Linux with Go 1.26, a C compiler,
+OpenSSL development headers, pkg-config, OpenSSL CLI, dumpcap and tshark:
+
+```sh
+work=$(mktemp -d)
+umask 077
+cc -Wall -Wextra -Werror test/fixtures/http_tcp_capture/tls_d10_openssl.c \
+  -o "$work/tls-d10-openssl" $(pkg-config --cflags --libs openssl) -lpthread
+go build -o "$work/tls-d10-ech" test/fixtures/http_tcp_capture/tls_d10_ech.go
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$work/peer.key" \
+  -out "$work/peer.crt" -days 1 -subj /CN=localhost
+sudo -v
+sudo -n dumpcap -i lo -s 0 -B 64 -f 'tcp portrange 44454-44462' \
+  -w - > "$work/d10_all.pcapng" 2> "$work/capture.log" &
+capture_pid=$!
+trap 'sudo -n kill -INT "$capture_pid" 2>/dev/null || true; wait "$capture_pid" 2>/dev/null || true' EXIT
+sleep 1
+"$work/tls-d10-openssl" "$work/peer.crt" "$work/peer.key" "$work/d10_openssl.keys" all \
+  > "$work/openssl-evidence.jsonl"
+"$work/tls-d10-ech" --cert "$work/peer.crt" --key "$work/peer.key" \
+  --keylog "$work/d10_ech.keys" --mode all > "$work/ech-evidence.jsonl"
+sleep 1
+sudo -n kill -INT "$capture_pid"
+wait "$capture_pid"
+trap - EXIT
+for entry in ku_aes128:44454 ku_aes256:44455 ku_chacha:44456 hrr:44457 early:44458 tls12_resume:44459 ech_accepted:44460 ech_rejected:44461 grease:44462; do
+  mode=${entry%:*}
+  port=${entry##*:}
+  tshark -r "$work/d10_all.pcapng" -Y "tcp.port == $port" -w "$work/d10_$mode.pcapng"
+done
+```
+
+Every keylog path must be new. The C program's final argument may select any
+single C mode; the Go program accepts `--mode accepted` or `--mode rejected`.
+Inspect peer evidence and capture drops before replacing fixtures, and allow
+the final close_notify/FIN/ACK traffic to drain before stopping capture. Keep
+certificate private keys and local evidence files out of Git. The SDK's
+missing-key, wrong-key, record-tampering and fragmented-handshake regressions
+are separate from this real-traffic matrix. References:
+[OpenSSL KeyUpdate](https://docs.openssl.org/3.5/man3/SSL_key_update/),
+[OpenSSL early data](https://docs.openssl.org/3.5/man3/SSL_read_early_data/) and
+[RFC 9850 ECH keylog labels](https://www.rfc-editor.org/rfc/rfc9850.html#section-2.3).

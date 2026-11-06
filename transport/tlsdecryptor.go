@@ -61,15 +61,11 @@ type TLSDecryptor struct {
 
 	// Client state for inline decryption
 	clientEncryptionStarted bool
-	clientInHandshakePhase  bool
-	clientCurrentDecryptor  *crypto.RecordDecryptor
 	clientApplicationSeen   bool // Protected by clientProcessMu.
 	clientProbeErr          error
 
 	// Server state for inline decryption
 	serverEncryptionStarted bool
-	serverInHandshakePhase  bool
-	serverCurrentDecryptor  *crypto.RecordDecryptor
 	serverApplicationSeen   bool // Protected by serverProcessMu.
 	serverProbeErr          error
 
@@ -109,6 +105,20 @@ type TLSDecryptor struct {
 	plaintextSink  func([]byte, bool, time.Time) error
 	handshakeReady func()
 	rawMetadata    map[string]any
+
+	clientRandom             []byte // Selected ClientHello (inner for authenticated ECH).
+	tls13                    [2]tls13Direction
+	earlyOffered             bool
+	earlyMu                  sync.Mutex // Serializes early-status resolution and client output.
+	earlyStatus              string
+	earlyHandshakeWithoutEnd bool // earlyMu; accepted 0-RTT requires EndOfEarlyData.
+	earlyPending             []tlsEarlyChunk
+	earlyBytes               int
+	earlyRawOffset           uint64 // protocolMu; rejected/unknown early data has its own space.
+	tls13Finalizing          atomic.Bool
+	tls13Wake                chan struct{}
+	echOuterCandidate        bool
+	echOuterReported         bool // handshakeMu; report only after an outer record authenticates.
 }
 
 const (
@@ -133,7 +143,7 @@ func (td *TLSDecryptor) recordFailure(stage, code string, err error) {
 
 // emitRawLocked preserves bytes and per-direction offsets without interpreting
 // record boundaries as application messages. protocolMu must be held.
-func (td *TLSDecryptor) emitRawLocked(data []byte, direction string, end bool) {
+func (td *TLSDecryptor) emitRawLocked(data []byte, direction string, end bool, earlyStatus ...string) {
 	index := 0
 	if direction == "response" {
 		index = 1
@@ -144,11 +154,26 @@ func (td *TLSDecryptor) emitRawLocked(data []byte, direction string, end bool) {
 		packet.Metadata["kind"] = "stream_end"
 	}
 	packet.Metadata["offset"] = td.rawOffsets[index]
+	separateEarly := len(earlyStatus) > 0 && earlyStatus[0] != "" && earlyStatus[0] != "accepted"
+	if td.earlyOffered {
+		packet.Metadata["encryption_level"] = "1rtt"
+	}
+	if len(earlyStatus) > 0 && earlyStatus[0] != "" {
+		packet.Metadata["encryption_level"] = "0rtt"
+		packet.Metadata["early_data"] = earlyStatus[0]
+		if separateEarly {
+			packet.Metadata["offset"] = td.earlyRawOffset
+		}
+	}
 	packet.Metadata["end"] = end
 	for key, value := range td.rawMetadata {
 		packet.Metadata[key] = value
 	}
-	td.rawOffsets[index] += uint64(len(data))
+	if separateEarly {
+		td.earlyRawOffset += uint64(len(data))
+	} else {
+		td.rawOffsets[index] += uint64(len(data))
+	}
 	td.packetChan <- packet
 }
 
@@ -167,6 +192,7 @@ func NewTLSDecryptor(ci types.ConnectionKey, keyLog *crypto.KeyLogStore, clientO
 		outputDone:     make(chan struct{}),
 		closeSignal:    make(chan struct{}),
 		packetChan:     packetChan,
+		tls13Wake:      make(chan struct{}, 1),
 	}
 
 	return td
@@ -184,18 +210,29 @@ func (td *TLSDecryptor) SetPacketTime(t time.Time) {
 
 // queueRequest adds a request to the queue and flushes if possible
 func (td *TLSDecryptor) queueRequest(data []byte) {
+	td.queueRequestEarly(data, "")
+}
+
+func (td *TLSDecryptor) queueRequestEarly(data []byte, earlyStatus string) {
 	if len(data) == 0 {
 		return
 	}
 
 	td.protocolMu.Lock()
+	if earlyStatus != "" && earlyStatus != "accepted" {
+		if td.options.RawChunks && td.packetChan != nil {
+			td.emitRawLocked(data, "request", false, earlyStatus)
+		}
+		td.protocolMu.Unlock()
+		return
+	}
 	if td.plaintextSink != nil {
-		td.forwardPlaintextLocked(data, true)
+		td.forwardPlaintextLocked(data, true, earlyStatus)
 		td.protocolMu.Unlock()
 		return
 	}
 	if td.options.RawChunks && td.packetChan != nil {
-		td.emitRawLocked(data, "request", false)
+		td.emitRawLocked(data, "request", false, earlyStatus)
 		td.protocolMu.Unlock()
 		return
 	}
@@ -299,13 +336,13 @@ func (td *TLSDecryptor) queueResponse(data []byte) {
 	td.flushOutput()
 }
 
-func (td *TLSDecryptor) forwardPlaintextLocked(data []byte, client bool) {
+func (td *TLSDecryptor) forwardPlaintextLocked(data []byte, client bool, earlyStatus ...string) {
 	if td.options.RawChunks && td.packetChan != nil {
 		direction := "response"
 		if client {
 			direction = "request"
 		}
-		td.emitRawLocked(data, direction, false)
+		td.emitRawLocked(data, direction, false, earlyStatus...)
 	}
 	if err := td.plaintextSink(data, client, td.packetTime); err != nil {
 		td.recordParserFailure(err)
@@ -447,6 +484,10 @@ func (td *TLSDecryptor) FeedServer(data []byte) error {
 func (td *TLSDecryptor) processClientRecords() {
 	td.clientProcessMu.Lock()
 	defer td.clientProcessMu.Unlock()
+	if td.version == tls.VersionTLS13 {
+		td.processTLS13Records(true)
+		return
+	}
 	for {
 		if td.aborted.Load() {
 			return
@@ -464,14 +505,9 @@ func (td *TLSDecryptor) processClientRecords() {
 
 		// ChangeCipherSpec (0x14) marks the start of encrypted communication for TLS 1.2
 		if recordType == 0x14 {
-			td.handshakeMu.RLock()
-			ver := td.version
-			td.handshakeMu.RUnlock()
-			if ver != tls.VersionTLS13 {
-				td.handshakeMu.Lock()
-				td.clientEncryptionStarted = true
-				td.handshakeMu.Unlock()
-			}
+			td.handshakeMu.Lock()
+			td.clientEncryptionStarted = true
+			td.handshakeMu.Unlock()
 			continue
 		}
 
@@ -485,33 +521,17 @@ func (td *TLSDecryptor) processClientRecords() {
 
 		// Decrypt the record
 		td.handshakeMu.RLock()
-		decryptor := td.clientCurrentDecryptor
-		inHandshake := td.clientInHandshakePhase
+		decryptor := td.clientDecryptor
 		td.handshakeMu.RUnlock()
 
 		plaintext, actualContentType, err := decryptor.Decrypt(record)
 		if err != nil {
-			// With application-only TLS 1.3 secrets we must skip encrypted
-			// handshake records until the first application record authenticates.
-			if td.version == tls.VersionTLS13 && td.clientHandshakeDecryptor == nil && !td.clientApplicationSeen {
-				td.clientProbeErr = err
-				continue
-			}
 			td.recordFailure("decrypt", "authentication_failed", err)
 			if td.httpEventMode() {
 				td.abortInput()
 				return
 			}
 			td.logger.Printf("Decrypt error (client): %v", err)
-			continue
-		}
-
-		// For TLS 1.3, check if we've finished the handshake phase
-		if inHandshake && actualContentType == 0x16 && len(plaintext) > 0 && plaintext[0] == 0x14 {
-			td.handshakeMu.Lock()
-			td.clientInHandshakePhase = false
-			td.clientCurrentDecryptor = td.clientDecryptor
-			td.handshakeMu.Unlock()
 			continue
 		}
 
@@ -529,8 +549,15 @@ func (td *TLSDecryptor) processClientRecords() {
 
 // processServerRecords processes all available server records synchronously
 func (td *TLSDecryptor) processServerRecords() {
+	// A FeedServer racing the initial/late-key drain must not overtake client
+	// records already buffered before it. Acquire the direction locks separately.
+	td.processClientRecords()
 	td.serverProcessMu.Lock()
 	defer td.serverProcessMu.Unlock()
+	if td.version == tls.VersionTLS13 {
+		td.processTLS13Records(false)
+		return
+	}
 	for {
 		if td.aborted.Load() {
 			return
@@ -548,14 +575,9 @@ func (td *TLSDecryptor) processServerRecords() {
 
 		// ChangeCipherSpec (0x14) marks the start of encrypted communication for TLS 1.2
 		if recordType == 0x14 {
-			td.handshakeMu.RLock()
-			ver := td.version
-			td.handshakeMu.RUnlock()
-			if ver != tls.VersionTLS13 {
-				td.handshakeMu.Lock()
-				td.serverEncryptionStarted = true
-				td.handshakeMu.Unlock()
-			}
+			td.handshakeMu.Lock()
+			td.serverEncryptionStarted = true
+			td.handshakeMu.Unlock()
 			continue
 		}
 
@@ -569,31 +591,17 @@ func (td *TLSDecryptor) processServerRecords() {
 
 		// Decrypt the record
 		td.handshakeMu.RLock()
-		decryptor := td.serverCurrentDecryptor
-		inHandshake := td.serverInHandshakePhase
+		decryptor := td.serverDecryptor
 		td.handshakeMu.RUnlock()
 
 		plaintext, actualContentType, err := decryptor.Decrypt(record)
 		if err != nil {
-			if td.version == tls.VersionTLS13 && td.serverHandshakeDecryptor == nil && !td.serverApplicationSeen {
-				td.serverProbeErr = err
-				continue
-			}
 			td.recordFailure("decrypt", "authentication_failed", err)
 			if td.httpEventMode() {
 				td.abortInput()
 				return
 			}
 			td.logger.Printf("Decrypt error (server): %v", err)
-			continue
-		}
-
-		// For TLS 1.3, check if we've finished the handshake phase
-		if inHandshake && actualContentType == 0x16 && len(plaintext) > 0 && plaintext[0] == 0x14 {
-			td.handshakeMu.Lock()
-			td.serverInHandshakePhase = false
-			td.serverCurrentDecryptor = td.serverDecryptor
-			td.handshakeMu.Unlock()
 			continue
 		}
 
@@ -675,7 +683,7 @@ func (td *TLSDecryptor) Close() error {
 		parser := td.parser
 		td.protocolMu.RUnlock()
 
-		if parser != nil && !td.httpEventMode() && !td.aborted.Load() {
+		if parser != nil && !td.httpEventMode() && !td.earlyOffered && !td.aborted.Load() {
 			parser.Flush()
 		}
 		// Final flush of any remaining queued data
@@ -721,29 +729,7 @@ func (td *TLSDecryptor) Decrypt() error {
 	if td.handshakeReady != nil {
 		td.handshakeReady()
 	}
-	// Feed may have queued encrypted records while waiting for a late DSB.
-	// Drain them immediately; subsequent Feed calls use the same direction lock.
-	td.processClientRecords()
-	td.processServerRecords()
-
-	// After handshake is complete, data will be processed inline via FeedClient/FeedServer
-	// The inline processing ensures the correct order of decryption output
-	// We just need to wait for both streams to close
-
-	wg := sync.WaitGroup{}
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		td.waitForClientClose()
-	}()
-
-	go func() {
-		defer wg.Done()
-		td.waitForServerClose()
-	}()
-
-	wg.Wait()
+	td.waitTLSRecords(deadline)
 	// Close can race with the final Feed; direction locks join its record drain.
 	td.processClientRecords()
 	td.processServerRecords()
@@ -751,14 +737,15 @@ func (td *TLSDecryptor) Decrypt() error {
 	if !td.clientApplicationSeen && td.clientProbeErr != nil {
 		// Application-only keys cannot distinguish a handshake-only capture
 		// from application records protected by unavailable or incorrect keys.
-		td.options.Report(td.ConnectionInfo, "decrypt", "no_authenticated_application_data")
+		td.recordFailure("decrypt", "no_authenticated_application_data", errors.New("TLS application data could not be authenticated"))
 	}
 	td.clientProcessMu.Unlock()
 	td.serverProcessMu.Lock()
 	if !td.serverApplicationSeen && td.serverProbeErr != nil {
-		td.options.Report(td.ConnectionInfo, "decrypt", "no_authenticated_application_data")
+		td.recordFailure("decrypt", "no_authenticated_application_data", errors.New("TLS application data could not be authenticated"))
 	}
 	td.serverProcessMu.Unlock()
+	td.finishTLS13()
 	if td.clientIn.Len() != 0 || td.serverIn.Len() != 0 {
 		td.recordFailure("input", "truncated_record", fmt.Errorf("truncated TLS record: %w", io.ErrUnexpectedEOF))
 	}
@@ -810,6 +797,14 @@ func (td *TLSDecryptor) releaseBuffers() {
 	defer td.serverProcessMu.Unlock()
 	td.clientIn.Discard()
 	td.serverIn.Discard()
+	for i := range td.tls13 {
+		td.tls13[i].handshake.Reset()
+		td.tls13[i].early = nil
+	}
+	td.earlyMu.Lock()
+	td.earlyPending = nil
+	td.earlyBytes = 0
+	td.earlyMu.Unlock()
 	td.protocolMu.Lock()
 	td.parser = nil
 	td.plaintextSink = nil
@@ -826,24 +821,15 @@ func (td *TLSDecryptor) releaseBuffers() {
 	td.queueMu.Unlock()
 }
 
-// waitForClientClose waits for client stream to close and processes remaining records
-func (td *TLSDecryptor) waitForClientClose() {
-	<-td.clientIn.Closed
-}
-
-// waitForServerClose waits for server stream to close and processes remaining records
-func (td *TLSDecryptor) waitForServerClose() {
-	<-td.serverIn.Closed
-}
-
 func (td *TLSDecryptor) parseHandshake() error {
 	// Read Client Hello and extract client random
-	clientRandom, err := crypto.ExtractClientRandom(td.clientIn)
+	hello, err := crypto.ReadClientHello(td.clientIn)
 	if err != nil {
 		td.options.Report(td.ConnectionInfo, "handshake", "missing_client_hello")
 		return fmt.Errorf("extract client random: %w", err)
 	}
 
+	clientRandom := hello.Random
 	td.logger.Printf("Client Random: %s", hex.EncodeToString(clientRandom))
 
 	// Read Server Hello and determine TLS version and cipher suite
@@ -852,11 +838,29 @@ func (td *TLSDecryptor) parseHandshake() error {
 		td.options.Report(td.ConnectionInfo, "handshake", "invalid_server_hello")
 		return fmt.Errorf("parse server hello: %w", err)
 	}
+	if crypto.IsHelloRetryRequest(serverHelloHandshake) {
+		if hello.EarlyData || hello.ECHOffered {
+			td.options.Report(td.ConnectionInfo, "handshake", "unsupported_handshake")
+			return errors.New("TLS HRR combined with early data or ECH is not supported")
+		}
+		retrySuite := cipherSuite
+		second, err := crypto.ReadClientHello(td.clientIn)
+		if err != nil || !bytes.Equal(second.Random, clientRandom) || second.EarlyData || second.ECHOffered {
+			return errTLS13Handshake
+		}
+		hello = second
+		version, cipherSuite, serverHelloHandshake, err = crypto.ParseServerHello(td.serverIn)
+		if err != nil || crypto.IsHelloRetryRequest(serverHelloHandshake) || version != tls.VersionTLS13 || cipherSuite != retrySuite {
+			return errTLS13Handshake
+		}
+		td.options.Report(td.ConnectionInfo, "handshake", "hello_retry_request")
+	}
 	if version != tls.VersionTLS12 && version != tls.VersionTLS13 {
 		td.options.Report(td.ConnectionInfo, "decrypt", "unsupported_version")
 		return fmt.Errorf("unsupported TLS version 0x%04x", version)
 	}
-	if !crypto.IsCipherSuiteSupported(cipherSuite) {
+	config, supported := crypto.GetCipherSuite(cipherSuite)
+	if !supported || version == tls.VersionTLS12 && config.Version == crypto.TLSVersion13 || version == tls.VersionTLS13 && config.Version == crypto.TLSVersion12 {
 		td.options.Report(td.ConnectionInfo, "decrypt", "unsupported_cipher")
 		return fmt.Errorf("unsupported cipher suite 0x%04x", cipherSuite)
 	}
@@ -867,7 +871,7 @@ func (td *TLSDecryptor) parseHandshake() error {
 	if td.keyLog.GetSecrets(clientRandom) == nil {
 		td.options.Report(td.ConnectionInfo, "keys", "waiting_secret")
 	}
-	secrets, err := td.keyLog.WaitForSecrets(clientRandom, func(s *crypto.TLSSecrets) bool {
+	applicationReady := func(s *crypto.TLSSecrets) bool {
 		if s == nil {
 			return false
 		}
@@ -875,10 +879,37 @@ func (td *TLSDecryptor) parseHandshake() error {
 			return len(s.ClientTrafficSecret) != 0 && len(s.ServerTrafficSecret) != 0
 		}
 		return len(s.MasterSecret) != 0
+	}
+	secrets, err := td.keyLog.WaitForSecrets(clientRandom, func(s *crypto.TLSSecrets) bool {
+		return applicationReady(s) || hello.ECHOffered && s != nil && len(s.ECHSecret) > 0 && len(s.ECHConfig) > 0
 	}, td.closeSignal, td.options.SecretWaitTimeout())
 	if err != nil {
 		td.options.Report(td.ConnectionInfo, "keys", "missing_secret")
 		return fmt.Errorf("wait for TLS secrets: %w", err)
+	}
+	if hello.ECHOffered {
+		if len(secrets.ECHSecret) > 0 && len(secrets.ECHConfig) > 0 {
+			var status string
+			hello, status, err = crypto.ResolveECHClientHello(hello, serverHelloHandshake, secrets)
+			if err != nil {
+				td.options.Report(td.ConnectionInfo, "handshake", "ech_unavailable")
+				return err
+			}
+			clientRandom = hello.Random
+			td.options.Report(td.ConnectionInfo, "handshake", "ech_"+status)
+			secrets, err = td.keyLog.WaitForSecrets(clientRandom, applicationReady, td.closeSignal, td.options.SecretWaitTimeout())
+			if err != nil {
+				td.options.Report(td.ConnectionInfo, "keys", "missing_secret")
+				return err
+			}
+		} else {
+			td.echOuterCandidate = true
+		}
+	}
+	td.clientRandom = bytes.Clone(clientRandom)
+	td.earlyOffered = version == tls.VersionTLS13 && hello.EarlyData
+	if crypto.ServerHelloResumed(serverHelloHandshake) {
+		td.options.Report(td.ConnectionInfo, "handshake", "session_resumed")
 	}
 
 	// Create decryptors based on TLS version
@@ -953,23 +984,19 @@ func (td *TLSDecryptor) parseHandshake() error {
 
 		// Start with handshake secrets if available
 		if td.clientHandshakeDecryptor != nil {
-			td.clientInHandshakePhase = true
-			td.clientCurrentDecryptor = td.clientHandshakeDecryptor
-		} else {
-			td.clientCurrentDecryptor = td.clientDecryptor
+			td.tls13[0].phase = tls13Handshake
 		}
 		if td.serverHandshakeDecryptor != nil {
-			td.serverInHandshakePhase = true
-			td.serverCurrentDecryptor = td.serverHandshakeDecryptor
-		} else {
-			td.serverCurrentDecryptor = td.serverDecryptor
+			td.tls13[1].phase = tls13Handshake
+		}
+		if td.earlyOffered {
+			td.tls13[0].phase = tls13Early
+			td.tls13[1].phase = tls13Handshake
 		}
 	} else {
 		// For TLS 1.2, encryption starts after ChangeCipherSpec
 		td.clientEncryptionStarted = false
 		td.serverEncryptionStarted = false
-		td.clientCurrentDecryptor = td.clientDecryptor
-		td.serverCurrentDecryptor = td.serverDecryptor
 	}
 
 	td.handshakeComplete = true

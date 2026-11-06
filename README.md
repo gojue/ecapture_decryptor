@@ -55,6 +55,8 @@ Use `types.DecryptOptions{ApplicationProtocol: "doh"}` with the Go file or strea
 
 Go callers can explicitly select `TLSUpgrade` for SMTP, IMAP, POP3, LDAP, PostgreSQL, MySQL or HTTP/1 CONNECT negotiation, including one inner TLS layer with `https-connect`. A rejected attempt stays plaintext; the parser does not scan for TLS prefixes. Upgraded traffic uses the existing application/raw output, and HTTPS CONNECT retains authenticated outer bytes when inner keys are unavailable. See [negotiation, layer identity and limits](docs/API.md#tlsupgrade).
 
+TLS 1.3 supports authenticated, directional KeyUpdate with record sequence resets, fragmented handshake messages, ordinary HRR and session resumption. Early data and ECH require their corresponding secrets and retain explicit acceptance/association boundaries. See the [TLS version, suite and state evidence](docs/API.md#tls-版本与状态); unsupported combinations are listed there.
+
 ### QUIC / HTTP/3 input requirements
 
 Decrypting HTTP/3 requires a bidirectional UDP capture that includes the client Initial (containing the ClientHello), plus the matching TLS 1.3 SSLKEYLOG. Keys may be provided as an external file or inside the pcapng DSB. The parser reassembles data by QUIC connection, packet number, and STREAM offset, then emits `http/3` `DecryptedPacket` values per HTTP/3 request stream.

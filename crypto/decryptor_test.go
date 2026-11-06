@@ -8,11 +8,128 @@ package crypto
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/hex"
 	"testing"
+
+	"golang.org/x/crypto/chacha20poly1305"
 )
+
+func TestTLS13KeyUpdateIndependentVectors(t *testing.T) {
+	// Independently generated with Python hashlib/hmac implementing RFC 8446
+	// HKDF-Expand-Label, not the production derivation or RecordDecryptor.
+	sha256Secrets := []string{
+		"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+		"2cecd0a17506ef5fa73edc062d6e7b5397cf074ec1b4d8f99a120772932f0b45",
+		"2d3fb1fe267c2e0126351cc169afb7ca25c0d8867167c55c5533e3715558a6b9",
+	}
+	sha256IVs := []string{"2f41c846a431a163814bcd71", "4ef68fed17d39b5f23bb4b30", "2739edacb4dc79885391a769"}
+	for _, tc := range []struct {
+		suite              uint16
+		secrets, keys, ivs []string
+	}{
+		{tls.TLS_AES_128_GCM_SHA256, sha256Secrets, []string{"9c9783cf77ea32d44f369da41f19f3cc", "05cdc7251fb9f925889f80ebc1fd385f", "f795fc0182a370f8af96a1d6dfba76ac"}, sha256IVs},
+		{tls.TLS_CHACHA20_POLY1305_SHA256, sha256Secrets, []string{"2ffbc449e87844051c7768f61ffd8ad070830f01ec2c520ef65f08e8296dffa0", "c690ede9a7525f64b759094f3bda2da3b5b52e50cffacd89a37bdf85affdd091", "a0bbbcfeba507420e29aff13ebeaeb194782449236bef1c04640793d86732721"}, sha256IVs},
+		{tls.TLS_AES_256_GCM_SHA384, []string{
+			"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+			"401331b63e9d59f202e8f041042d9516f4cd7fa2e2ee14631d3b49fc340d7af37fc2c0c9f252d8036f81ec5b85cbe5db",
+			"1fed39ab8257f49d1c0c45bfbf71ffa8525b22ea44fdbbe0f7dfff32ea98fa53864320d595ea4ab13a8292965996db9b",
+		}, []string{"6877d022f1c61d24ebb7487c16752d9a4798e40431c75b39320e537c90e23225", "eb354f3b48924ed78de34dd8aa6a6a0a51d857ddad1454d5cfa7b69f60712911", "2d9c985947a6214bd2d1eef320171612b39ade8f7b8f0df6c09023ab183d172e"}, []string{"42822531a0fe88648fc09e9f", "8478ffbe4f2e5450789775b3", "fd5be82f2a1fe585114075cc"}},
+	} {
+		t.Run(tls.CipherSuiteName(tc.suite), func(t *testing.T) {
+			secret := decodeTLSFixture(t, tc.secrets[0])
+			rd, err := NewRecordDecryptor(tls.VersionTLS13, tc.suite, secret)
+			if err != nil {
+				t.Fatal(err)
+			}
+			secret[0] ^= 1 // Constructor must own retained key material.
+			seal := func(generation int, seq uint64) []byte {
+				t.Helper()
+				key := decodeTLSFixture(t, tc.keys[generation])
+				var aead cipher.AEAD
+				var err error
+				if tc.suite == tls.TLS_CHACHA20_POLY1305_SHA256 {
+					aead, err = chacha20poly1305.New(key)
+				} else {
+					block, e := aes.NewCipher(key)
+					if e != nil {
+						t.Fatal(e)
+					}
+					aead, err = cipher.NewGCM(block)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				nonce := decodeTLSFixture(t, tc.ivs[generation])
+				binary.BigEndian.PutUint64(nonce[4:], binary.BigEndian.Uint64(nonce[4:])^seq)
+				header := []byte{23, 3, 3, 0, 20}
+				return append(header, aead.Seal(nil, nonce, []byte{'k', 'u', byte(generation), 23}, header)...)
+			}
+			for generation := range tc.secrets {
+				if !bytes.Equal(rd.secret, decodeTLSFixture(t, tc.secrets[generation])) || !bytes.Equal(rd.iv, decodeTLSFixture(t, tc.ivs[generation])) || rd.seq != 0 {
+					t.Fatal("wrong traffic secret, IV or reset sequence", generation)
+				}
+				valid := seal(generation, 0)
+				bad := bytes.Clone(valid)
+				bad[len(bad)-1] ^= 1
+				if p, _, err := rd.Decrypt(bad); err == nil || len(p) != 0 || rd.seq != 0 {
+					t.Fatal("authentication failure advanced sequence or exposed bytes")
+				}
+				if generation < 2 {
+					if _, _, err := rd.Decrypt(seal(generation+1, 0)); err == nil || rd.seq != 0 {
+						t.Fatal("future key was accepted without KeyUpdate")
+					}
+				}
+				if generation > 0 {
+					if _, _, err := rd.Decrypt(seal(generation-1, 0)); err == nil || rd.seq != 0 {
+						t.Fatal("old key replay accepted after KeyUpdate")
+					}
+				}
+				if p, typ, err := rd.Decrypt(valid); err != nil || typ != 23 || !bytes.Equal(p, []byte{'k', 'u', byte(generation)}) {
+					t.Fatalf("independent record: %x %d %v", p, typ, err)
+				}
+				if _, _, err := rd.Decrypt(seal(generation, 1)); err != nil {
+					t.Fatal(err)
+				}
+				if generation < 2 {
+					if err := rd.UpdateTrafficSecret(); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			rd.seq = ^uint64(0)
+			if _, _, err := rd.Decrypt(seal(2, rd.seq)); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := rd.Decrypt(seal(2, 0)); err == nil {
+				t.Fatal("record sequence wrapped")
+			}
+			if _, err := NewRecordDecryptor(tls.VersionTLS13, tc.suite, secret[:len(secret)-1]); err == nil {
+				t.Fatal("incorrect secret length accepted")
+			}
+		})
+	}
+}
+
+func TestTLSRecordCipherVersionBinding(t *testing.T) {
+	secret := bytes.Repeat([]byte{1}, 32)
+	for _, tc := range []struct{ version, suite uint16 }{
+		{tls.VersionTLS12, tls.TLS_AES_128_GCM_SHA256},
+		{tls.VersionTLS13, tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256},
+		{tls.VersionTLS13, 0xffff},
+	} {
+		if _, err := NewRecordDecryptor(tc.version, tc.suite, secret); err == nil {
+			t.Fatalf("invalid TLS 1.3 version/suite pair accepted: %+v", tc)
+		}
+	}
+	if _, err := NewRecordDecryptorTLS12(tls.VersionTLS12, tls.TLS_AES_128_GCM_SHA256, secret, secret, secret, false); err == nil {
+		t.Fatal("TLS 1.3-only cipher was accepted by TLS 1.2 constructor")
+	}
+}
 
 func decodeTLSFixture(t *testing.T, value string) []byte {
 	t.Helper()
