@@ -199,7 +199,7 @@ err := ecapture_decryptor.DecryptPcapngStreamWithOptions(ctx, input,
 | `reset` | 已开始的方向被取消，offset 为已经交付的正文长度。HTTP/2 RST_STREAM 结束该 stream 两个仍打开的方向，HTTP/3 RESET_STREAM 结束发送方向，两者携带 `error_code`。CANCEL_PUSH 和 TCP RST 也可终止已开始的消息。 |
 | `partial` | 已开始但被截断或无法继续解析的方向。offset 为已经交付的正文长度，调用方同时处理 API 的终止错误。每个已开始方向只交付一次终止事件。 |
 
-只有 `body_chunk` 和 `sse` 带正文数据。回调串行运行，channel 和回调速度对解密器施加背压。调用方取消 context 或让回调返回错误后，以 API 返回值作为终止信号。HTTP/1 固定长度和 chunked 正文按各自边界结束。close-delimited 响应在连接排空时区分已观察到的服务端 FIN / TLS close_notify 与只有抓包 EOF 的截断，后者交付 partial 并返回错误。
+`body_chunk`、`sse` 和下述 `grpc_message` 带正文数据。回调串行运行，channel 和回调速度对解密器施加背压。调用方取消 context 或让回调返回错误后，以 API 返回值作为终止信号。HTTP/1 固定长度和 chunked 正文按各自边界结束。close-delimited 响应在连接排空时区分已观察到的服务端 FIN / TLS close_notify 与只有抓包 EOF 的截断，后者交付 partial 并返回错误。
 
 默认保留 Content-Encoding 的原始正文。将 `MaxDecodedBodyBytes` 设为正数（例如 `8 << 20`）会启用单层 gzip 的增量展开，值为每条消息的展开字节上限。此时 headers 带 `decoded_encoding="gzip"`，原始 Content-Length 和 Content-Encoding 仍描述线上编码。body、SSE 和 offset 均基于展开后的字节。超过额度或校验失败会终止该消息，已交付字节按 partial 处理。其他编码或组合编码原样交付 body。SSE 解析适用于未编码、identity 或成功选择 gzip 展开的正文。
 
@@ -578,22 +578,35 @@ QPACK、SETTINGS 和消息顺序错误报告 `protocol/parse_failed`，不归为
 
 ### WebSocket
 
-**握手元数据：**
-```go
-{
-    "upgrade": true,              // WebSocket 升级
-    "headers": http.Header{...},  // 握手头部
-}
-```
+默认完整消息模式支持 HTTP/1.1 Upgrade 后的 WebSocket。请求头跨 TLS record、同一 record 内的 101 与首帧、失败升级后的 HTTP/1 keep-alive 均可处理。握手校验 GET、HTTP/1.1、Host、Connection/Upgrade token、版本 13、16 字节 key、服务端 accept、子协议和扩展选择；非 101 响应仍按 HTTP 输出。
 
-**消息元数据：**
-```go
-{
-    "opcode": 1,                  // WebSocket 操作码 (1=text, 2=binary)
-    "fin": true,                  // 是否为最后一个分片
-    "masked": true,               // 是否掩码
-}
-```
+`Protocol="websocket"`，`Direction` 区分两端。按 `Metadata["kind"]` 区分输出：
+
+| kind | Data 与元数据 |
+| --- | --- |
+| `upgrade` | 原始握手头，`upgrade="websocket"`、`headers`；请求另带 `method`/`url`，响应带 `status=101`。 |
+| `message` | 完整 text/binary 消息字节，已去 mask、合并同方向 continuation、按协商展开压缩。`opcode`（byte）、`opcode_name`、`is_client`、`data_length`、`compressed`。text 必须是有效 UTF-8。 |
+| `control` | ping/pong/close 的原始 payload，同样带 opcode/name/方向/长度。close 存在状态码时另带 `close_code`（uint16）和 `close_reason`。解析器被动读取，不发送 pong 或 close。 |
+
+双向独立维护分片，控制帧可插入数据消息。客户端必须 mask、服务端不得 mask；拒绝非法 opcode/RSV、非最短长度、64 位高位、非法 continuation、控制帧分片或超过 125 字节，以及非法关闭码/UTF-8。握手头每方向最多 64 KiB，单帧、分片消息的编码总量和展开后的消息各最多 16 MiB。每方向只保留当前未完成消息和最多 32 KiB 压缩字典，不保存历史消息。发送使用背压，慢消费者不丢消息或控制帧。
+
+支持按 [RFC 7692](https://www.rfc-editor.org/rfc/rfc7692.html) 协商的 `permessage-deflate`，含双向 context takeover、`client/server_no_context_takeover`、8–15 的 window bits。接收端使用 32 KiB 字典，也可解码协商了较小发送窗口的消息；不额外审计发送方实际使用的回溯距离。未协商压缩不能设置 RSV1，无法解释的服务端扩展会返回协议错误。超限为 `protocol/resource_limit`，非法帧/握手为 `protocol/parse_failed`；EOF 剩余半帧、未完成分片或未完成握手会返回错误。完整消息边界上的捕获 EOF 不要求一定看到 close 帧。
+
+独立 Python websockets 夹具实测两个方向的压缩分片、控制帧和 takeover 开/关，详见 [复现步骤](../test/fixtures/http_tcp_capture/README.md#websocket-and-grpc-fixtures)。`HTTPEvents` 模式仍不接管 WebSocket Upgrade；HTTP/2、HTTP/3 的扩展 CONNECT 属于后续子项。
+
+### gRPC（HTTP/2 增量语义）
+
+显式选择 `HTTPEvents: true` 后，对 HTTP/2 `application/grpc` 或 `application/grpc+...` 自动解析五字节前缀。前缀和消息可跨 DATA/chunk，一片 DATA 也可包含多条消息。请求必须使用 POST；按连接、stream ID、方向独立编号。完整模式、HTTP/1、HTTP/3、gRPC-Web 不由此获得 gRPC 消息解析。
+
+保留原有 HTTP headers/body_chunk/trailers/终止事件，headers 加 `grpc=true`。每条完整消息额外输出 `kind="grpc_message"`，`Protocol` 仍为 `http/2`；`Data` 是去掉五字节前缀、完成消息级解压后的原始消息字节，不需要 descriptor，也不推断 Protobuf 字段名。
+
+- `message_index`（uint64）在每个流、方向从 0 开始，包括零长度消息。
+- `offset`（uint64）是该消息前缀在 HTTP 正文中的起点；`wire_length`（uint32）是前缀声明的编码消息长度，不含前缀。HTTP body_chunk/终止 offset 仍描述完整线上正文。
+- `compressed` 表示前缀标志；`grpc_encoding` 来自当前方向的 `grpc-encoding`，缺失时为 `identity`。支持未压缩消息及 gzip 消息压缩，每条消息独立解压并检查 gzip 校验。其他算法遇到 compressed=1 时明确失败，不输出伪解码结果。HTTP Content-Encoding 和 gRPC 消息压缩不混用；`MaxDecodedBodyBytes` 不控制 gRPC 消息限额。
+- 响应 trailers 和 end 带 `grpc_status`（uint32）、百分号解码后的 `grpc_message`。非法百分号编码保留原值，`+` 保持字面含义；原始 headers/trailers（包括 `grpc-status-details-bin`）保留。非零业务状态正常交付，不作为解密错误。trailers-only 响应交付 headers、trailers、end。
+- 缺少/畸形 `grpc-status`、截断前缀/body、非法压缩标志或压缩校验失败会返回解析错误，已开始方向终止为 partial。RESET 保留 HTTP/2 error_code、释放未完成消息，不将半条消息当作成功输出。SDK 不合成缺失的业务状态，也不解释 status-details 的 Protobuf。
+
+单条编码消息和展开结果各限 16 MiB；每连接所有未完成 gRPC 消息的已接收 payload 共限 32 MiB，活动流仍适用 HTTP/2 限额。完整消息在 END_STREAM/EOF 前交付并释放，累计流长可超过 16 MiB。只拼接 body_chunk 才能还原 HTTP 正文，grpc_message 是额外语义视图。单元测试覆盖 unary/client/server/bidi streaming、长流和边界；独立 hyper-h2 + Python gzip 实际 TLS 流量覆盖四类调用、双向压缩、错误 trailers 和 trailers-only。基线为 [gRPC HTTP/2 协议](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md)。
 
 ---
 
@@ -604,7 +617,8 @@ QPACK、SETTINGS 和消息顺序错误报告 `protocol/parse_failed`，不归为
 | HTTP/1.1 | `http/1.1` | ✅ 完整 | 包括 chunked 编码 |
 | HTTP/2 | `http/2` | ✅ 完整 | 帧解析、流重组 |
 | HTTP/3 | `http/3` | ✅ 有界消息解析 | QUIC + 动态 QPACK；边界见上节 |
-| WebSocket | `websocket` | ✅ 完整 | 包括分片消息 |
+| WebSocket | `websocket` | ✅ HTTP/1 Upgrade | 双向分片、控制帧、permessage-deflate；边界见上节 |
+| gRPC | `http/2` + `grpc_message` | ✅ 显式增量语义 | HTTPEvents；未压缩/gzip 消息与状态 trailers |
 
 ---
 

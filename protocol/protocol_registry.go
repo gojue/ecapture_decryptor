@@ -109,7 +109,7 @@ func (d *WebSocketDetector) Detect(data []byte) int {
 }
 
 func (d *WebSocketDetector) CreateParser(addr types.ConnectionKey, packetChan chan *types.DecryptedPacket) types.StreamParserInterface {
-	return NewWebSocketStreamParser(addr, packetChan)
+	return NewHTTPStreamParser(addr, packetChan)
 }
 
 // init 自动注册所有内置协议检测器

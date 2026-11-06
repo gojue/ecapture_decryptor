@@ -48,6 +48,8 @@ SDK 只负责解密与协议解析，不强制输出格式。结果以 `Decrypte
 
 Go 调用方可以用 `types.DecryptOptions{HTTPEvents: true}` 接收 HTTP/1、2、3 的 headers、正文片段、SSE、trailers 与 end/reset/partial 事件。正文按消息和方向独立维护 offset。增量 HTTP 和 raw QUIC 可以累计交付超过 16 MiB，乱序缓存仍受限。gzip 展开需显式设置每条消息的展开额度。[增量事件契约](docs/API.md#http-增量事件)
 
+HTTP/1 WebSocket 支持跨 record 的握手校验、双向分片、ping/pong/close 和协商后的 permessage-deflate（含 context takeover），消息与压缩缓存有界。`HTTPEvents` 模式为 HTTP/2 gRPC 增加流结束前的完整 `grpc_message` 输出，含分方向消息边界、gzip 消息压缩和状态 trailers；无 descriptor 时保留原始 Protobuf 字节。详见 [WebSocket 与 gRPC 契约](docs/API.md#websocket)。
+
 ### QUIC / HTTP/3 输入要求
 
 解密 HTTP/3 需要包含客户端 Initial（其中有 ClientHello）的双向 UDP 抓包，以及匹配该连接的 TLS 1.3 SSLKEYLOG。密钥可作为外部文件传入，也可放在 pcapng 的 DSB 中。解析器按 QUIC 连接、包号和 STREAM 偏移重组数据，再按 HTTP/3 请求流输出 `http/3` 的 `DecryptedPacket`。

@@ -48,6 +48,8 @@ The SDK only decrypts and parses protocols — it does not impose an output form
 
 Go callers can select `types.DecryptOptions{HTTPEvents: true}` to receive headers, body chunks, SSE records, trailers, and end/reset/partial events as HTTP/1, HTTP/2 or HTTP/3 traffic arrives. Body offsets are per message and direction. Incremental HTTP and raw QUIC can pass 16 MiB while out-of-order storage stays bounded. Gzip expansion is opt-in with a per-message decoded byte limit. [HTTP event contract](docs/API.md#http-增量事件)
 
+HTTP/1 WebSocket validates fragmented Upgrade handshakes and emits bounded bidirectional messages, ping/pong/close and negotiated permessage-deflate, including context takeover. In `HTTPEvents` mode, HTTP/2 gRPC adds complete `grpc_message` events before stream end, with per-direction framing, gzip message compression and status trailers. Protobuf bytes remain opaque without a descriptor. See the [WebSocket and gRPC contracts](docs/API.md#websocket).
+
 ### QUIC / HTTP/3 input requirements
 
 Decrypting HTTP/3 requires a bidirectional UDP capture that includes the client Initial (containing the ClientHello), plus the matching TLS 1.3 SSLKEYLOG. Keys may be provided as an external file or inside the pcapng DSB. The parser reassembles data by QUIC connection, packet number, and STREAM offset, then emits `http/3` `DecryptedPacket` values per HTTP/3 request stream.

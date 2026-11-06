@@ -10,20 +10,22 @@ package protocol
 import (
 	"bufio"
 	"bytes"
+	"compress/flate"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
-	"fmt"
+	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gojue/ecapture_decryptor/types"
 )
 
-// WebSocket 操作码
 const (
 	WSOpcodeContinuation = 0x0
 	WSOpcodeText         = 0x1
@@ -31,87 +33,60 @@ const (
 	WSOpcodeClose        = 0x8
 	WSOpcodePing         = 0x9
 	WSOpcodePong         = 0xA
+	wsGUID               = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 )
 
-// WebSocket GUID (RFC 6455)
-const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+var errWebSocket = errors.New("invalid WebSocket stream")
 
-// WebSocketStreamParser WebSocket 流解析器
+type wsDirection struct {
+	buf                           bytes.Buffer
+	message                       []byte
+	opcode                        byte
+	compressed, closed, noContext bool
+	dict                          []byte
+	at                            time.Time
+}
+
+// WebSocketStreamParser validates an HTTP/1 upgrade and emits complete messages
+// and control frames. Only the active fragmented message and a 32 KiB DEFLATE
+// dictionary are retained per direction; sends apply caller backpressure.
 type WebSocketStreamParser struct {
-	addr       types.ConnectionKey
-	clientIP   string
-	clientPort uint32
-	serverIP   string
-	serverPort uint32
-	packetChan chan *types.DecryptedPacket // 解密包输出通道
-	mu         sync.Mutex
-
-	// 握手状态
-	handshakeComplete bool
-	upgradeRequest    *http.Request
-	upgradeResponse   *http.Response
-	wsKey             string
-
-	// 数据缓冲
-	clientBuffer bytes.Buffer
-	serverBuffer bytes.Buffer
-
-	// 消息状态
-	messages []wsMessage
-
-	// 时间戳
-	startTime  time.Time
-	packetTime time.Time
-
-	// HTTP/1.x 回退解析器
-	httpFallback *HTTPStreamParser
+	addr                               types.ConnectionKey
+	packetChan                         chan *types.DecryptedPacket
+	mu                                 sync.Mutex
+	sides                              [2]wsDirection
+	handshakeComplete, deflate, closed bool
+	request                            *http.Request
+	requestRaw                         []byte
+	requestTime, packetTime            time.Time
+	httpFallback                       *HTTPStreamParser
+	parseErr                           error
 }
 
-// wsMessage WebSocket 消息
-type wsMessage struct {
-	isClient  bool
-	opcode    byte
-	data      []byte
-	timestamp time.Time
+func NewWebSocketStreamParser(addr types.ConnectionKey, ch chan *types.DecryptedPacket) *WebSocketStreamParser {
+	return &WebSocketStreamParser{addr: addr, packetChan: ch}
 }
 
-// NewWebSocketStreamParser 创建 WebSocket 流解析器
-func NewWebSocketStreamParser(addr types.ConnectionKey, packetChan chan *types.DecryptedPacket) *WebSocketStreamParser {
-	return newWebSocketStreamParserInternal(addr, packetChan)
-}
-
-// newWebSocketStreamParserInternal 内部构造函数
-func newWebSocketStreamParserInternal(addr types.ConnectionKey, packetChan chan *types.DecryptedPacket) *WebSocketStreamParser {
-
-	return &WebSocketStreamParser{
-		addr:       addr,
-		clientIP:   addr.SrcIP.String(),
-		clientPort: uint32(addr.SrcPort),
-		serverIP:   addr.DstIP.String(),
-		serverPort: uint32(addr.DstPort),
-		packetChan: packetChan,
-		messages:   make([]wsMessage, 0),
+func headerToken(h http.Header, name, token string) bool {
+	for _, value := range h.Values(name) {
+		for _, part := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), token) {
+				return true
+			}
+		}
 	}
+	return false
 }
 
-// IsWebSocketUpgrade 检测是否是 WebSocket 升级请求
 func IsWebSocketUpgrade(data []byte) bool {
-	dataStr := string(data)
-	return strings.Contains(dataStr, "Upgrade: websocket") ||
-		strings.Contains(dataStr, "upgrade: websocket") ||
-		strings.Contains(dataStr, "Sec-WebSocket-Key:")
-}
-
-// getOrCreateHTTPFallback 获取或创建 HTTP 回退解析器
-func (p *WebSocketStreamParser) getOrCreateHTTPFallback() *HTTPStreamParser {
-	if p.httpFallback == nil {
-		p.httpFallback = NewHTTPStreamParser(p.addr, p.packetChan)
-		p.httpFallback.SetPacketTime(p.packetTime)
+	n := bytes.Index(data, []byte("\r\n\r\n"))
+	if n < 0 || n+4 > eventFieldLimit {
+		return false
 	}
-	return p.httpFallback
+	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(data[:n+4])))
+	return err == nil && headerToken(req.Header, "Upgrade", "websocket")
 }
 
-// SetPacketTime 设置数据包时间戳
 func (p *WebSocketStreamParser) SetPacketTime(t time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -120,338 +95,435 @@ func (p *WebSocketStreamParser) SetPacketTime(t time.Time) {
 		p.httpFallback.SetPacketTime(t)
 	}
 }
-
-// FeedRequest 处理客户端数据
-func (p *WebSocketStreamParser) FeedRequest(data []byte) {
+func (p *WebSocketStreamParser) Err() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
-	if !p.handshakeComplete {
-		p.clientBuffer.Write(data)
-		p.tryParseHandshakeRequest()
-		return
+	if p.parseErr == nil && p.httpFallback != nil {
+		return p.httpFallback.Err()
 	}
-
-	// 解析 WebSocket 帧
-	p.clientBuffer.Write(data)
-	p.parseWebSocketFrames(&p.clientBuffer, true)
+	return p.parseErr
 }
-
-// FeedResponse 处理服务端数据
-func (p *WebSocketStreamParser) FeedResponse(data []byte) {
+func (p *WebSocketStreamParser) FeedRequest(data []byte)  { p.feed(data, true) }
+func (p *WebSocketStreamParser) FeedResponse(data []byte) { p.feed(data, false) }
+func (p *WebSocketStreamParser) feed(data []byte, client bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
-	if !p.handshakeComplete {
-		p.serverBuffer.Write(data)
-		p.tryParseHandshakeResponse()
+	if p.parseErr != nil || p.closed {
 		return
 	}
-
-	// 解析 WebSocket 帧
-	p.serverBuffer.Write(data)
-	p.parseWebSocketFrames(&p.serverBuffer, false)
-}
-
-// tryParseHandshakeRequest 尝试解析升级请求
-func (p *WebSocketStreamParser) tryParseHandshakeRequest() {
-	if p.clientBuffer.Len() == 0 {
+	if p.httpFallback != nil {
+		p.feedFallback(data, client)
 		return
 	}
-
-	data := p.clientBuffer.Bytes()
-	reader := bufio.NewReader(bytes.NewReader(data))
-	req, err := http.ReadRequest(reader)
-	if err != nil {
-		return
-	}
-
-	// 检查是否是 WebSocket 升级请求
-	upgrade := req.Header.Get("Upgrade")
-	if !strings.EqualFold(upgrade, "websocket") {
-		// 不是 WebSocket，回退到 HTTP/1.x
-		p.getOrCreateHTTPFallback().FeedRequest(data)
-		p.clientBuffer.Reset()
-		return
-	}
-
-	p.upgradeRequest = req
-	p.wsKey = req.Header.Get("Sec-WebSocket-Key")
-	p.startTime = p.packetTime
-
-	// 清除已解析的数据
-	consumed := len(data) - reader.Buffered()
-	p.clientBuffer.Reset()
-	if reader.Buffered() > 0 {
-		remaining := make([]byte, reader.Buffered())
-		_, _ = reader.Read(remaining)
-		p.clientBuffer.Write(remaining)
-	} else if consumed < len(data) {
-		p.clientBuffer.Write(data[consumed:])
+	d := &p.sides[http3Side(client)]
+	for len(data) > 0 {
+		n := min(len(data), eventChunkSize)
+		if d.buf.Len()+n > maxHTTPMessageBytes+14 {
+			p.fail(ErrHTTPEventLimit)
+			return
+		}
+		d.buf.Write(data[:n])
+		data = data[n:]
+		if !p.handshakeComplete {
+			if err := p.handshake(); err != nil {
+				p.fail(err)
+				return
+			}
+			if p.httpFallback != nil {
+				p.feedFallback(data, client)
+				return
+			}
+		}
+		if p.handshakeComplete {
+			for i := range p.sides {
+				if err := p.frames(&p.sides[i], i == 0); err != nil {
+					p.fail(err)
+					return
+				}
+			}
+		}
 	}
 }
-
-// tryParseHandshakeResponse 尝试解析升级响应
-func (p *WebSocketStreamParser) tryParseHandshakeResponse() {
-	if p.upgradeRequest == nil {
-		// 还没收到升级请求
-		return
+func (p *WebSocketStreamParser) feedFallback(data []byte, client bool) {
+	if client {
+		p.httpFallback.FeedRequest(data)
+	} else {
+		p.httpFallback.FeedResponse(data)
 	}
-
-	if p.serverBuffer.Len() == 0 {
-		return
+}
+func (p *WebSocketStreamParser) fallback() {
+	p.httpFallback = NewHTTPStreamParser(p.addr, p.packetChan)
+	p.httpFallback.SetPacketTime(p.packetTime)
+	// This rejected/non-WebSocket request must not recursively upgrade itself.
+	p.httpFallback.skipWebSocket = true
+	p.httpFallback.FeedRequest(p.requestRaw)
+	p.httpFallback.skipWebSocket = false
+	p.httpFallback.FeedRequest(p.sides[0].buf.Bytes())
+	p.httpFallback.FeedResponse(p.sides[1].buf.Bytes())
+	p.requestRaw = nil
+	p.request = nil
+	p.sides = [2]wsDirection{}
+}
+func wsHeader(buf *bytes.Buffer) ([]byte, error) {
+	n := bytes.Index(buf.Bytes(), []byte("\r\n\r\n"))
+	if n < 0 {
+		if buf.Len() > eventFieldLimit {
+			return nil, ErrHTTPEventLimit
+		}
+		return nil, nil
 	}
-
-	data := p.serverBuffer.Bytes()
-	reader := bufio.NewReader(bytes.NewReader(data))
-	resp, err := http.ReadResponse(reader, p.upgradeRequest)
+	if n+4 > eventFieldLimit {
+		return nil, ErrHTTPEventLimit
+	}
+	return buf.Bytes()[:n+4], nil
+}
+func (p *WebSocketStreamParser) handshake() error {
+	if p.request == nil {
+		raw, err := wsHeader(&p.sides[0].buf)
+		if err != nil || raw == nil {
+			return err
+		}
+		req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(raw)))
+		if err != nil {
+			return errWebSocket
+		}
+		p.request = req
+		p.requestRaw = bytes.Clone(raw)
+		p.requestTime = p.packetTime
+		p.sides[0].buf.Next(len(raw))
+		if !headerToken(req.Header, "Upgrade", "websocket") {
+			p.fallback()
+			return nil
+		}
+		key, err := base64.StdEncoding.DecodeString(req.Header.Get("Sec-WebSocket-Key"))
+		if err != nil || len(key) != 16 || len(req.Header.Values("Sec-WebSocket-Key")) != 1 ||
+			req.Method != "GET" || req.Proto != "HTTP/1.1" || req.Host == "" ||
+			!headerToken(req.Header, "Connection", "upgrade") || req.Header.Get("Sec-WebSocket-Version") != "13" ||
+			req.ContentLength != 0 || len(req.TransferEncoding) != 0 {
+			return errWebSocket
+		}
+	}
+	raw, err := wsHeader(&p.sides[1].buf)
+	if err != nil || raw == nil {
+		return err
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(raw)), p.request)
 	if err != nil {
-		return
+		return errWebSocket
 	}
-
-	// 检查是否是成功的升级响应
-	if resp.StatusCode != 101 {
-		// 升级失败，回退到 HTTP/1.x
-		p.getOrCreateHTTPFallback().FeedResponse(data)
-		p.serverBuffer.Reset()
-		return
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		p.fallback()
+		return nil
 	}
-
-	// 验证 Sec-WebSocket-Accept
-	expectedAccept := computeWebSocketAccept(p.wsKey)
-	actualAccept := resp.Header.Get("Sec-WebSocket-Accept")
-	_ = actualAccept != expectedAccept // Verification (accept mismatch is logged but processing continues)
-
-	p.upgradeResponse = resp
+	if resp.Proto != "HTTP/1.1" || !headerToken(resp.Header, "Upgrade", "websocket") ||
+		!headerToken(resp.Header, "Connection", "upgrade") || len(resp.Header.Values("Sec-WebSocket-Accept")) != 1 ||
+		resp.Header.Get("Sec-WebSocket-Accept") != computeWebSocketAccept(p.request.Header.Get("Sec-WebSocket-Key")) {
+		return errWebSocket
+	}
+	if sub := resp.Header.Get("Sec-WebSocket-Protocol"); sub != "" {
+		found := false
+		for _, v := range p.request.Header.Values("Sec-WebSocket-Protocol") {
+			for _, offered := range strings.Split(v, ",") {
+				found = found || strings.TrimSpace(offered) == sub
+			}
+		}
+		if !found || len(resp.Header.Values("Sec-WebSocket-Protocol")) != 1 {
+			return errWebSocket
+		}
+	}
+	if err := p.negotiateDeflate(resp.Header); err != nil {
+		return err
+	}
 	p.handshakeComplete = true
-
-	// Output WebSocket upgrade request
-	var reqBuf bytes.Buffer
-	fmt.Fprintf(&reqBuf, "%s %s %s\r\n", p.upgradeRequest.Method, p.upgradeRequest.URL.RequestURI(), p.upgradeRequest.Proto)
-	_ = p.upgradeRequest.Header.Write(&reqBuf)
-	reqBuf.WriteString("\r\n")
-
-	if p.packetChan != nil {
-		reqPacket := types.NewDecryptedPacket(types.TransportProtocolTCP, "websocket", "request", reqBuf.Bytes(), p.startTime, p.addr)
-		reqPacket.WithMetadata("method", p.upgradeRequest.Method).
-			WithMetadata("url", p.upgradeRequest.URL.String()).
-			WithMetadata("upgrade", "websocket")
-
-		select {
-		case p.packetChan <- reqPacket:
-		default:
-		}
-	}
-
-	// Output WebSocket upgrade response
-	var respBuf bytes.Buffer
-	fmt.Fprintf(&respBuf, "%s %s\r\n", resp.Proto, resp.Status)
-	_ = resp.Header.Write(&respBuf)
-	respBuf.WriteString("\r\n")
-
-	if p.packetChan != nil {
-		respPacket := types.NewDecryptedPacket(types.TransportProtocolTCP, "websocket", "response", respBuf.Bytes(), p.packetTime, p.addr)
-		respPacket.WithMetadata("status", resp.StatusCode).
-			WithMetadata("upgrade", "websocket")
-
-		select {
-		case p.packetChan <- respPacket:
-		default:
-		}
-	}
-
-	// 清除已解析的数据
-	consumed := len(data) - reader.Buffered()
-	p.serverBuffer.Reset()
-	if reader.Buffered() > 0 {
-		remaining := make([]byte, reader.Buffered())
-		_, _ = reader.Read(remaining)
-		p.serverBuffer.Write(remaining)
-	} else if consumed < len(data) {
-		p.serverBuffer.Write(data[consumed:])
-	}
+	p.emit(true, "upgrade", p.requestRaw, p.requestTime, map[string]any{"method": p.request.Method, "url": p.request.URL.String(), "headers": p.request.Header.Clone(), "upgrade": "websocket"})
+	p.emit(false, "upgrade", raw, p.packetTime, map[string]any{"status": resp.StatusCode, "headers": resp.Header.Clone(), "upgrade": "websocket"})
+	p.sides[1].buf.Next(len(raw))
+	p.requestRaw = nil
+	p.request = nil
+	return nil
 }
 
-// computeWebSocketAccept 计算 Sec-WebSocket-Accept
 func computeWebSocketAccept(key string) string {
-	h := sha1.New()
-	h.Write([]byte(key + wsGUID))
-	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+	sum := sha1.Sum([]byte(key + wsGUID))
+	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
-// parseWebSocketFrames 解析 WebSocket 帧
-func (p *WebSocketStreamParser) parseWebSocketFrames(buf *bytes.Buffer, isClient bool) {
-	for {
-		if buf.Len() < 2 {
-			return
-		}
-
-		data := buf.Bytes()
-
-		// 解析帧头
-		firstByte := data[0]
-		secondByte := data[1]
-
-		fin := (firstByte & 0x80) != 0
-		opcode := firstByte & 0x0F
-		masked := (secondByte & 0x80) != 0
-		payloadLen := int(secondByte & 0x7F)
-
-		headerLen := 2
-		switch payloadLen {
-		case 126:
-			if buf.Len() < 4 {
-				return
+// The agreed response controls dictionaries. A receiver may always use a
+// 32 KiB window, including when a smaller sender window was negotiated.
+func wsDeflateParams(extension string, offer bool) (map[string]string, error) {
+	parts := strings.Split(extension, ";")
+	if strings.TrimSpace(parts[0]) != "permessage-deflate" {
+		return nil, errWebSocket
+	}
+	params := make(map[string]string)
+	for _, part := range parts[1:] {
+		k, v, has := strings.Cut(strings.TrimSpace(part), "=")
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		if strings.HasPrefix(v, "\"") || strings.HasSuffix(v, "\"") {
+			if len(v) < 2 || v[0] != '"' || v[len(v)-1] != '"' {
+				return nil, errWebSocket
 			}
-			payloadLen = int(binary.BigEndian.Uint16(data[2:4]))
-			headerLen = 4
-		case 127:
-			if buf.Len() < 10 {
-				return
+			v = v[1 : len(v)-1]
+		}
+		if _, exists := params[k]; exists {
+			return nil, errWebSocket
+		}
+		switch k {
+		case "client_no_context_takeover", "server_no_context_takeover":
+			if has {
+				return nil, errWebSocket
 			}
-			payloadLen = int(binary.BigEndian.Uint64(data[2:10]))
-			headerLen = 10
+		case "client_max_window_bits", "server_max_window_bits":
+			if !has && offer && k == "client_max_window_bits" {
+				break
+			}
+			n, err := strconv.Atoi(v)
+			if !has || err != nil || n < 8 || n > 15 || strconv.Itoa(n) != v {
+				return nil, errWebSocket
+			}
+		default:
+			return nil, errWebSocket
 		}
+		params[k] = v
+	}
+	return params, nil
+}
+func (p *WebSocketStreamParser) negotiateDeflate(h http.Header) error {
+	selected := strings.TrimSpace(strings.Join(h.Values("Sec-WebSocket-Extensions"), ","))
+	if selected == "" {
+		return nil
+	}
+	agreed, err := wsDeflateParams(selected, false)
+	if err != nil {
+		return err
+	}
+	matched := false
+	for _, offer := range strings.Split(strings.Join(p.request.Header.Values("Sec-WebSocket-Extensions"), ","), ",") {
+		params, err := wsDeflateParams(offer, true)
+		if err != nil {
+			continue
+		}
+		if _, ok := agreed["client_max_window_bits"]; ok {
+			if _, ok = params["client_max_window_bits"]; !ok {
+				continue
+			}
+		}
+		if v, ok := params["server_max_window_bits"]; ok {
+			n, _ := strconv.Atoi(v)
+			a, _ := strconv.Atoi(agreed["server_max_window_bits"])
+			if a == 0 || a > n {
+				continue
+			}
+		}
+		if _, ok := params["server_no_context_takeover"]; ok {
+			if _, ok = agreed["server_no_context_takeover"]; !ok {
+				continue
+			}
+		}
+		matched = true
+		break
+	}
+	if !matched {
+		return errWebSocket
+	}
+	p.deflate = true
+	_, p.sides[0].noContext = agreed["client_no_context_takeover"]
+	_, p.sides[1].noContext = agreed["server_no_context_takeover"]
+	return nil
+}
 
+func (p *WebSocketStreamParser) frames(d *wsDirection, client bool) error {
+	for d.buf.Len() >= 2 {
+		h := d.buf.Bytes()
+		fin := h[0]&0x80 != 0
+		compressed := h[0]&0x40 != 0
+		op := h[0] & 15
+		masked := h[1]&0x80 != 0
+		n := uint64(h[1] & 127)
+		header := 2
+		control := op >= 8
+		if d.closed || h[0]&0x30 != 0 || masked != client ||
+			(op != 0 && op != 1 && op != 2 && op != 8 && op != 9 && op != 10) ||
+			compressed && (!p.deflate || control || op == 0) || control && (!fin || n > 125) {
+			return errWebSocket
+		}
+		if n == 126 {
+			if len(h) < 4 {
+				return nil
+			}
+			n = uint64(binary.BigEndian.Uint16(h[2:4]))
+			header = 4
+			if n < 126 {
+				return errWebSocket
+			}
+		} else if n == 127 {
+			if len(h) < 10 {
+				return nil
+			}
+			n = binary.BigEndian.Uint64(h[2:10])
+			header = 10
+			if n < 65536 || n>>63 != 0 {
+				return errWebSocket
+			}
+		}
+		if n > maxHTTPMessageBytes {
+			return ErrHTTPEventLimit
+		}
 		if masked {
-			headerLen += 4
+			header += 4
 		}
-
-		totalLen := headerLen + payloadLen
-		if buf.Len() < totalLen {
-			return
+		if uint64(len(h)) < uint64(header)+n {
+			return nil
 		}
-
-		// 读取完整帧
-		frameData := make([]byte, totalLen)
-		_, _ = buf.Read(frameData)
-
-		// 提取载荷
-		payload := frameData[headerLen:]
+		payload := bytes.Clone(h[header : header+int(n)])
 		if masked {
-			maskKey := frameData[headerLen-4 : headerLen]
 			for i := range payload {
-				payload[i] ^= maskKey[i%4]
+				payload[i] ^= h[header-4+i%4]
 			}
 		}
-
-		// 处理帧
-		p.handleWebSocketFrame(fin, opcode, payload, isClient)
+		d.buf.Next(header + int(n))
+		if control {
+			meta := map[string]any{"opcode": op, "opcode_name": map[byte]string{8: "close", 9: "ping", 10: "pong"}[op], "is_client": client, "data_length": len(payload)}
+			if op == WSOpcodeClose {
+				if len(payload) == 1 {
+					return errWebSocket
+				}
+				if len(payload) >= 2 {
+					code := binary.BigEndian.Uint16(payload)
+					if !validWSClose(code) || !utf8.Valid(payload[2:]) {
+						return errWebSocket
+					}
+					meta["close_code"] = code
+					meta["close_reason"] = string(payload[2:])
+				}
+				d.closed = true
+				d.message = nil
+				d.opcode = 0
+				d.dict = nil
+			}
+			p.emit(client, "control", payload, p.packetTime, meta)
+			continue
+		}
+		if op == 0 {
+			if d.opcode == 0 {
+				return errWebSocket
+			}
+		} else {
+			if d.opcode != 0 {
+				return errWebSocket
+			}
+			d.opcode = op
+			d.compressed = compressed
+			d.at = p.packetTime
+		}
+		if len(payload) > maxHTTPMessageBytes-len(d.message) {
+			return ErrHTTPEventLimit
+		}
+		d.message = append(d.message, payload...)
+		if !fin {
+			continue
+		}
+		data := d.message
+		if d.compressed {
+			var err error
+			data, err = inflateWebSocket(data, d.dict)
+			if err != nil {
+				return err
+			}
+			if !d.noContext {
+				d.dict = wsDictionary(d.dict, data)
+			}
+		}
+		if d.opcode == WSOpcodeText && !utf8.Valid(data) {
+			return errWebSocket
+		}
+		name := "binary"
+		if d.opcode == WSOpcodeText {
+			name = "text"
+		}
+		p.emit(client, "message", data, d.at, map[string]any{"opcode": d.opcode, "opcode_name": name, "is_client": client, "data_length": len(data), "compressed": d.compressed})
+		d.message = nil
+		d.opcode = 0
 	}
+	return nil
 }
-
-// handleWebSocketFrame 处理 WebSocket 帧
-func (p *WebSocketStreamParser) handleWebSocketFrame(fin bool, opcode byte, payload []byte, isClient bool) {
-	switch opcode {
-	case WSOpcodeText, WSOpcodeBinary:
-		msg := wsMessage{
-			isClient:  isClient,
-			opcode:    opcode,
-			data:      make([]byte, len(payload)),
-			timestamp: p.packetTime,
-		}
-		copy(msg.data, payload)
-		p.messages = append(p.messages, msg)
-
-		// 如果是完整消息（FIN=1），输出解密包
-		if fin && p.packetChan != nil {
-			direction := "request"
-			if !msg.isClient {
-				direction = "response"
-			}
-
-			opcodeStr := "unknown"
-			switch msg.opcode {
-			case WSOpcodeText:
-				opcodeStr = "text"
-			case WSOpcodeBinary:
-				opcodeStr = "binary"
-			}
-
-			packet := types.NewDecryptedPacket(types.TransportProtocolTCP, "websocket", direction, msg.data, msg.timestamp, p.addr)
-			packet.WithMetadata("opcode", msg.opcode).
-				WithMetadata("opcode_name", opcodeStr).
-				WithMetadata("is_client", msg.isClient).
-				WithMetadata("data_length", len(msg.data))
-
-			select {
-			case p.packetChan <- packet:
-			default:
-			}
-		}
-
-	case WSOpcodeClose:
-		// 连接关闭
-
-	case WSOpcodePing, WSOpcodePong:
-		// Ping/Pong 帧，忽略
-
-	case WSOpcodeContinuation:
-		// 继续帧，追加到前一个消息
-		if len(p.messages) > 0 {
-			lastIdx := len(p.messages) - 1
-			p.messages[lastIdx].data = append(p.messages[lastIdx].data, payload...)
-			if fin && p.packetChan != nil {
-				msg := p.messages[lastIdx]
-				direction := "request"
-				if !msg.isClient {
-					direction = "response"
-				}
-
-				opcodeStr := "unknown"
-				switch msg.opcode {
-				case WSOpcodeText:
-					opcodeStr = "text"
-				case WSOpcodeBinary:
-					opcodeStr = "binary"
-				}
-
-				packet := types.NewDecryptedPacket(types.TransportProtocolTCP, "websocket", direction, msg.data, msg.timestamp, p.addr)
-				packet.WithMetadata("opcode", msg.opcode).
-					WithMetadata("opcode_name", opcodeStr).
-					WithMetadata("is_client", msg.isClient).
-					WithMetadata("data_length", len(msg.data))
-
-				select {
-				case p.packetChan <- packet:
-				default:
-				}
-			}
-		}
+func validWSClose(code uint16) bool {
+	return code >= 3000 && code <= 4999 || code >= 1000 && code <= 1014 && code != 1004 && code != 1005 && code != 1006
+}
+func wsDictionary(dict, data []byte) []byte {
+	if len(data) >= 32768 {
+		return bytes.Clone(data[len(data)-32768:])
 	}
+	keep := min(len(dict), 32768-len(data))
+	return append(bytes.Clone(dict[len(dict)-keep:]), data...)
 }
-
-// Flush 刷新所有未完成的数据
+func inflateWebSocket(data, dict []byte) ([]byte, error) {
+	// Restore SYNC_FLUSH and supply a final empty block. A byte reader avoids
+	// read-ahead across BFINAL blocks, which RFC 7692 also permits in a message.
+	r := bytes.NewReader(append(bytes.Clone(data), 0, 0, 255, 255, 1, 0, 0, 255, 255))
+	var out []byte
+	for r.Len() > 0 {
+		z := flate.NewReaderDict(r, dict)
+		part, err := io.ReadAll(io.LimitReader(z, int64(maxHTTPMessageBytes-len(out)+1)))
+		_ = z.Close()
+		if len(part) > maxHTTPMessageBytes-len(out) {
+			return nil, ErrHTTPEventLimit
+		}
+		if err != nil {
+			return nil, errWebSocket
+		}
+		out = append(out, part...)
+		dict = wsDictionary(dict, part)
+	}
+	return out, nil
+}
+func (p *WebSocketStreamParser) emit(client bool, kind string, data []byte, at time.Time, meta map[string]any) {
+	if p.packetChan == nil {
+		return
+	}
+	direction := "response"
+	if client {
+		direction = "request"
+	}
+	packet := types.NewDecryptedPacket(types.TransportProtocolTCP, "websocket", direction, bytes.Clone(data), at, p.addr)
+	for k, v := range meta {
+		packet.WithMetadata(k, v)
+	}
+	packet.WithMetadata("kind", kind)
+	p.packetChan <- packet
+}
+func (p *WebSocketStreamParser) fail(err error) {
+	p.parseErr = err
+	p.sides = [2]wsDirection{}
+	p.requestRaw = nil
+	p.request = nil
+}
 func (p *WebSocketStreamParser) Flush() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
-	// 如果有 HTTP 回退解析器，刷新它
+	if p.closed {
+		return
+	}
+	p.closed = true
 	if p.httpFallback != nil {
 		p.httpFallback.Flush()
 		return
 	}
-
-	// 解析剩余的 WebSocket 帧
-	if p.handshakeComplete {
-		p.parseWebSocketFrames(&p.clientBuffer, true)
-		p.parseWebSocketFrames(&p.serverBuffer, false)
+	if p.parseErr == nil {
+		if !p.handshakeComplete || p.sides[0].buf.Len()+p.sides[1].buf.Len() > 0 || p.sides[0].opcode != 0 || p.sides[1].opcode != 0 {
+			p.parseErr = io.ErrUnexpectedEOF
+		}
 	}
+	p.sides = [2]wsDirection{}
+	p.request = nil
+	p.requestRaw = nil
 }
-
-// Close 关闭解析器
-func (p *WebSocketStreamParser) Close() error {
-	p.Flush()
-	return nil
-}
-
-// IsWebSocket 返回是否已建立 WebSocket 连接
+func (p *WebSocketStreamParser) Close() error { p.Flush(); return p.Err() }
 func (p *WebSocketStreamParser) IsWebSocket() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.handshakeComplete
 }
 
-// Ensure interface is implemented
 var _ types.StreamParserInterface = (*WebSocketStreamParser)(nil)
-var _ io.Closer = (*WebSocketStreamParser)(nil)

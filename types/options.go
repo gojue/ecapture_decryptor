@@ -13,7 +13,8 @@ type DecryptOptions struct {
 	// RawChunks emits authenticated TLS bytes or QUIC STREAM chunks instead of
 	// parsed application messages. Chunk boundaries are not message boundaries.
 	RawChunks bool
-	// HTTPEvents emits incremental HTTP headers, body, SSE, trailers and terminal events.
+	// HTTPEvents emits incremental HTTP headers, body, SSE, HTTP/2 gRPC messages,
+	// trailers and terminal events.
 	HTTPEvents bool
 	// MaxDecodedBodyBytes enables incremental gzip expansion with this per-message
 	// output limit. Zero preserves the content-coded representation.
