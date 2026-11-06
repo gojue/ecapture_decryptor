@@ -75,11 +75,13 @@ pcap/pcapng + 外部 SSLKEYLOG / 内嵌 DSB
 - 保持现有缓存上限和关闭语义；退出需释放路由、队列、解析器引用与连接额度，正常 EOF 需处理已缓冲数据。不得通过删除限制、无界等待或持有路由锁执行阻塞关闭修复问题。
 - `DecryptedPacket.Data` 带 `json:"-"`：直接 JSON 编码不会自动携带明文正文。Go CLI 的显式转换器与 C API 的 JSON 输出行为不同，修改时同时检查消费者预期。
 
-HTTP/3 需要包含客户端 Initial/ClientHello 的双向 UDP 抓包和匹配 TLS 1.3 secrets。真实夹具验证 QUIC v1/v2 的 AES-128-GCM 双向多次 Key Update；AES-256-GCM/ChaCha20 更新仅有向量和状态测试，draft-29 未通过真实抓包验证。QUIC 每方向保留当前/上一代及下一代候选，详见 `docs/API.md`。独立 aioquic 夹具覆盖 v1/v2 × 三套件的握手/应用解密、CID 轮换/迁移、Retry/VN 和 accepted/rejected 0-RTT（不扩大 Key Update 的实测套件范围）；零长度 CID 仅在唯一原 tuple 路由，early data 输出边界见 API 文档。HTTP/3 已支持有界动态 QPACK、控制流、1xx/final/trailers、push 和 RESET_STREAM；双向动态 QPACK 的独立真实夹具使用 QUIC v1。decoder feedback 仅被动读取，不发送 ACK；消息与资源契约见 API 文档。HTTP/1 WebSocket 支持有界双向分片、控制帧和协商后的 permessage-deflate/context takeover。gRPC 语义仅在 HTTPEvents 的 HTTP/2 路径启用，保留无 schema 的消息字节，支持未压缩/gzip 和状态 trailers；不外推到 gRPC-Web、H3 或扩展 CONNECT。不要宣称已支持 TLS KeyUpdate 或 DATAGRAM。C 的 `DecryptLiveTrafficToFile` 网卡接入仍是占位实现，E2E 验证其错误路径。
+HTTP/3 需要包含客户端 Initial/ClientHello 的双向 UDP 抓包和匹配 TLS 1.3 secrets。真实夹具验证 QUIC v1/v2 的 AES-128-GCM 双向多次 Key Update；AES-256-GCM/ChaCha20 更新仅有向量和状态测试，draft-29 未通过真实抓包验证。QUIC 每方向保留当前/上一代及下一代候选，详见 `docs/API.md`。独立 aioquic 夹具覆盖 v1/v2 × 三套件的握手/应用解密、CID 轮换/迁移、Retry/VN 和 accepted/rejected 0-RTT（不扩大 Key Update 的实测套件范围）；零长度 CID 仅在唯一原 tuple 路由，early data 输出边界见 API 文档。HTTP/3 已支持有界动态 QPACK、控制流、1xx/final/trailers、push 和 RESET_STREAM；双向动态 QPACK 的独立真实夹具使用 QUIC v1。decoder feedback 仅被动读取，不发送 ACK；消息与资源契约见 API 文档。HTTP/1 WebSocket 支持有界双向分片、控制帧和协商后的 permessage-deflate/context takeover。gRPC 语义仅在 HTTPEvents 的 HTTP/2 路径启用，保留无 schema 的消息字节，支持未压缩/gzip 和状态 trailers；不外推到 gRPC-Web、H3 或扩展 CONNECT。不要宣称已支持 DATAGRAM。C 的 `DecryptLiveTrafficToFile` 网卡接入仍是占位实现，E2E 验证其错误路径。
 
 DNS 仅解析普通 QUERY（不含 AXFR/IXFR）：DoT 按连接内 ID 和问题唯一关联，DoH 支持 HTTP/1.x、2、3 GET/POST，DoQ 限客户端双向流的一问一答及 1-RTT。DoQ 必须显式选择；观察到经认证的 QUIC ALPN 时核对 `doq`/`h3`，缺少握手 secrets 时由调用方声明协议，不代表已验证协商结果。MQTT 仅支持 TLS 内 3.1.1 控制包，不跟踪 QoS ACK 状态或去重 DUP；Redis 仅支持定长 RESP2/RESP3，保留流水线和 Pub/Sub 配对，不包含 inline、流式 RESP、复制或 MONITOR。新增真实夹具由独立 Python TLS/QUIC 对端产生，不依赖 eCapture。
 
 `TLSUpgrade` 显式选择 SMTP/IMAP/POP3、LDAP、PostgreSQL SSLRequest、MySQL SSLRequest、HTTP/1 CONNECT 或 HTTPS CONNECT 内一层 TLS。仅处理一次协商，拒绝后持续明文，不扫描 TLS 魔数或重试升级；邮件/数据库应用解析不在此范围。输出以原 ConnectionID 与 tls_depth 区分层，HTTPS CONNECT 始终保留外层已认证 raw 字节，无内层密钥仍返回固定诊断及错误。所有阶段共用有界协商/密钥期限，详见 API 文档；不外推到 H2/H3 CONNECT、多层隧道或任意 Upgrade。
+
+TLS 1.3 KeyUpdate 按方向认证完整消息后派生下一代并重置 record 序号；三套件有独立向量和真实抓包。握手分帧、普通 HRR、TLS 1.2/1.3 恢复、TLS early data 与 ECH 输入范围见 API 能力矩阵。early 接受由已认证 EncryptedExtensions 判定；ECH 需 Outer random 下的 ECH_SECRET/ECH_CONFIG，验证 payload/accept_confirmation 后才选 Inner random。仅实现 X25519/HKDF-SHA256/AES128-GCM HPKE；HRR 与 ECH/early 的组合、重协商等不在本批。不要把 cipher 注册项、record 认证或单项测试外推为全部 TLS 状态支持/完整身份验证。
 
 ## 编译环境与命令
 

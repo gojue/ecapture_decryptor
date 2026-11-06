@@ -117,6 +117,23 @@ func (sb *StreamBuffer) ReadRecord() ([]byte, error) {
 	return record, nil
 }
 
+// unreadRecord preserves a coalesced handshake tail without consuming bytes
+// from the following TLS record. It is used only by the serialized handshake
+// reader; concurrent producers remain subject to the shared input budget.
+func (sb *StreamBuffer) unreadRecord(record []byte) error {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	if len(record) > sb.limit-sb.buf.Len() {
+		return ErrHandshakeResourceLimit
+	}
+	var pending bytes.Buffer
+	pending.Grow(len(record) + sb.buf.Len())
+	pending.Write(record)
+	pending.Write(sb.buf.Bytes())
+	sb.buf = pending
+	return nil
+}
+
 // TryReadRecord attempts to read a complete TLS record without blocking.
 // Returns nil if not enough data is available.
 func (sb *StreamBuffer) TryReadRecord() []byte {

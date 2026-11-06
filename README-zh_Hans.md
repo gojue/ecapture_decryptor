@@ -55,6 +55,8 @@ Go 文件或流式 API 可用 `types.DecryptOptions{ApplicationProtocol: "doh"}`
 
 Go API 可通过 `TLSUpgrade` 显式选择 SMTP、IMAP、POP3、LDAP、PostgreSQL、MySQL 或 HTTP/1 CONNECT 协商，并用 `https-connect` 解密一层内层 TLS。升级被拒绝后保持明文，不扫描 TLS 前缀；升级后的载荷沿用已有应用/raw 输出，缺内层密钥仍保留可解的外层字节。[协商范围、层级与上限](docs/API.md#tlsupgrade)见 API 文档。
 
+TLS 1.3 支持经认证的分方向 KeyUpdate 与 record 序号重置、跨 record 握手消息、普通 HRR 和会话恢复。early data 与 ECH 需要对应密钥，并明确区分接受状态和随机数关联边界。各套件实测证据及未支持组合见 [TLS 能力矩阵](docs/API.md#tls-版本与状态)。
+
 ### QUIC / HTTP/3 输入要求
 
 解密 HTTP/3 需要包含客户端 Initial（其中有 ClientHello）的双向 UDP 抓包，以及匹配该连接的 TLS 1.3 SSLKEYLOG。密钥可作为外部文件传入，也可放在 pcapng 的 DSB 中。解析器按 QUIC 连接、包号和 STREAM 偏移重组数据，再按 HTTP/3 请求流输出 `http/3` 的 `DecryptedPacket`。

@@ -373,7 +373,7 @@ func TestTLSHandshakeAndKeyWaitShareDeadline(t *testing.T) {
 					// Consuming most of the deadline in ClientHello must not grant a
 					// fresh timeout to the following ServerHello or secret wait.
 					time.Sleep(75 * time.Millisecond)
-					hello := append([]byte{0x16, 3, 3, 0, 38, 1, 0, 0, 34, 3, 3}, bytes.Repeat([]byte{0x44}, 32)...)
+					hello, _ := tlsUpgradeTestHellos(0x44)
 					if err := decryptor.FeedClient(hello); err != nil {
 						t.Fatal(err)
 					}

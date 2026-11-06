@@ -987,6 +987,15 @@ func decryptD09Capture(t *testing.T, path string, options types.DecryptOptions, 
 		}
 		keys = append(keys, inner...)
 	}
+	packets, err := decryptTLSCapture(t, path, keys, options)
+	if innerKeys && err != nil {
+		t.Fatal(err)
+	}
+	return packets, err
+}
+
+func decryptTLSCapture(t *testing.T, path string, keys []byte, options types.DecryptOptions) ([]*types.DecryptedPacket, error) {
+	t.Helper()
 	f, err := os.Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -1004,9 +1013,6 @@ func decryptD09Capture(t *testing.T, path string, options types.DecryptOptions, 
 	err = DecryptWithConfig(NewDecryptorConfig().WithPcapReader(f).WithSSLKeyLog(bytes.NewReader(keys)).WithPacketChan(ch).WithOptions(options).WithLogger(log.New(io.Discard, "", 0)))
 	close(ch)
 	<-done
-	if innerKeys && err != nil {
-		t.Fatal(err)
-	}
 	return packets, err
 }
 
@@ -1109,5 +1115,278 @@ func TestD09CancelAndCallbackFailure(t *testing.T) {
 				})
 			})
 		}
+	}
+}
+
+// tlsFixtureDSB constructs only a DSB, for appending to the little-endian
+// independently captured fixtures without rewriting their network packets.
+func tlsFixtureDSB(t *testing.T, keys []byte) []byte {
+	t.Helper()
+	var encoded bytes.Buffer
+	w, err := pcapgo.NewNgWriter(&encoded, layers.LinkTypeEthernet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	encoded.Reset()
+	if err := w.WriteDecryptionSecretsBlock(pcapgo.DSB_SECRETS_TYPE_TLS, keys); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	return bytes.Clone(encoded.Bytes())
+}
+
+func d10HTTP(mode string, index int) (request, response, body []byte) {
+	request = fmt.Appendf(nil, "GET /d10/%s/%d HTTP/1.1\r\nHost: fixture\r\n\r\n", mode, index)
+	body = fmt.Appendf(nil, "d10/%s/%d\n", mode, index)
+	response = fmt.Appendf(nil, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+	return
+}
+
+func TestD10TLSCaptureAPIs(t *testing.T) {
+	for _, tc := range []struct {
+		mode                string
+		connections, rounds int
+	}{
+		{"ku_aes128", 1, 6}, {"ku_aes256", 1, 6}, {"ku_chacha", 1, 6},
+		{"hrr", 1, 1}, {"early", 4, 1}, {"tls12_resume", 2, 1}, {"grease", 1, 1},
+		{"ech_accepted", 1, 1}, {"ech_rejected", 0, 0},
+	} {
+		keyPath := "test/testdata/d10_openssl.keys"
+		if strings.HasPrefix(tc.mode, "ech_") {
+			keyPath = "test/testdata/d10_ech.keys"
+		}
+		keys, err := os.ReadFile(keyPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := "test/testdata/d10_" + tc.mode + ".pcapng"
+		for _, output := range []string{"messages", "raw", "events"} {
+			for _, streaming := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/stream=%t", tc.mode, output, streaming), func(t *testing.T) {
+					var mu sync.Mutex
+					var diagnostics []types.Diagnostic
+					options := types.DecryptOptions{RawChunks: output == "raw", HTTPEvents: output == "events", OnDiagnostic: func(d types.Diagnostic) {
+						mu.Lock()
+						defer mu.Unlock()
+						diagnostics = append(diagnostics, d)
+					}}
+					var packets []*types.DecryptedPacket
+					var result error
+					if !streaming {
+						packets, result = decryptTLSCapture(t, path, keys, options)
+					} else {
+						capture, err := os.ReadFile(path)
+						if err != nil {
+							t.Fatal(err)
+						}
+						// App secrets alone arrive first, followed by handshake/early
+						// secrets, and finally the ECH association. No new network packet.
+						var groups [3][]byte
+						for _, line := range bytes.Split(keys, []byte{'\n'}) {
+							f := bytes.Fields(line)
+							if len(f) != 3 || f[0][0] == '#' {
+								continue
+							}
+							group := 1
+							label := string(f[0])
+							if strings.HasSuffix(label, "TRAFFIC_SECRET_0") || label == "CLIENT_RANDOM" {
+								group = 0
+							} else if strings.HasPrefix(label, "ECH_") {
+								group = 2
+							}
+							groups[group] = append(groups[group], append(bytes.Clone(line), '\n')...)
+						}
+						if tc.mode == "ech_rejected" {
+							// A definitive rejection requires ECH evidence when selecting
+							// the outer random; absent evidence is only "unknown".
+							groups[0], groups[2] = groups[2], groups[0]
+						}
+						synctest.Test(t, func(t *testing.T) {
+							stream := newLiveStreamWithOptions(t, options)
+							stream.write(t, capture)
+							for i, group := range groups {
+								if len(group) == 0 {
+									continue
+								}
+								stream.write(t, tlsFixtureDSB(t, group))
+								synctest.Wait()
+								stream.assertOpen(t)
+								if tc.mode == "ech_accepted" && i < 2 && len(stream.packets) != 0 {
+									t.Fatal("ECH traffic emitted before random association was authenticated")
+								}
+							}
+							if tc.connections != 0 && len(stream.packets) == 0 {
+								t.Fatal("TLS output delayed until EOF")
+							}
+							stream.write(t, tlsFixtureDSB(t, keys))
+							if err := stream.writer.Close(); err != nil {
+								t.Fatal(err)
+							}
+							synctest.Wait()
+							result, packets = <-stream.done, stream.packets
+						})
+					}
+					if result != nil && tc.mode != "ech_rejected" {
+						t.Fatal(result)
+					}
+					type exchange struct {
+						request, response []byte
+						ends              int
+					}
+					got := map[string]*exchange{}
+					earlyRaw := map[string][]byte{}
+					for _, p := range packets {
+						if p.Metadata["encryption_level"] == "0rtt" && p.Metadata["early_data"] != "accepted" {
+							if output != "raw" || tc.mode != "early" || p.Metadata["early_data"] != "rejected" || p.Direction != "request" || p.Metadata["offset"] != uint64(len(earlyRaw[p.ConnectionID()])) {
+								t.Fatal("unexpected rejected early output", p.Metadata)
+							}
+							earlyRaw[p.ConnectionID()] = append(earlyRaw[p.ConnectionID()], p.Data...)
+							continue
+						}
+						if output == "raw" && p.Metadata["kind"] == "stream_end" {
+							continue
+						}
+						e := got[p.ConnectionID()]
+						if e == nil {
+							e = &exchange{}
+							got[p.ConnectionID()] = e
+						}
+						data := &e.response
+						if p.Direction == "request" {
+							data = &e.request
+						}
+						if output == "raw" {
+							if p.Protocol != "tls" || p.Metadata["offset"] != uint64(len(*data)) {
+								t.Fatal("noncontiguous TLS raw bytes", p.Metadata)
+							}
+						} else if p.Protocol != "http/1.1" {
+							t.Fatal(p.Protocol)
+						}
+						if output == "events" {
+							switch p.Metadata["kind"] {
+							case "headers":
+								if p.Direction == "request" {
+									e.request = append(e.request, []byte(fmt.Sprint(p.Metadata["url"])+"\n")...)
+								}
+							case "body_chunk":
+								*data = append(*data, p.Data...)
+							case "end":
+								e.ends++
+							default:
+								t.Fatal("unexpected HTTP event", p.Metadata)
+							}
+						} else {
+							*data = append(*data, p.Data...)
+						}
+					}
+					if len(got) != tc.connections {
+						t.Fatalf("connections=%d, want %d", len(got), tc.connections)
+					}
+					for connection := 0; connection < tc.connections; connection++ {
+						var wantRequest, wantResponse []byte
+						for round := 0; round < tc.rounds; round++ {
+							index := round
+							if tc.connections > 1 {
+								index = connection
+							}
+							request, response, body := d10HTTP(tc.mode, index)
+							if output == "events" {
+								request = fmt.Appendf(nil, "/d10/%s/%d\n", tc.mode, index)
+								response = body
+							}
+							wantRequest = append(wantRequest, request...)
+							wantResponse = append(wantResponse, response...)
+						}
+						matched := false
+						for id, e := range got {
+							if bytes.Equal(e.request, wantRequest) && bytes.Equal(e.response, wantResponse) && (output != "events" || e.ends == tc.rounds*2) {
+								matched = true
+								delete(got, id)
+								break
+							}
+						}
+						if !matched {
+							t.Fatalf("missing exact HTTP exchange %d: want request %q response %q; got %+v", connection, wantRequest, wantResponse, got)
+						}
+					}
+					if tc.mode == "early" && output == "raw" {
+						want, _, _ := d10HTTP(tc.mode, 3)
+						if len(earlyRaw) != 1 {
+							t.Fatal("rejected early bytes missing or duplicated")
+						}
+						for _, data := range earlyRaw {
+							if !bytes.Equal(data, want) {
+								t.Fatal("rejected early request bytes changed")
+							}
+						}
+					}
+					if strings.HasPrefix(tc.mode, "ech_") {
+						mu.Lock()
+						defer mu.Unlock()
+						if !slices.ContainsFunc(diagnostics, func(d types.Diagnostic) bool { return d.Stage == "handshake" && d.Code == tc.mode }) {
+							t.Fatal("missing fixed ECH diagnostic", diagnostics)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestD10TLSCaptureInvalidSecrets(t *testing.T) {
+	for _, name := range []string{"wrong_application", "wrong_application_only", "wrong_handshake", "missing_ech", "wrong_ech", "wrong_ech_random", "ech_outer_unconfirmed"} {
+		t.Run(name, func(t *testing.T) {
+			mode, keyPath := "ku_aes128", "test/testdata/d10_openssl.keys"
+			if strings.Contains(name, "ech") {
+				mode, keyPath = "ech_accepted", "test/testdata/d10_ech.keys"
+			}
+			if name == "ech_outer_unconfirmed" {
+				mode = "ech_rejected"
+			}
+			original, err := os.ReadFile(keyPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var keys []byte
+			for _, line := range bytes.Split(original, []byte{'\n'}) {
+				f := bytes.Fields(line)
+				if len(f) != 3 || f[0][0] == '#' {
+					continue
+				}
+				label := string(f[0])
+				if name == "missing_ech" && strings.HasPrefix(label, "ECH_") || name == "wrong_application_only" && strings.Contains(label, "HANDSHAKE") || name == "ech_outer_unconfirmed" && (strings.HasPrefix(label, "ECH_") || strings.Contains(label, "HANDSHAKE")) {
+					continue
+				}
+				if (strings.HasPrefix(name, "wrong_application") || name == "ech_outer_unconfirmed") && strings.HasSuffix(label, "TRAFFIC_SECRET_0") || name == "wrong_handshake" && strings.Contains(label, "HANDSHAKE") || name == "wrong_ech" && label == "ECH_SECRET" {
+					f[2] = bytes.Repeat([]byte("00"), len(f[2])/2)
+				}
+				if name == "wrong_ech_random" && strings.HasPrefix(label, "ECH_") {
+					f[1] = bytes.Repeat([]byte("ff"), 32)
+				}
+				keys = append(keys, append(bytes.Join(f, []byte{' '}), '\n')...)
+			}
+			var mu sync.Mutex
+			var diagnostics []types.Diagnostic
+			packets, err := decryptTLSCapture(t, "test/testdata/d10_"+mode+".pcapng", keys, types.DecryptOptions{
+				RawChunks: true, KeyWaitTimeout: time.Second,
+				OnDiagnostic: func(d types.Diagnostic) { mu.Lock(); defer mu.Unlock(); diagnostics = append(diagnostics, d) },
+			})
+			if err == nil || len(packets) != 0 {
+				t.Fatalf("invalid secrets yielded packets=%d err=%v", len(packets), err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(diagnostics) == 0 {
+				t.Fatal("missing failure diagnostic")
+			}
+			if name == "ech_outer_unconfirmed" && !slices.ContainsFunc(diagnostics, func(d types.Diagnostic) bool { return d.Code == "ech_unknown" }) {
+				t.Fatal("unconfirmed outer keys overstated ECH status", diagnostics)
+			}
+		})
 	}
 }
