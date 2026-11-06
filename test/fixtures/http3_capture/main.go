@@ -19,6 +19,9 @@ import (
 	"strings"
 	"time"
 
+	"bytes"
+	"net/http/httptest"
+
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/qlog"
@@ -149,6 +152,8 @@ func main() {
 	}
 	var err error
 	switch os.Args[1] {
+	case "stream-fixture":
+		err = streamFixture(os.Args[2])
 	case "server":
 		err = serve(os.Args[2])
 	case "client":
@@ -163,4 +168,128 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+const fixtureLongSize = 17<<20 + 37
+
+// The peers share only net/http's handler contract. Capture their real TLS and
+// QUIC sockets separately. The generator has no dependency on the SDK.
+func streamFixture(mode string) error {
+	if mode != "sse" && mode != "long" {
+		return fmt.Errorf("stream-fixture needs sse or long")
+	}
+	keys, err := os.OpenFile(os.Getenv("SSLKEYLOGFILE"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer keys.Close()
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/events" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			for _, name := range []string{"one", "two", "three"} {
+				fmt.Fprintf(w, "data: %s\n\n", name)
+				w.(http.Flusher).Flush()
+				time.Sleep(20 * time.Millisecond)
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		buf := make([]byte, 32<<10)
+		for off := 0; off < fixtureLongSize; {
+			part := buf[:min(len(buf), fixtureLongSize-off)]
+			for i := range part {
+				part[i] = byte((off + i) % 251)
+			}
+			if _, err := w.Write(part); err != nil {
+				return
+			}
+			off += len(part)
+			// Leave enough time for lossless loopback capture on small VMs.
+			time.Sleep(time.Millisecond)
+		}
+	})
+	for version := 1; version <= 3; version++ {
+		var client *http.Client
+		var url string
+		var cleanup func()
+		if version < 3 {
+			srv := httptest.NewUnstartedServer(handler)
+			_ = srv.Listener.Close()
+			ln, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", 44434+version))
+			if err != nil {
+				return err
+			}
+			srv.Listener = ln
+			srv.EnableHTTP2 = version == 2
+			srv.StartTLS()
+			client = srv.Client()
+			client.Transport.(*http.Transport).TLSClientConfig.KeyLogWriter = keys
+			url = srv.URL
+			cleanup = srv.Close
+		} else {
+			cert, err := certificate()
+			if err != nil {
+				return err
+			}
+			conn, err := net.ListenPacket("udp4", "127.0.0.1:44433")
+			if err != nil {
+				return err
+			}
+			srv := &http3.Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}}, QUICConfig: quicConfig(), Handler: handler}
+			go func() { _ = srv.Serve(conn) }()
+			tr := &http3.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true, KeyLogWriter: keys}, QUICConfig: quicConfig()}
+			client = &http.Client{Transport: tr}
+			url = "https://127.0.0.1:44433"
+			cleanup = func() { _ = tr.Close(); _ = srv.Close(); _ = conn.Close() }
+		}
+		client.Timeout = 30 * time.Second
+		err := checkStreamPeer(client, url, version, mode)
+		cleanup()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkStreamPeer(client *http.Client, url string, version int, mode string) error {
+	res, err := client.Get(url + "/events")
+	if err != nil {
+		return err
+	}
+	data, err := io.ReadAll(res.Body)
+	_ = res.Body.Close()
+	if err != nil || res.ProtoMajor != version || !bytes.Equal(data, []byte("data: one\n\ndata: two\n\ndata: three\n\n")) {
+		return fmt.Errorf("HTTP/%d SSE mismatch", version)
+	}
+	if mode == "sse" {
+		return nil
+	}
+	res, err = client.Get(url + "/long")
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	buf := make([]byte, 32768)
+	offset := 0
+	for {
+		n, err := res.Body.Read(buf)
+		for i, v := range buf[:n] {
+			if v != byte((offset+i)%251) {
+				return fmt.Errorf("peer body mismatch at %d", offset+i)
+			}
+		}
+		offset += n
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if offset != fixtureLongSize || res.ProtoMajor != version {
+		return fmt.Errorf("HTTP/%d length %d", version, offset)
+	}
+	fmt.Printf("HTTP/%d verified %d bytes\n", version, offset)
+	return nil
 }

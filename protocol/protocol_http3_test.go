@@ -621,3 +621,74 @@ func TestHTTP3PushMetadataDoesNotExposeParserState(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestHTTP3EventLongSingleDATAAndReset(t *testing.T) {
+	ch := make(chan *types.DecryptedPacket, 8)
+	p := NewHTTP3StreamParser(types.ConnectionKey{Proto: "udp"}, ch)
+	p.EnableHTTPEvents(0)
+	http3Feed(t, p, 0, true, http3TestFrame(1, []byte{0, 0, 0xd4, 0xd7, 0xc1}), false)
+	const total = 17<<20 + 37
+	http3Feed(t, p, 0, false, append(http3TestFrame(1, []byte{0, 0, 0xd9}), append([]byte{0}, http3TestVarint(total)...)...), false)
+	<-ch
+	<-ch
+	block := make([]byte, 16384)
+	for pos := 0; pos < total; {
+		part := block[:min(len(block), total-pos)]
+		for i := range part {
+			part[i] = byte((pos + i) % 251)
+		}
+		http3Feed(t, p, 0, false, part, false)
+		if len(ch) != 1 {
+			t.Fatal("DATA delayed until end of frame")
+		}
+		got := <-ch
+		if got.Metadata["kind"] != "body_chunk" || got.Metadata["offset"] != uint64(pos) || !bytes.Equal(got.Data, part) {
+			t.Fatal(pos, got.Metadata)
+		}
+		pos += len(part)
+	}
+	http3Feed(t, p, 0, false, http3TestFrame(1, []byte{0, 0}), true)
+	if (<-ch).Metadata["kind"] != "trailers" || (<-ch).Metadata["offset"] != uint64(total) {
+		t.Fatal("missing trailers/end")
+	}
+	if err := p.ResetQUICStreamWithCode(0, true, 0x10c); err != nil {
+		t.Fatal(err)
+	}
+	rst := <-ch
+	if rst.Metadata["kind"] != "reset" || rst.Direction != "request" || rst.Metadata["error_code"] != uint64(0x10c) {
+		t.Fatal(rst.Metadata)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHTTP3EventsPartialAndPush(t *testing.T) {
+	out := make(chan *types.DecryptedPacket, 12)
+	p := NewHTTP3StreamParser(types.ConnectionKey{Proto: "udp"}, out)
+	p.EnableHTTPEvents(0)
+	http3Feed(t, p, 2, true, append(http3TestSettings(0, 0), http3TestFrame(13, []byte{0})...), false)
+	http3Feed(t, p, 15, false, append([]byte{1, 0}, append(http3TestFrame(1, []byte{0, 0, 0xd9}), http3TestFrame(0, []byte("asset"))...)...), true)
+	if len(out) != 0 {
+		t.Fatal("unassociated push emitted")
+	}
+	http3Feed(t, p, 4, false, http3TestFrame(5, []byte{0, 0, 0, 0xd1, 0xd7, 0xc1}), false)
+	if len(out) != 3 {
+		t.Fatalf("push events=%d", len(out))
+	}
+	header, body, end := <-out, <-out, <-out
+	if header.Metadata["parent_stream_id"] != uint64(4) || header.Metadata["push_id"] != uint64(0) || string(body.Data) != "asset" || end.Metadata["offset"] != uint64(5) {
+		t.Fatal(header.Metadata, body.Metadata, end.Metadata)
+	}
+	http3Feed(t, p, 4, false, append(http3TestFrame(1, []byte{0, 0, 0xd9}), 0, 4, 'a'), false)
+	if err := p.Close(); err == nil {
+		t.Fatal("truncation succeeded")
+	}
+	_ = p.Close()
+	<-out
+	<-out
+	partial := <-out
+	if partial.Metadata["kind"] != "partial" || partial.Metadata["offset"] != uint64(1) || len(out) != 0 {
+		t.Fatal(partial.Metadata)
+	}
+}

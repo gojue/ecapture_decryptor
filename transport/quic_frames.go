@@ -29,6 +29,7 @@ type quicStreamKey struct {
 }
 
 type quicStreamAssembler struct {
+	long         bool // raw or incremental STREAM, never handshake CRYPTO
 	next         uint64
 	pending      map[uint64][]byte
 	pendingBytes int
@@ -38,7 +39,11 @@ type quicStreamAssembler struct {
 }
 
 func (s *quicStreamAssembler) push(offset uint64, data []byte, fin bool) ([][]byte, bool, error) {
-	if offset > maxQUICStreamBytes || uint64(len(data)) > maxQUICStreamBytes-offset {
+	limit := uint64(maxQUICStreamBytes)
+	if s.long {
+		limit = (1 << 62) - 1
+	}
+	if offset > limit || uint64(len(data)) > limit-offset {
 		return nil, false, errQUICStreamLimit
 	}
 	if fin {
@@ -386,8 +391,27 @@ func (q *QUICDecryptor) feedQUICStream(id, offset uint64, data []byte, fin, isCl
 			q.reportQUICReassemblyError(errQUICStreamCountLimit)
 			return errQUICStreamCountLimit
 		}
-		stream = &quicStreamAssembler{}
+		stream = &quicStreamAssembler{long: q.options.RawChunks || q.options.HTTPEvents}
 		q.flow.streams[key] = stream
+	}
+	// A large cumulative offset is cheap. Charge only newly retained out-of-order
+	// bytes/segments, across both normal and rejected early stream spaces.
+	if offset > stream.next && !stream.finished && len(data) > len(stream.pending[offset]) {
+		added := len(data) - len(stream.pending[offset])
+		segments := 0
+		if _, ok := stream.pending[offset]; !ok {
+			segments++
+		}
+		for _, space := range []map[quicStreamKey]*quicStreamAssembler{q.flow.streams, q.flow.early.streams} {
+			for _, s := range space {
+				added += s.pendingBytes
+				segments += len(s.pending)
+			}
+		}
+		if added > maxQUICBufferedBytes || segments > maxQUICPendingSegments {
+			q.reportQUICReassemblyError(errQUICBufferLimit)
+			return errQUICBufferLimit
+		}
 	}
 	next := stream.next
 	parts, complete, err := stream.push(offset, data, fin)
@@ -634,11 +658,11 @@ func (q *QUICDecryptor) resetQUICStream(id, final, code uint64, client bool, at 
 			q.reportQUICReassemblyError(errQUICStreamCountLimit)
 			return errQUICStreamCountLimit
 		}
-		s = &quicStreamAssembler{}
+		s = &quicStreamAssembler{long: q.options.RawChunks || q.options.HTTPEvents}
 		q.flow.streams[key] = s
 	}
 	var err error
-	if final > maxQUICStreamBytes {
+	if final >= 1<<62 || !s.long && final > maxQUICStreamBytes {
 		err = errQUICStreamLimit
 	} else if final < s.next || s.hasFinal && s.final != final {
 		err = errors.New("invalid QUIC RESET_STREAM final offset")
@@ -661,7 +685,7 @@ func (q *QUICDecryptor) resetQUICStream(id, final, code uint64, client bool, at 
 	s.pending = nil
 	s.pendingBytes = 0
 	if q.http3Parser != nil {
-		if err := q.http3Parser.ResetQUICStream(id, client); err != nil {
+		if err := q.http3Parser.ResetQUICStreamWithCode(id, client, code); err != nil {
 			q.reportHTTP3Error(err)
 			return err
 		}
@@ -681,7 +705,7 @@ func (q *QUICDecryptor) resetQUICStream(id, final, code uint64, client bool, at 
 
 func (q *QUICDecryptor) reportHTTP3Error(err error) {
 	code := "parse_failed"
-	if errors.Is(err, protocol.ErrHTTP3ResourceLimit) {
+	if errors.Is(err, protocol.ErrHTTP3ResourceLimit) || errors.Is(err, protocol.ErrHTTPEventLimit) {
 		code = "resource_limit"
 	}
 	q.options.Report(q.connectionInfo, "protocol", code)

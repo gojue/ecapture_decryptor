@@ -46,6 +46,8 @@ SDK 只负责解密与协议解析，不强制输出格式。结果以 `Decrypte
 - 🔧 **多种使用方式**：Go 库、静态链接库（`.a`）、命令行工具
 - 🎯 **职责清晰**：只负责解密和协议解析，不强制输出格式
 
+Go 调用方可以用 `types.DecryptOptions{HTTPEvents: true}` 接收 HTTP/1、2、3 的 headers、正文片段、SSE、trailers 与 end/reset/partial 事件。正文按消息和方向独立维护 offset。增量 HTTP 和 raw QUIC 可以累计交付超过 16 MiB，乱序缓存仍受限。gzip 展开需显式设置每条消息的展开额度。[增量事件契约](docs/API.md#http-增量事件)
+
 ### QUIC / HTTP/3 输入要求
 
 解密 HTTP/3 需要包含客户端 Initial（其中有 ClientHello）的双向 UDP 抓包，以及匹配该连接的 TLS 1.3 SSLKEYLOG。密钥可作为外部文件传入，也可放在 pcapng 的 DSB 中。解析器按 QUIC 连接、包号和 STREAM 偏移重组数据，再按 HTTP/3 请求流输出 `http/3` 的 `DecryptedPacket`。

@@ -165,6 +165,7 @@ type HTTP3StreamParser struct {
 	quicUni     map[uint64]*http3UniStream
 	quicState   [2]http3Direction
 	quicPush    map[uint64]*http3Push
+	events      *eventOutput
 	quicErr     error
 	quicClosed  bool
 

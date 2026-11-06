@@ -190,6 +190,9 @@ func (q *QUICDecryptor) SetOptions(options types.DecryptOptions) {
 	q.http3Parser = nil
 	if !options.RawChunks && q.packetChan != nil {
 		q.http3Parser = protocol.NewHTTP3StreamParser(q.connectionInfo, q.packetChan)
+		if options.HTTPEvents {
+			q.http3Parser.EnableHTTPEvents(options.MaxDecodedBodyBytes)
+		}
 	}
 }
 
@@ -222,6 +225,9 @@ func (q *QUICDecryptor) Decrypt() (result error) {
 		result = errors.Join(result, q.inputErr)
 		q.mu.Unlock()
 		q.flow = newQUICFlowState()
+		if q.http3Parser != nil && q.options.HTTPEvents {
+			q.http3Parser.AbortHTTPEvents()
+		}
 		q.http3Parser = nil
 		q.clientInitialKeys, q.serverInitialKeys = nil, nil
 		q.destConnID = nil

@@ -25,6 +25,8 @@ var errHTTP3Message = errors.New("invalid HTTP/3 message or stream state")
 
 type http3QUICStream struct{ request, response http3QUICMessage }
 type http3QUICMessage struct {
+	event                                                       *eventBody
+	dataLeft                                                    uint64
 	buffer, body                                                bytes.Buffer
 	headers, trailers                                           http.Header
 	method, path, scheme, authority, status                     string
@@ -74,6 +76,17 @@ func http3Side(client bool) int {
 	return 1
 }
 
+func (p *HTTP3StreamParser) EnableHTTPEvents(limit int64) {
+	p.events = newEventOutput(p.addr, p.packetChan, limit)
+}
+
+// AbortHTTPEvents joins active content decoders when a QUIC worker exits early.
+func (p *HTTP3StreamParser) AbortHTTPEvents() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.events.abort()
+}
+
 // FeedQUICStream accepts contiguous, authenticated bytes. QPACK tables belong to
 // the connection and sender, not to an individual request. Output remains serial
 // and applies backpressure; a blocked field section never blocks input handling.
@@ -86,7 +99,18 @@ func (p *HTTP3StreamParser) FeedQUICStream(id uint64, isClient bool, data []byte
 	if p.quicClosed {
 		return io.ErrClosedPipe
 	}
-	err := p.feedHTTP3(id, isClient, data, fin, at)
+	var err error
+	// Bound individual input fragments as well as the retained blocked buffers.
+	for p.events != nil && len(data) > eventChunkSize && err == nil {
+		err = p.feedHTTP3(id, isClient, data[:eventChunkSize], false, at)
+		data = data[eventChunkSize:]
+		if err == nil {
+			err = p.checkHTTP3Bounds()
+		}
+	}
+	if err == nil {
+		err = p.feedHTTP3(id, isClient, data, fin, at)
+	}
 	if err == nil {
 		err = p.checkHTTP3Bounds()
 	}
@@ -148,6 +172,9 @@ func (p *HTTP3StreamParser) feedHTTP3Message(id uint64, client bool, m *http3QUI
 	if m.buffer.Len()+m.body.Len()+len(data) > maxHTTP3StreamBytes {
 		return ErrHTTP3ResourceLimit
 	}
+	if m.event != nil {
+		m.event.at = at
+	}
 	_, _ = m.buffer.Write(data)
 	m.fin = m.fin || fin
 	err := p.parseHTTP3Message(id, client, m)
@@ -170,7 +197,23 @@ func (p *HTTP3StreamParser) parseHTTP3Message(id uint64, client bool, m *http3QU
 			m.buffer = bytes.Buffer{}
 		}
 	}()
+	if err := p.startHTTP3Events(id, client, m); err != nil {
+		return err
+	}
 	for m.buffer.Len() > 0 {
+		if m.dataLeft > 0 {
+			n := min(uint64(m.buffer.Len()), m.dataLeft)
+			part := m.buffer.Next(int(n))
+			m.dataLeft -= n
+			if m.event != nil {
+				if err := m.event.write(part); err != nil {
+					return err
+				}
+			} else {
+				m.body.Write(part)
+			}
+			continue
+		}
 		if m.skip > 0 {
 			n := min(m.skip, uint64(m.buffer.Len()))
 			m.buffer.Next(int(n))
@@ -194,6 +237,14 @@ func (p *HTTP3StreamParser) parseHTTP3Message(id uint64, client bool, m *http3QU
 		default:
 			m.buffer.Next(header)
 			m.skip = length
+			continue
+		}
+		if typ == HTTP3FrameData && p.events != nil {
+			if !m.headersDone || m.trailersDone {
+				return errHTTP3Message
+			}
+			m.buffer.Next(header)
+			m.dataLeft = length
 			continue
 		}
 		limit := uint64(maxHTTP3FieldBytes + 8)
@@ -254,7 +305,7 @@ func (p *HTTP3StreamParser) parseHTTP3Message(id uint64, client bool, m *http3QU
 		m.buffer.Next(header + int(length))
 	}
 	if m.fin && !m.finished {
-		if m.buffer.Len() != 0 || m.skip != 0 || !m.headersDone {
+		if m.buffer.Len() != 0 || m.skip != 0 || m.dataLeft != 0 || !m.headersDone {
 			return errHTTP3Message
 		}
 		if id&2 != 0 {
@@ -264,7 +315,13 @@ func (p *HTTP3StreamParser) parseHTTP3Message(id uint64, client bool, m *http3QU
 			}
 		}
 		m.finished = true
-		p.emitHTTP3(id, client, m, "")
+		if m.event != nil {
+			if err := m.event.finish("end", nil); err != nil {
+				return err
+			}
+		} else {
+			p.emitHTTP3(id, client, m, "")
+		}
 		m.body = bytes.Buffer{}
 		m.buffer = bytes.Buffer{}
 		m.headers = nil
@@ -381,6 +438,9 @@ func (p *HTTP3StreamParser) applyHTTP3Headers(id uint64, client bool, m *http3QU
 	if m.headersDone {
 		m.trailers = h.headers
 		m.trailersDone = true
+		if m.event != nil {
+			return m.event.trailers(h.headers)
+		}
 		return nil
 	}
 	h.at = m.at
@@ -405,7 +465,57 @@ func (p *HTTP3StreamParser) applyHTTP3Headers(id uint64, client bool, m *http3QU
 	m.authority = h.authority
 	m.status = h.status
 	m.headersDone = true
+	return p.startHTTP3Events(id, client, m)
+}
+
+func (p *HTTP3StreamParser) startHTTP3Events(id uint64, client bool, m *http3QUICMessage) error {
+	if p.events == nil || m.event != nil || m.finished || !m.headersDone {
+		return nil
+	}
+	if id&2 != 0 {
+		push := p.quicPush[p.quicUni[id].pushID]
+		if !push.promised || !p.quicState[0].hasMaxPush {
+			return nil
+		}
+	}
+	body, err := p.events.headers("http/3", id, client, m.at, m.headers, p.http3Metadata(id, client, m), false)
+	if err != nil {
+		return err
+	}
+	m.event = body
+	// Push DATA can precede its promise; only that unassociated prefix is buffered.
+	if m.body.Len() > 0 {
+		if err := body.write(m.body.Bytes()); err != nil {
+			return err
+		}
+		m.body = bytes.Buffer{}
+	}
+	if m.trailersDone {
+		return body.trailers(m.trailers)
+	}
 	return nil
+}
+
+func (p *HTTP3StreamParser) http3Metadata(id uint64, client bool, m *http3QUICMessage) map[string]any {
+	if client {
+		return map[string]any{"method": m.method, "path": m.path, "scheme": m.scheme, "authority": m.authority}
+	}
+	status, _ := strconv.Atoi(m.status)
+	meta := map[string]any{"status": status}
+	if id&2 == 0 {
+		meta["authority"] = p.quicStreams[id].request.authority
+	} else {
+		pushID := p.quicUni[id].pushID
+		push := p.quicPush[pushID]
+		meta["push_id"] = pushID
+		meta["parent_stream_id"] = push.parent
+		meta["method"] = push.request.method
+		meta["path"] = push.request.path
+		meta["scheme"] = push.request.scheme
+		meta["authority"] = push.request.authority
+		meta["promise_headers"] = push.request.headers.Clone()
+	}
+	return meta
 }
 
 func (p *HTTP3StreamParser) feedHTTP3Uni(id uint64, client bool, data []byte, fin bool, at time.Time) error {
@@ -670,6 +780,7 @@ func (p *HTTP3StreamParser) parseHTTP3Control(u *http3UniStream, client bool) er
 				if err != nil {
 					return err
 				}
+				_ = push.response.event.finish("reset", nil)
 				push.canceled = true
 				push.informational = nil
 				if push.streamKnown {
@@ -875,6 +986,14 @@ func (p *HTTP3StreamParser) PendingSince() time.Time {
 // ResetQUICStream discards an incomplete direction without fabricating a final
 // HTTP message. Critical streams cannot be reset. Completed messages stay final.
 func (p *HTTP3StreamParser) ResetQUICStream(id uint64, client bool) error {
+	return p.resetStream(id, client, nil)
+}
+
+// ResetQUICStreamWithCode preserves the authenticated application error code.
+func (p *HTTP3StreamParser) ResetQUICStreamWithCode(id uint64, client bool, code uint64) error {
+	return p.resetStream(id, client, map[string]any{"error_code": code})
+}
+func (p *HTTP3StreamParser) resetStream(id uint64, client bool, meta map[string]any) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.quicErr != nil {
@@ -891,6 +1010,7 @@ func (p *HTTP3StreamParser) ResetQUICStream(id uint64, client bool) error {
 			u.buffer = bytes.Buffer{}
 			if u.pushKnown {
 				push := p.quicPush[u.pushID]
+				_ = push.response.event.finish("reset", meta)
 				push.canceled = true
 				push.informational = nil
 				if push.streamKnown {
@@ -906,6 +1026,7 @@ func (p *HTTP3StreamParser) ResetQUICStream(id uint64, client bool) error {
 			if !client {
 				m = &s.response
 			}
+			_ = m.event.finish("reset", meta)
 			*m = http3QUICMessage{finished: true}
 		}
 	}
@@ -931,6 +1052,7 @@ func (p *HTTP3StreamParser) closeHTTP3() error {
 		return p.quicErr
 	}
 	p.quicClosed = true
+	defer p.events.abort()
 	incomplete := false
 	for _, s := range p.quicStreams {
 		for _, m := range []*http3QUICMessage{&s.request, &s.response} {
@@ -968,6 +1090,11 @@ func (p *HTTP3StreamParser) emitHTTP3(id uint64, client bool, m *http3QUICMessag
 	if p.packetChan == nil {
 		return
 	}
+	if p.events != nil {
+		// Only informational sections pass through here in event mode.
+		_, _ = p.events.headers("http/3", id, client, m.at, m.headers, p.http3Metadata(id, client, m), true)
+		return
+	}
 	var text bytes.Buffer
 	direction := "response"
 	if client {
@@ -988,27 +1115,14 @@ func (p *HTTP3StreamParser) emitHTTP3(id uint64, client bool, m *http3QUICMessag
 	if len(m.trailers) > 0 {
 		packet.WithMetadata("trailers", m.trailers)
 	}
+	if kind == "" && id&2 != 0 {
+		kind = "push_response"
+	}
 	if kind != "" {
 		packet.WithMetadata("kind", kind)
 	}
-	if client {
-		packet.WithMetadata("method", m.method).WithMetadata("path", m.path).WithMetadata("scheme", m.scheme).WithMetadata("authority", m.authority)
-	} else {
-		status, _ := strconv.Atoi(m.status)
-		packet.WithMetadata("status", status)
-		if id&2 == 0 {
-			packet.WithMetadata("authority", p.quicStreams[id].request.authority)
-		} else {
-			pushID := p.quicUni[id].pushID
-			push := p.quicPush[pushID]
-			if kind == "" {
-				packet.WithMetadata("kind", "push_response")
-			}
-			packet.WithMetadata("push_id", pushID).WithMetadata("parent_stream_id", push.parent).
-				WithMetadata("method", push.request.method).WithMetadata("path", push.request.path).
-				WithMetadata("scheme", push.request.scheme).WithMetadata("authority", push.request.authority).
-				WithMetadata("promise_headers", push.request.headers.Clone())
-		}
+	for k, v := range p.http3Metadata(id, client, m) {
+		packet.WithMetadata(k, v)
 	}
 	p.packetChan <- packet
 }

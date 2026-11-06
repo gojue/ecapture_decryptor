@@ -117,10 +117,13 @@ type quicLiveStream struct {
 }
 
 func newQUICLiveStream(t *testing.T, raw bool) *quicLiveStream {
+	return newLiveStreamWithOptions(t, types.DecryptOptions{RawChunks: raw})
+}
+func newLiveStreamWithOptions(t *testing.T, options types.DecryptOptions) *quicLiveStream {
 	t.Helper()
 	reader, writer := io.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
-	stream := &quicLiveStream{writer: writer, cancel: cancel, done: make(chan error, 1), raw: raw}
+	stream := &quicLiveStream{writer: writer, cancel: cancel, done: make(chan error, 1), raw: options.RawChunks}
 	t.Cleanup(func() {
 		cancel()
 		_ = writer.Close()
@@ -129,7 +132,7 @@ func newQUICLiveStream(t *testing.T, raw bool) *quicLiveStream {
 		stream.done <- DecryptPcapngStreamWithOptions(ctx, reader, func(packet *types.DecryptedPacket) error {
 			stream.packets = append(stream.packets, packet)
 			return nil
-		}, types.DecryptOptions{RawChunks: raw})
+		}, options)
 	}()
 	return stream
 }
