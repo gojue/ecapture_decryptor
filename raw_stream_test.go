@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -1675,5 +1677,254 @@ func TestD11DatagramCallbackFailure(t *testing.T) {
 				})
 			})
 		}
+	}
+}
+
+func TestHTTP3DynamicEventCaptureAPIs(t *testing.T) {
+	type message struct {
+		Headers       map[string]any
+		Informational []map[string]any
+		Body          []byte
+		Trailers      http.Header
+		Terminal      string
+	}
+	// Normalize only body chunk boundaries: event order, headers, offsets and
+	// terminal states are checked before comparing file and streaming semantics.
+	check := func(t *testing.T, packets []*types.DecryptedPacket) map[string]message {
+		t.Helper()
+		byConnection := make(map[string]map[string]*message)
+		for _, p := range packets {
+			if p.Protocol != "http/3" || p.Transport != "udp" || (p.Direction != "request" && p.Direction != "response") {
+				t.Fatal("unexpected event identity", p.Protocol, p.Direction)
+			}
+			id, ok := p.Metadata["stream_id"].(uint64)
+			if !ok {
+				t.Fatal("missing stream ID")
+			}
+			conn := p.ConnectionID()
+			if byConnection[conn] == nil {
+				byConnection[conn] = make(map[string]*message)
+			}
+			key := fmt.Sprintf("%d/%s", id, p.Direction)
+			m := byConnection[conn][key]
+			if m == nil {
+				m = &message{}
+				byConnection[conn][key] = m
+			}
+			if m.Terminal != "" {
+				t.Fatal("event after terminal", key, p.Metadata)
+			}
+			if p.Metadata["offset"] != uint64(len(m.Body)) {
+				t.Fatal("noncontiguous event body offset", key, p.Metadata)
+			}
+			kind := p.Metadata["kind"]
+			if kind != "body_chunk" && len(p.Data) != 0 {
+				t.Fatal("non-body event contains data", kind)
+			}
+			switch kind {
+			case "headers":
+				if m.Headers != nil {
+					t.Fatal("headers after final headers", key)
+				}
+				h, ok := p.Metadata["headers"].(http.Header)
+				if !ok {
+					t.Fatal("missing headers")
+				}
+				metadata := p.Metadata
+				if p.Direction == "response" && id&2 == 0 {
+					// Ordinary response authority is optional request context, not
+					// a response pseudo-header. Server keys may arrive first.
+					if a := metadata["authority"]; a != nil && a != "" && a != "localhost" {
+						t.Fatal("response authority crossed connections", a)
+					}
+					metadata = maps.Clone(metadata)
+					delete(metadata, "authority")
+				}
+				if p.Metadata["informational"] == true {
+					if p.Direction != "response" || (id != 4 && id != 8) || p.Metadata["status"] != 103 || h.Get("Link") != "</asset>; rel=preload" || len(m.Informational) != 0 {
+						t.Fatal("incorrect/duplicate informational section", p.Metadata)
+					}
+					m.Informational = append(m.Informational, metadata)
+				} else {
+					m.Headers = metadata
+				}
+			case "body_chunk":
+				if m.Headers == nil || m.Trailers != nil || len(p.Data) == 0 {
+					t.Fatal("body outside header/trailer boundary", key)
+				}
+				m.Body = append(m.Body, p.Data...)
+			case "trailers":
+				if m.Headers == nil || m.Trailers != nil {
+					t.Fatal("trailers outside message", key)
+				}
+				h, ok := p.Metadata["trailers"].(http.Header)
+				if !ok {
+					t.Fatal("missing trailer fields")
+				}
+				m.Trailers = h
+			case "end", "reset":
+				if m.Headers == nil {
+					t.Fatal("terminal event before final headers", key)
+				}
+				if kind == "reset" && (id != 12 || p.Direction != "response" || p.Metadata["error_code"] != uint64(0x10c)) {
+					t.Fatal("incorrect reset", p.Metadata)
+				}
+				if kind == "end" && p.Metadata["error_code"] != nil {
+					t.Fatal("normal end has reset code")
+				}
+				m.Terminal = kind.(string)
+			default:
+				t.Fatal("unexpected HTTPEvents kind", p.Metadata)
+			}
+		}
+		if len(byConnection) != 2 {
+			t.Fatalf("connections=%d, want 2", len(byConnection))
+		}
+		result := make(map[string]message)
+		labels := make(map[string]bool)
+		for _, messages := range byConnection {
+			if len(messages) != 9 {
+				t.Fatalf("message directions=%d, want 9", len(messages))
+			}
+			request := messages["0/request"]
+			if request == nil || request.Headers == nil {
+				t.Fatal("missing warmup request")
+			}
+			path, _ := request.Headers["path"].(string)
+			parts := strings.Split(path, "/")
+			if len(parts) != 3 {
+				t.Fatal("invalid fixture path", path)
+			}
+			label := parts[1]
+			if (label != "alpha" && label != "beta") || labels[label] {
+				t.Fatal("connection labels crossed or duplicated", label)
+			}
+			labels[label] = true
+			for _, id := range []uint64{0, 4, 8, 12, 15} {
+				for _, direction := range []string{"request", "response"} {
+					if id == 15 && direction == "request" {
+						continue
+					}
+					key := fmt.Sprintf("%d/%s", id, direction)
+					m := messages[key]
+					if m == nil || m.Headers == nil {
+						t.Fatal("missing message", label, key)
+					}
+					h := m.Headers["headers"].(http.Header)
+					suffix := map[uint64]string{0: "warmup", 4: "one", 8: "two", 12: "reset", 15: "asset"}[id]
+					wantBody, wantEnd := "", "end"
+					if direction == "request" {
+						if m.Headers["method"] != "GET" || m.Headers["scheme"] != "https" || m.Headers["authority"] != "localhost" || m.Headers["path"] != "/"+label+"/"+suffix || h.Get("X-Fixture-Token") != strings.Repeat(label, 16) || m.Trailers != nil || len(m.Informational) != 0 {
+							t.Fatal("request fields crossed streams/connections", label, key, m.Headers)
+						}
+					} else {
+						if m.Headers["status"] != 200 {
+							t.Fatal("missing final status", key, m.Headers)
+						}
+						switch id {
+						case 12:
+							wantBody, wantEnd = "discarded partial response", "reset"
+							if m.Trailers != nil || len(m.Informational) != 0 {
+								t.Fatal("reset produced trailers/informational")
+							}
+						case 15:
+							wantBody = "asset " + label
+							promise, ok := m.Headers["promise_headers"].(http.Header)
+							if !ok || promise == nil || h.Get("Content-Length") != fmt.Sprint(len(wantBody)) || m.Headers["push_id"] != uint64(0) || m.Headers["parent_stream_id"] != uint64(4) || m.Headers["method"] != "GET" || m.Headers["scheme"] != "https" || m.Headers["authority"] != "localhost" || m.Headers["path"] != "/"+label+"/asset" || m.Trailers != nil || len(m.Informational) != 0 {
+								t.Fatal("push association", m.Headers)
+							}
+						default:
+							wantBody = "reply /" + label + "/" + suffix
+							wantInfo := 0
+							if id != 0 {
+								wantInfo = 1
+							}
+							if h.Get("X-Fixture-Token") != strings.Repeat(label, 16) || h.Get("Content-Length") != fmt.Sprint(len(wantBody)) || h.Get("X-Finished") != "" || len(m.Trailers) != 1 || m.Trailers.Get("X-Finished") != label || len(m.Informational) != wantInfo {
+								t.Fatal("response headers/trailers/103", label, key, m.Headers, m.Trailers)
+							}
+						}
+					}
+					if string(m.Body) != wantBody || m.Terminal != wantEnd {
+						t.Fatalf("%s/%s body=%q terminal=%q, want %q/%q", label, key, m.Body, m.Terminal, wantBody, wantEnd)
+					}
+					result[label+"/"+key] = *m
+				}
+			}
+		}
+		return result
+	}
+	for _, tc := range []struct{ name, base string }{{"v1", "http3_dynamic_aioquic"}, {"v2", "http3_dynamic_aioquic_v2"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := "test/testdata/" + tc.base
+			capture, clientKeys, serverKeys := quicDSBBlocks(t, base+".pcapng", base+".keys")
+			keylog, err := os.ReadFile(base + ".keys")
+			if err != nil {
+				t.Fatal(err)
+			}
+			options := types.DecryptOptions{HTTPEvents: true}
+			var reference map[string]message
+			for _, mode := range []string{"file", "late_client_first", "late_server_first"} {
+				t.Run(mode, func(t *testing.T) {
+					var packets []*types.DecryptedPacket
+					if mode == "file" {
+						var err error
+						packets, err = decryptTLSCapture(t, base+".pcapng", keylog, options)
+						if err != nil {
+							t.Fatal(err)
+						}
+					} else {
+						synctest.Test(t, func(t *testing.T) {
+							stream := newLiveStreamWithOptions(t, options)
+							stream.write(t, capture)
+							synctest.Wait()
+							if len(stream.packets) != 0 {
+								t.Fatal("events before secrets")
+							}
+							first, second := clientKeys, serverKeys
+							if mode == "late_server_first" {
+								first, second = second, first
+							}
+							stream.write(t, first)
+							synctest.Wait()
+							stream.assertOpen(t)
+							stream.write(t, second)
+							synctest.Wait()
+							stream.assertOpen(t)
+							// All decoded dynamic sections, push and reset must arrive while input
+							// remains open, even though the keys followed every captured packet.
+							check(t, stream.packets)
+							before := len(stream.packets)
+							stream.write(t, first)
+							stream.write(t, second)
+							synctest.Wait()
+							if len(stream.packets) != before {
+								t.Fatal("duplicate DSB repeated an event")
+							}
+							if err := stream.writer.Close(); err != nil {
+								t.Fatal(err)
+							}
+							synctest.Wait()
+							if err := <-stream.done; err != nil {
+								t.Fatal(err)
+							}
+							if len(stream.packets) != before {
+								t.Fatal("complete events delayed until EOF")
+							}
+							packets = stream.packets
+						})
+					}
+					got := check(t, packets)
+					if reference == nil {
+						reference = got
+					} else if !reflect.DeepEqual(reference, got) {
+						for key, value := range got {
+							if !reflect.DeepEqual(reference[key], value) {
+								t.Errorf("dynamic HTTPEvents semantics for %s: file=%+v late=%+v", key, reference[key], value)
+							}
+						}
+					}
+				})
+			}
+		})
 	}
 }

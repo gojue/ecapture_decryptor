@@ -229,7 +229,15 @@ func (q *QUICDecryptor) parseQUICFrames(plaintext []byte, level int, isClient bo
 				}
 			}
 			if level == quicLevelApplication && (q.http3Parser != nil || q.doqParser != nil || q.options.RawChunks && q.packetChan != nil) {
-				if err := q.feedQUICStream(id, offset, part, frameType&1 != 0, isClient, at); err != nil {
+				// Preserve order with queued RESETs and keep 1-RTT bytes from
+				// being released by an early prefix with 0-RTT metadata.
+				waitEarly := isClient && (q.flow.early.seen && q.flow.early.status == "" || q.flow.pendingLevels[0][quicLevelEarly] || q.flow.retryingEarly)
+				if waitEarly {
+					err = q.queueQUICEarly(quicEarlyFrame{id: id, offset: offset, data: part, fin: frameType&1 != 0, application: true, at: at})
+				} else {
+					err = q.feedQUICStream(id, offset, part, frameType&1 != 0, isClient, at)
+				}
+				if err != nil {
 					reported = true
 					return err
 				}
@@ -256,7 +264,15 @@ func (q *QUICDecryptor) parseQUICFrames(plaintext []byte, level int, isClient bo
 					return err
 				}
 			} else if level == quicLevelApplication {
-				if err := q.resetQUICStream(id, final, code, isClient, at); err != nil {
+				// A reset must not tombstone the stream before captured 0-RTT
+				// bytes have been authenticated and their acceptance resolved.
+				waitEarly := isClient && (q.flow.early.seen && q.flow.early.status == "" || q.flow.pendingLevels[0][quicLevelEarly] || q.flow.retryingEarly)
+				if waitEarly {
+					err = q.queueQUICEarly(quicEarlyFrame{id: id, offset: final, reset: true, application: true, errorCode: code, at: at})
+				} else {
+					err = q.resetQUICStream(id, final, code, isClient, at)
+				}
+				if err != nil {
 					reported = true
 					return err
 				}
@@ -633,31 +649,40 @@ func (q *QUICDecryptor) flushQUICEarly() error {
 	early := &q.flow.early
 	frames := early.frames
 	early.frames, early.bytes, early.since = nil, 0, time.Time{}
-	if !q.options.RawChunks && early.status != "accepted" {
-		return nil
-	}
-	if q.doqParser != nil && len(frames) != 0 {
-		err := errors.New("DoQ early data is not supported")
-		q.reportHTTP3Error(err)
-		return err
-	}
 	// Rejected / unconfirmed raw bytes use a separate offset space. Accepted
 	// data shares the normal assembler, suppressing duplicate 1-RTT delivery.
-	if early.status != "accepted" {
+	swapped := q.options.RawChunks && early.status != "accepted"
+	if swapped {
 		if early.streams == nil {
 			early.streams = make(map[quicStreamKey]*quicStreamAssembler)
 		}
 		q.flow.streams, early.streams = early.streams, q.flow.streams
-		defer func() { q.flow.streams, early.streams = early.streams, q.flow.streams }()
 	}
-	defer func() { early.emitting = false }()
+	defer func() {
+		if swapped {
+			q.flow.streams, early.streams = early.streams, q.flow.streams
+		}
+		early.emitting = false
+	}()
 	// A late early secret can authenticate 0-RTT after 1-RTT was queued. Deliver
-	// the early phase first without sorting or reassembling DATAGRAM messages.
+	// the early phase first, then restore the application stream space.
 	for _, application := range []bool{false, true} {
+		if application && swapped {
+			q.flow.streams, early.streams = early.streams, q.flow.streams
+			swapped = false
+		}
+		if !application && !q.options.RawChunks && early.status != "accepted" {
+			continue
+		}
 		early.emitting = !application
 		for _, frame := range frames {
 			if frame.application != application {
 				continue
+			}
+			if !application && q.doqParser != nil {
+				err := errors.New("DoQ early data is not supported")
+				q.reportHTTP3Error(err)
+				return err
 			}
 			var err error
 			if frame.datagram {

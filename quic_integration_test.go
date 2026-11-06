@@ -490,7 +490,13 @@ func TestQUICLifecycleCaptureAPIs(t *testing.T) {
 }
 
 func TestHTTP3DynamicCaptureAPIs(t *testing.T) {
-	const base = "test/testdata/http3_dynamic_aioquic"
+	for _, name := range []string{"http3_dynamic_aioquic", "http3_dynamic_aioquic_v2"} {
+		t.Run(name, func(t *testing.T) { checkHTTP3DynamicCaptureAPIs(t, "test/testdata/"+name) })
+	}
+}
+
+func checkHTTP3DynamicCaptureAPIs(t *testing.T, base string) {
+	t.Helper()
 	capture, clientKeys, serverKeys := quicDSBBlocks(t, base+".pcapng", base+".keys")
 	keylog, err := os.ReadFile(base + ".keys")
 	if err != nil {
@@ -683,6 +689,264 @@ func TestHTTP3DynamicCaptureAPIs(t *testing.T) {
 					t.Fatal("field semantics/body/stream/direction differ across APIs or raw reconstruction")
 				}
 			})
+		}
+	}
+}
+
+// The independent peer sends a partial POST and a 0-RTT RESET, then completes
+// a separate request. Rejected early RESETs are retransmitted at 1-RTT without
+// the POST prefix; these two reset spaces must remain independent.
+func TestQUICEarlyResetCaptureAPIs(t *testing.T) {
+	const base = "test/testdata/http3_early_reset_aioquic"
+	capture, clientKeys, serverKeys := quicDSBBlocks(t, base+".pcapng", base+".keys")
+	keys, err := os.ReadFile(base + ".keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var early, handshake, application []byte
+	for _, line := range bytes.Split(keys, []byte("\n")) {
+		fields := bytes.Fields(line)
+		if len(fields) != 3 || fields[0][0] == '#' {
+			continue
+		}
+		switch string(fields[0]) {
+		case "CLIENT_EARLY_TRAFFIC_SECRET":
+			early = append(early, append(bytes.Clone(line), '\n')...)
+		case "CLIENT_HANDSHAKE_TRAFFIC_SECRET", "SERVER_HANDSHAKE_TRAFFIC_SECRET":
+			handshake = append(handshake, append(bytes.Clone(line), '\n')...)
+		default:
+			application = append(application, append(bytes.Clone(line), '\n')...)
+		}
+	}
+	for _, mode := range []string{"messages", "raw", "events"} {
+		options := types.DecryptOptions{RawChunks: mode == "raw", HTTPEvents: mode == "events"}
+		for _, input := range []string{"external", "late_client_first", "late_server_first", "late_early", "late_handshake"} {
+			t.Run(mode+"/"+input, func(t *testing.T) {
+				if input == "external" {
+					packets, err := decryptTLSCapture(t, base+".pcapng", keys, options)
+					if err != nil {
+						t.Fatal(err)
+					}
+					checkQUICEarlyResetCapture(t, packets, options)
+					return
+				}
+				synctest.Test(t, func(t *testing.T) {
+					stream := newLiveStreamWithOptions(t, options)
+					stream.write(t, capture)
+					synctest.Wait()
+					if len(stream.packets) != 0 {
+						t.Fatal("output before secrets")
+					}
+					groups := [][]byte{clientKeys, serverKeys}
+					switch input {
+					case "late_server_first":
+						groups = [][]byte{serverKeys, clientKeys}
+					case "late_early":
+						groups = [][]byte{tlsFixtureDSB(t, append(bytes.Clone(application), handshake...)), tlsFixtureDSB(t, early)}
+					case "late_handshake":
+						groups = [][]byte{tlsFixtureDSB(t, append(bytes.Clone(application), early...)), tlsFixtureDSB(t, handshake)}
+					}
+					for _, group := range groups {
+						stream.write(t, group)
+						synctest.Wait()
+						stream.assertOpen(t)
+					}
+					checkQUICEarlyResetCapture(t, stream.packets, options)
+					count := len(stream.packets)
+					stream.write(t, tlsFixtureDSB(t, keys))
+					synctest.Wait()
+					if len(stream.packets) != count {
+						t.Fatal("duplicate DSB repeated output")
+					}
+					if err := stream.writer.Close(); err != nil {
+						t.Fatal(err)
+					}
+					synctest.Wait()
+					if err := <-stream.done; err != nil {
+						t.Fatal(err)
+					}
+					if len(stream.packets) != count {
+						t.Fatal("output delayed until EOF")
+					}
+				})
+			})
+		}
+	}
+}
+
+func checkQUICEarlyResetCapture(t *testing.T, packets []*types.DecryptedPacket, options types.DecryptOptions) {
+	t.Helper()
+	// Fixed wire prefix from the independent endpoint, including binary body.
+	const prefix = "\x01\x1b\x00\x00\xd4\xd7\x50\x86\xa0\xe4\x1d\x13\x9d\x09\x51\x89\x60\xa3\xb2\x8f\x4c\x58\x54\x15\x3f\x54\x02\x36\x34\x00\x09partial\x00\xff"
+	byConnection := make(map[string][]*types.DecryptedPacket)
+	for _, p := range packets {
+		if p.Transport != types.TransportProtocolUDP {
+			t.Fatal("non-UDP output")
+		}
+		byConnection[p.ConnectionID()] = append(byConnection[p.ConnectionID()], p)
+	}
+	if len(byConnection) != 6 {
+		t.Fatalf("connections=%d, want 6", len(byConnection))
+	}
+	paths := make(map[string]bool)
+	for conn, output := range byConnection {
+		var earlyStatus string
+		if options.RawChunks {
+			ch := make(chan *types.DecryptedPacket, 16)
+			parser := protocol.NewHTTP3StreamParser(types.ConnectionKey{}, ch)
+			data := make(map[string][]byte)
+			ended := make(map[string]bool)
+			var earlyPrefix []byte
+			earlyResets, applicationResets := 0, 0
+			for _, p := range output {
+				id := p.Metadata["stream_id"].(uint64)
+				level, _ := p.Metadata["encryption_level"].(string)
+				status, _ := p.Metadata["early_data"].(string)
+				space := ""
+				if level == "0rtt" {
+					if status != "accepted" && status != "rejected" || earlyStatus != "" && earlyStatus != status {
+						t.Fatal("early status", p.Metadata)
+					}
+					earlyStatus = status
+					if status == "rejected" {
+						space = "early"
+					}
+				}
+				key := fmt.Sprintf("%d/%s/%s", id, p.Direction, space)
+				if p.Protocol != "quic" || ended[key] {
+					t.Fatal("invalid or repeated stream output", conn, p.Metadata)
+				}
+				reset := p.Metadata["kind"] == "stream_reset"
+				if reset {
+					if id != 0 || p.Direction != "request" || p.Metadata["offset"] != uint64(40) || p.Metadata["error_code"] != uint64(0x10c) || len(p.Data) != 0 || p.Metadata["end"] != true {
+						t.Fatal("reset", p.Metadata)
+					}
+					if level == "0rtt" {
+						earlyResets++
+						if string(earlyPrefix) != prefix {
+							t.Fatalf("early prefix lost before reset: %x", earlyPrefix)
+						}
+					} else if level == "1rtt" && earlyStatus == "rejected" && earlyResets == 1 {
+						applicationResets++
+					} else {
+						t.Fatal("application reset preceded early resolution", p.Metadata)
+					}
+				} else {
+					if p.Metadata["kind"] != "stream_chunk" || p.Metadata["offset"] != uint64(len(data[key])) {
+						t.Fatal("raw offsets", p.Metadata)
+					}
+					data[key] = append(data[key], p.Data...)
+					if level == "0rtt" && id == 0 {
+						earlyPrefix = append(earlyPrefix, p.Data...)
+					}
+				}
+				ended[key] = p.Metadata["end"] == true
+				if space == "early" {
+					continue // Rejected bytes cannot become accepted HTTP messages.
+				}
+				var err error
+				if reset {
+					err = parser.ResetQUICStream(id, p.Direction == "request")
+				} else {
+					err = parser.FeedQUICStream(id, p.Direction == "request", p.Data, ended[key], p.Timestamp)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			wantEarly, wantApplication := 0, 0
+			if earlyStatus != "" {
+				wantEarly = 1
+			}
+			if earlyStatus == "rejected" {
+				wantApplication = 1
+			}
+			if earlyResets != wantEarly || applicationResets != wantApplication {
+				t.Fatalf("early/application resets=%d/%d, want %d/%d", earlyResets, applicationResets, wantEarly, wantApplication)
+			}
+			if err := parser.Close(); err != nil {
+				t.Fatal(err)
+			}
+			close(ch)
+			output = nil
+			for p := range ch {
+				output = append(output, p)
+			}
+		}
+		type message struct {
+			meta map[string]interface{}
+			body string
+			end  string
+		}
+		messages := make(map[string]*message)
+		path := ""
+		for _, p := range output {
+			id := p.Metadata["stream_id"].(uint64)
+			key := fmt.Sprintf("%d/%s", id, p.Direction)
+			if p.Protocol != "http/3" {
+				t.Fatal("protocol", p.Protocol)
+			}
+			if !options.HTTPEvents {
+				parts := bytes.SplitN(p.Data, []byte("\r\n\r\n"), 2)
+				if len(parts) != 2 || messages[key] != nil {
+					t.Fatal("invalid or duplicate complete message")
+				}
+				messages[key] = &message{meta: p.Metadata, body: string(parts[1]), end: "end"}
+			} else {
+				kind := p.Metadata["kind"]
+				m := messages[key]
+				if kind == "headers" {
+					if m != nil || p.Metadata["offset"] != uint64(0) || len(p.Data) != 0 {
+						t.Fatal("duplicate headers", p.Metadata)
+					}
+					messages[key] = &message{meta: p.Metadata}
+				} else {
+					if m == nil || m.end != "" || p.Metadata["offset"] != uint64(len(m.body)) {
+						t.Fatal("event order/offset", p.Metadata)
+					}
+					switch kind {
+					case "body_chunk":
+						m.body += string(p.Data)
+					case "end", "reset":
+						m.end = kind.(string)
+						if len(p.Data) != 0 || kind == "reset" && p.Metadata["error_code"] != uint64(0x10c) {
+							t.Fatal("terminal event", p.Metadata)
+						}
+					default:
+						t.Fatal("unexpected event", p.Metadata)
+					}
+				}
+			}
+			if p.Direction == "request" && p.Metadata["method"] == "GET" {
+				path = p.Metadata["path"].(string)
+			}
+		}
+		parts := strings.Split(path, "/")
+		if len(parts) != 4 || (parts[1] != "v1" && parts[1] != "v2") || (parts[2] != "seed" && parts[2] != "accepted" && parts[2] != "rejected") || parts[3] != "ok" || paths[path] {
+			t.Fatal("connection isolation/path", path)
+		}
+		paths[path] = true
+		id := uint64(4)
+		if parts[2] == "seed" {
+			id = 0
+		}
+		request, response := messages[fmt.Sprintf("%d/request", id)], messages[fmt.Sprintf("%d/response", id)]
+		if request == nil || response == nil || request.meta["method"] != "GET" || request.meta["authority"] != "localhost" || request.body != "" || request.end != "end" || response.meta["status"] != 200 || response.body != "reply "+path || response.end != "end" {
+			t.Fatalf("normal request/response lost: %s %+v", path, messages)
+		}
+		if options.RawChunks && ((parts[2] == "seed" && earlyStatus != "") || (parts[2] != "seed" && earlyStatus != parts[2])) {
+			t.Fatal("early status belongs to wrong connection", path, earlyStatus)
+		}
+		want := 2
+		if options.HTTPEvents && parts[2] == "accepted" {
+			want++
+			m := messages["0/request"]
+			if m == nil || m.meta["method"] != "POST" || m.meta["path"] != "/early/reset" || m.meta["headers"].(http.Header).Get("Content-Length") != "64" || m.body != "partial\x00\xff" || m.end != "reset" {
+				t.Fatal("accepted early request must end with reset", m)
+			}
+		}
+		if len(messages) != want {
+			t.Fatalf("%s emitted %d messages, want %d; incomplete/rejected POST must not complete", path, len(messages), want)
 		}
 	}
 }

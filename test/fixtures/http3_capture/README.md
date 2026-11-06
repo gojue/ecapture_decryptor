@@ -316,10 +316,16 @@ keys and local self-signed certificate are only for reproducible test traffic.
 
 ## Dynamic QPACK and message-state fixture
 
-`http3_dynamic_aioquic.pcapng` and `.keys` are a separate, independent QUIC v1
-capture from `aioquic_capture.py --dynamic` (aioquic 1.3.0, pylsqpack 0.3.24).
-The production SDK does not import either package. The fixture has 71 real
-loopback UDP packets, zero dumpcap drops, and two connections (`alpha`, `beta`).
+`aioquic_capture.py --dynamic` uses independent aioquic 1.3.0 and pylsqpack
+0.3.24; the production SDK imports neither package. Two captures have the same
+application workload, each with two connections (`alpha`, `beta`) and zero
+dumpcap drops:
+
+| Capture and matching `.keys` basename | Wire version | Actual suite | UDP packets |
+| --- | --- | --- | ---: |
+| `http3_dynamic_aioquic` | v1 (`0x00000001`) | AES-256-GCM/SHA384 (`0x1302`) | 71 |
+| `http3_dynamic_aioquic_v2` | v2 (`0x6b3343cf`) | AES-128-GCM/SHA256 (`0x1301`) | 72 |
+
 Each connection sends `/LABEL/warmup`, `/LABEL/one`, `/LABEL/two`, `/LABEL/reset`.
 Repeated `x-fixture-token: LABEL` × 16 values exercise dynamic references across
 request streams in both directions. Encoder writes are delayed 80 ms and split
@@ -337,7 +343,11 @@ informational frames without advancing the final-response send state; QPACK
 encoding/decoding remains entirely in pylsqpack. The generator asserts nonzero
 Required Insert Counts and fragmented encoder writes in both directions, records
 received fields/body/reset/push events in `dynamic-evidence.json`, and writes
-`dynamic.qlog` for inspection. These auxiliary artifacts are local, not fixtures.
+`dynamic.qlog` for inspection. It also checks the actual version and suite;
+tshark independently confirms the ServerHello values. The v2 capture has two
+nonzero Required Insert Counts on the client and five on the server per connection,
+with one client and two server encoder flushes split across writes. These
+auxiliary evidence artifacts are local, not fixtures.
 
 To reproduce, use the lifecycle section's venv/certificate/dumpcap setup, capture
 to `http3_dynamic_aioquic.pcapng`, and run:
@@ -347,15 +357,77 @@ to `http3_dynamic_aioquic.pcapng`, and run:
   --dynamic --cert "$work/server.crt" --key "$work/server.key" --output "$work"
 # Stop and wait for the capture process before inspecting or copying the files.
 # dynamic.keys is the matching SSLKEYLOG for http3_dynamic_aioquic.pcapng.
-go test -run TestHTTP3DynamicCaptureAPIs -v .
+
+# For a separate v2 run, use the same UDP 44433 capture setup and write
+# http3_dynamic_aioquic_v2.pcapng instead. Start capture before this command.
+"$work/venv/bin/python" test/fixtures/http3_capture/aioquic_capture.py \
+  --dynamic --version 2 --cert "$work/server.crt" --key "$work/server.key" \
+  --output "$work/dynamic-v2"
+# Stop and wait for capture, then pair it with dynamic-v2/dynamic.keys.
+go test -run 'TestHTTP3Dynamic(Capture|EventCapture)APIs' -v .
 ```
 
+`--version` applies to `--dynamic`; its default is v1/AES-256, preserving the
+original fixture configuration. The v2 selection uses AES-128.
 The regression compares field semantics, exact body bytes, stream IDs and
 directions across seekable/non-seekable files, external keys, embedded/trailing
-DSB, and raw reconstruction. Duplicate DSB does not duplicate messages; blocked
+DSB, raw reconstruction and HTTPEvents. Duplicate DSB does not duplicate messages; blocked
 headers resume before EOF. RFC 9204 Appendix B vectors, wrapping insert counts,
 invalid SETTINGS, eviction, limits, reset and deadline tests complement this
-capture. Dynamic HTTP/3 on v2 and early RESET remain outside real-capture coverage.
+capture. These two cells do not imply a dynamic HTTP/3 matrix for every cipher
+suite or expand the real Key Update coverage described above.
+
+### Accepted and rejected 0-RTT RESET
+
+`http3_early_reset_aioquic.pcapng` and `.keys` contain 70 real loopback UDP
+packets with zero dumpcap drops. `--early-reset` generates v1 on port 44467 and
+v2 on port 44468, both using AES-128-GCM/SHA256. Each version has a seed,
+accepted and rejected connection. Static QPACK keeps this test independent of
+the dynamic-table workload above.
+
+Each connection completes `GET /vN/MODE/ok`, with response body `reply PATH`.
+The seed uses stream 0; accepted/rejected connections use stream 4 for this
+normal exchange. Before their handshake completes, both send a partial
+`POST /early/reset` on stream 0, declaring `content-length: 64` but transmitting
+only ASCII `partial` followed by `00 ff` (nine body bytes), then RESET_STREAM with code `0x10c` and
+final size 40. The independent sender records the exact 40-byte HTTP/3 prefix:
+
+```text
+011b0000d4d75086a0e41d139d09518960a3b28f4c5854153f5402363400097061727469616c00ff
+```
+
+The generator asserts actual qlog packets, not only configuration: accepted
+connections send and receive the prefix and RESET at 0-RTT; rejected connections
+send the RESET at 0-RTT and automatically retransmit it at 1-RTT. The rejecting
+server receives only the 1-RTT RESET and no partial request bytes. All four
+attempts have the same prefix/final size. Peer assertions check the incomplete
+POST, reset stream/code and complete GET responses; qlog verifies the prefix
+was sent before RESET with a nonzero final size. No network packets are synthesized.
+
+Use the lifecycle section's venv and certificate, with a separate capture:
+
+```sh
+sudo -n dumpcap -i lo -f 'udp port 44467 or udp port 44468' -w - \
+  > "$work/http3_early_reset_aioquic.pcapng" 2> "$work/early-reset-capture.log" &
+capture_pid=$!
+trap 'sudo -n kill -INT "$capture_pid" 2>/dev/null || true; wait "$capture_pid" 2>/dev/null || true' EXIT
+sleep 1
+"$work/venv/bin/python" test/fixtures/http3_capture/aioquic_capture.py \
+  --early-reset --cert "$work/server.crt" --key "$work/server.key" \
+  --output "$work/early-reset"
+sudo -n kill -INT "$capture_pid"
+wait "$capture_pid" || true
+trap - EXIT
+# Pair the capture with early-reset/early-reset.keys; inspect the capture log,
+# early-reset-evidence.json and early-reset.qlog before replacing fixtures.
+go test -run TestQUICEarlyResetCaptureAPIs -v .
+```
+
+The SDK checks complete messages, raw stage/status/reset metadata and HTTPEvents
+across external keys and embedded/trailing DSB. A canceled partial POST must not
+become a complete message; rejected early bytes remain separate in raw output.
+This adds v1/v2 early RESET evidence, not Retry+0-RTT, dynamic QPACK within
+0-RTT, other early-data cipher suites, or new Key Update combinations.
 
 ## Incremental HTTP and SSE fixture
 

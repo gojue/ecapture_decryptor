@@ -267,20 +267,23 @@ func TestQUICEarlyDataAcceptanceAndReplay(t *testing.T) {
 					if err := q.observeServerCrypto(quicLevelHandshake, 0, ee[:3]); err != nil {
 						t.Fatal(err)
 					}
-				} else if err := q.finishQUICEarly(); err == nil {
-					t.Fatal("unknown acceptance was not returned")
 				}
 				if err := q.parseQUICFrames(frame, quicLevelApplication, true, time.Time{}); err != nil {
 					t.Fatal(err)
 				}
 				if err := q.parseQUICFrames(frame, quicLevelApplication, true, time.Time{}); err != nil {
 					t.Fatal(err)
+				}
+				if status == "unknown" {
+					if err := q.finishQUICEarly(); err == nil {
+						t.Fatal("unknown acceptance was not returned")
+					}
 				}
 				want := 1
 				if raw && status != "accepted" {
 					want = 2
 				}
-				if len(out) != want {
+				if len(out) != want || len(q.flow.early.frames) != 0 {
 					t.Fatalf("outputs=%d want=%d", len(out), want)
 				}
 				if raw {
@@ -470,6 +473,277 @@ func TestQUICEarlyResetUsesAcceptanceSpace(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestQUICEarlyResetLateKeysPreserveCapturedPrefix(t *testing.T) {
+	for _, version := range []uint32{quicVersion1, quicVersion2} {
+		for _, status := range []string{"accepted", "rejected"} {
+			for _, delay := range []string{"none", "early", "handshake"} {
+				t.Run(fmt.Sprintf("v%x/%s/late=%s", version, status, delay), func(t *testing.T) {
+					q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true})
+					q.version, q.flow.cipherSuite = version, 0x1301
+					q.flow.clientRandom = bytes.Repeat([]byte{0x44}, 32)
+					earlySecret, handshakeSecret := bytes.Repeat([]byte{7}, 32), bytes.Repeat([]byte{8}, 32)
+					earlyKey, _ := deriveQUICKeys(earlySecret, version, quicAES128)
+					handshakeKey, _ := deriveQUICKeys(handshakeSecret, version, quicAES128)
+					appKey, _ := deriveQUICKeys(bytes.Repeat([]byte{9}, 32), version, quicAES128)
+					q.flow.keys[0][quicLevelApplication] = []*QUICKeys{appKey}
+					if delay != "early" {
+						q.flow.keys[0][quicLevelEarly] = []*QUICKeys{earlyKey}
+					}
+					if delay != "handshake" {
+						q.flow.keys[1][quicLevelHandshake] = []*QUICKeys{handshakeKey}
+					}
+					ee := []byte{8, 0, 0, 2, 0, 0}
+					if status == "accepted" {
+						ee = []byte{8, 0, 0, 6, 0, 4, 0, 42, 0, 0}
+					}
+					reset := []byte{4, 0, 0x41, 0x0c, 3}
+					// The same cancellation can be sent again at 1-RTT. Delayed
+					// secrets must not let it erase an earlier captured prefix.
+					flight := []quicPacket{
+						quicLongTestPacket(t, version, QUICPacketType0RTT, nil, nil, nil, earlyKey, 0, []byte{0x0e, 0, 0, 3, 'a', 'b', 'c'}),
+						quicLongTestPacket(t, version, QUICPacketType0RTT, nil, nil, nil, earlyKey, 1, reset),
+						quicLongTestPacket(t, version, QUICPacketTypeHandshake, nil, nil, nil, handshakeKey, 0, append([]byte{6, 0, byte(len(ee))}, ee...)),
+						quicKeyPhasePacket(t, appKey, 2, 0, reset),
+					}
+					for i, packet := range flight {
+						q.processQUICDatagram(quicDatagram{data: packet.data, isClient: i != 2, at: time.Unix(int64(i+1), 0)})
+					}
+					if delay != "none" {
+						if len(out) != 0 || len(q.flow.streams) != 0 {
+							t.Fatal("1-RTT RESET overtook unresolved early data")
+						}
+						label, secret := "CLIENT_EARLY_TRAFFIC_SECRET", earlySecret
+						if delay == "handshake" {
+							label, secret = "SERVER_HANDSHAKE_TRAFFIC_SECRET", handshakeSecret
+						}
+						q.keyLog.AddSecret(label, fmt.Sprintf("%x", q.flow.clientRandom), secret)
+						q.retryQUICPacketsWithNewKeys()
+					}
+					want := 2
+					if status == "rejected" {
+						want = 3
+					}
+					if len(q.flow.errors) != 0 || len(q.flow.pending) != 0 || len(out) != want {
+						t.Fatalf("outputs=%d pending=%d errors=%v", len(out), len(q.flow.pending), q.flow.errors)
+					}
+					for i := 0; i < want; i++ {
+						p := <-out
+						kind, offset, level, earlyStatus, at := "stream_reset", uint64(3), "0rtt", any(status), int64(i+1)
+						var data []byte
+						if i == 0 {
+							kind, offset, data = "stream_chunk", 0, []byte("abc")
+						} else if i == 2 {
+							level, earlyStatus, at = "1rtt", nil, 4
+						}
+						if p.Metadata["kind"] != kind || p.Metadata["offset"] != offset || p.Metadata["encryption_level"] != level ||
+							p.Metadata["early_data"] != earlyStatus || !bytes.Equal(p.Data, data) || !p.Timestamp.Equal(time.Unix(at, 0)) {
+							t.Fatalf("output %d: metadata=%v data=%x timestamp=%v", i, p.Metadata, p.Data, p.Timestamp)
+						}
+					}
+					_ = q.Close()
+					if err := q.Decrypt(); err != nil {
+						t.Fatal(err)
+					}
+					assertQUICReleased(t, q)
+				})
+			}
+		}
+	}
+}
+
+func TestQUICQueuedApplicationResetUsesNormalStreamSpace(t *testing.T) {
+	for _, options := range []types.DecryptOptions{{}, {HTTPEvents: true}, {ApplicationProtocol: "doq"}} {
+		for _, earlyFrame := range []bool{false, true} {
+			t.Run(fmt.Sprintf("events=%v/protocol=%s/early=%v", options.HTTPEvents, options.ApplicationProtocol, earlyFrame), func(t *testing.T) {
+				q, out := newQUICOutputTest(t, options)
+				if earlyFrame {
+					if err := q.parseQUICFrames([]byte{4, 0, 0, 0}, quicLevelEarly, true, time.Time{}); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					// Ciphertext can be pending without any authenticated early
+					// frames; the queued 1-RTT reset is not DoQ early data.
+					q.flow.pendingLevels[0][quicLevelEarly] = true
+				}
+				if err := q.parseQUICFrames([]byte{4, 0, 0, 0}, quicLevelApplication, true, time.Time{}); err != nil {
+					t.Fatal(err)
+				}
+				// A reordered FIN must not reach HTTP/3 or DoQ ahead of the reset.
+				if err := q.parseQUICFrames([]byte{0x0f, 0, 0, 0}, quicLevelApplication, true, time.Time{}); err != nil {
+					t.Fatal(err)
+				}
+				if len(q.flow.streams) != 0 || len(out) != 0 {
+					t.Fatal("application reset bypassed early wait")
+				}
+				q.flow.pendingLevels[0][quicLevelEarly] = false
+				q.flow.early.status = "accepted"
+				if earlyFrame {
+					q.flow.early.status = "rejected"
+				}
+				if err := q.flushQUICEarly(); err != nil {
+					t.Fatal(err)
+				}
+				stream := q.flow.streams[quicStreamKey{id: 0, isClient: true}]
+				if stream == nil || !stream.finished || len(q.flow.early.streams) != 0 || len(q.flow.early.frames) != 0 {
+					t.Fatal("queued 1-RTT reset was discarded or used the early stream space")
+				}
+				if options.ApplicationProtocol == "doq" && (len(out) != 1 || (<-out).Metadata["kind"] != "reset") {
+					t.Fatal("DoQ 1-RTT reset was not emitted")
+				}
+				_ = q.Close()
+				if err := q.Decrypt(); err != nil {
+					t.Fatal(err)
+				}
+				assertQUICReleased(t, q)
+			})
+		}
+	}
+}
+
+func TestQUICEarlyPendingStreamPreservesPhaseAndTimestamp(t *testing.T) {
+	for _, status := range []string{"accepted", "rejected", "unknown"} {
+		t.Run(status, func(t *testing.T) {
+			q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true})
+			if err := q.parseQUICFrames([]byte{0x0e, 0, 0, 3, 'a', 'b', 'c'}, quicLevelEarly, true, time.Unix(1, 0)); err != nil {
+				t.Fatal(err)
+			}
+			// Accepted early bytes and the later suffix share offsets. A
+			// rejected/unknown attempt has its own space, including its prefix.
+			offset, data := uint64(0), []byte("abcdef")
+			if status == "accepted" {
+				offset, data = 3, []byte("def")
+			}
+			frame := append([]byte{0x0f, 0, byte(offset), byte(len(data))}, data...)
+			if err := q.parseQUICFrames(frame, quicLevelApplication, true, time.Unix(2, 0)); err != nil {
+				t.Fatal(err)
+			}
+			if len(out) != 0 || len(q.flow.streams) != 0 {
+				t.Fatal("application STREAM bypassed unresolved early data")
+			}
+			if status != "unknown" {
+				q.flow.early.status = status
+			}
+			if err := q.finishQUICEarly(); (err != nil) != (status == "unknown") {
+				t.Fatal("unexpected acceptance result", err)
+			}
+			if len(out) != 2 {
+				t.Fatalf("outputs=%d, want early prefix and application bytes", len(out))
+			}
+			prefix, suffix := <-out, <-out
+			if !bytes.Equal(prefix.Data, []byte("abc")) || prefix.Metadata["offset"] != uint64(0) || prefix.Metadata["end"] != false ||
+				prefix.Metadata["encryption_level"] != "0rtt" || prefix.Metadata["early_data"] != status || !prefix.Timestamp.Equal(time.Unix(1, 0)) {
+				t.Fatalf("early prefix: data=%x metadata=%v timestamp=%v", prefix.Data, prefix.Metadata, prefix.Timestamp)
+			}
+			if !bytes.Equal(suffix.Data, data) || suffix.Metadata["offset"] != offset || suffix.Metadata["end"] != true ||
+				suffix.Metadata["encryption_level"] != "1rtt" || suffix.Metadata["early_data"] != nil || !suffix.Timestamp.Equal(time.Unix(2, 0)) {
+				t.Fatalf("application bytes: data=%x metadata=%v timestamp=%v", suffix.Data, suffix.Metadata, suffix.Timestamp)
+			}
+			stream := q.flow.streams[quicStreamKey{id: 0, isClient: true}]
+			if stream == nil || !stream.finished || stream.next != 6 || stream.final != 6 || len(q.flow.early.frames) != 0 || q.flow.early.bytes != 0 {
+				t.Fatal("application FIN did not complete its own stream space")
+			}
+			_ = q.Close()
+			if err := q.Decrypt(); err != nil {
+				t.Fatal(err)
+			}
+			assertQUICReleased(t, q)
+		})
+	}
+}
+
+func TestQUICQueuedResetCannotBeOvertakenByStream(t *testing.T) {
+	for _, status := range []string{"accepted", "rejected", "unknown"} {
+		t.Run(status, func(t *testing.T) {
+			q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true})
+			for i, frame := range [][]byte{
+				{0x0e, 0, 0, 1, 'a'},
+				{4, 4, 0x41, 0x0c, 3},
+				{0x0f, 4, 0, 3, 'a', 'b', 'c'},
+			} {
+				level := quicLevelApplication
+				if i == 0 {
+					level = quicLevelEarly
+				}
+				if err := q.parseQUICFrames(frame, level, true, time.Unix(int64(i+1), 0)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(out) != 0 || len(q.flow.streams) != 0 {
+				t.Fatal("reordered STREAM overtook the queued RESET")
+			}
+			if status != "unknown" {
+				q.flow.early.status = status
+			}
+			if err := q.finishQUICEarly(); (err != nil) != (status == "unknown") {
+				t.Fatal("unexpected acceptance result", err)
+			}
+			if len(out) != 2 {
+				t.Fatalf("outputs=%d, want early prefix and application reset", len(out))
+			}
+			prefix, reset := <-out, <-out
+			if string(prefix.Data) != "a" || prefix.Metadata["early_data"] != status || !prefix.Timestamp.Equal(time.Unix(1, 0)) {
+				t.Fatal("early prefix changed", prefix.Metadata)
+			}
+			if reset.Metadata["kind"] != "stream_reset" || reset.Metadata["stream_id"] != uint64(4) || reset.Metadata["offset"] != uint64(3) ||
+				reset.Metadata["end"] != true || reset.Metadata["error_code"] != uint64(0x10c) || reset.Metadata["encryption_level"] != "1rtt" ||
+				reset.Metadata["early_data"] != nil || len(reset.Data) != 0 || !reset.Timestamp.Equal(time.Unix(2, 0)) {
+				t.Fatalf("application reset: data=%x metadata=%v timestamp=%v", reset.Data, reset.Metadata, reset.Timestamp)
+			}
+			stream := q.flow.streams[quicStreamKey{id: 4, isClient: true}]
+			if stream == nil || !stream.finished || stream.next != 0 || stream.final != 3 || stream.pendingBytes != 0 || len(stream.pending) != 0 {
+				t.Fatal("later STREAM replaced the RESET tombstone")
+			}
+			_ = q.Close()
+			if err := q.Decrypt(); err != nil {
+				t.Fatal(err)
+			}
+			assertQUICReleased(t, q)
+		})
+	}
+}
+
+func TestDoQQueuedApplicationStreamIsNotEarlyData(t *testing.T) {
+	for _, status := range []string{"accepted", "rejected", "unknown"} {
+		t.Run(status, func(t *testing.T) {
+			q, out := newQUICOutputTest(t, types.DecryptOptions{ApplicationProtocol: "doq"})
+			q.flow.pendingLevels[0][quicLevelEarly] = true
+			if status == "rejected" {
+				if err := q.parseQUICFrames([]byte{4, 4, 0, 0}, quicLevelEarly, true, time.Time{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// A length-prefixed DNS QUERY for a. A, ID zero as required by DoQ.
+			wire := []byte{0, 19, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 'a', 0, 0, 1, 0, 1}
+			frame := append([]byte{0x0b, 0, byte(len(wire))}, wire...)
+			if err := q.parseQUICFrames(frame, quicLevelApplication, true, time.Unix(2, 0)); err != nil || len(out) != 0 {
+				t.Fatal("DoQ request bypassed unresolved early data", err)
+			}
+			q.flow.pendingLevels[0][quicLevelEarly] = false
+			if status != "unknown" {
+				q.flow.early.status = status
+			}
+			if err := q.finishQUICEarly(); (err != nil) != (status == "unknown") || q.flow.terminalErr != nil {
+				t.Fatal("1-RTT DoQ request was treated as early data", err, q.flow.terminalErr)
+			}
+			if len(out) != 1 {
+				t.Fatalf("DoQ outputs=%d, want one request", len(out))
+			}
+			p := <-out
+			if !bytes.Equal(p.Data, wire[2:]) || p.Metadata["kind"] != "message" || p.Direction != "request" || !p.Timestamp.Equal(time.Unix(2, 0)) {
+				t.Fatal("DoQ request changed", p.Metadata)
+			}
+			if err := q.parseQUICFrames([]byte{4, 0, 0, 0}, quicLevelApplication, false, time.Time{}); err != nil {
+				t.Fatal(err)
+			}
+			_ = q.Close()
+			if err := q.Decrypt(); err != nil {
+				t.Fatal(err)
+			}
+			assertQUICReleased(t, q)
+		})
 	}
 }
 
