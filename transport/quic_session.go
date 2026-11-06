@@ -55,13 +55,20 @@ type quicHandshakeState struct {
 }
 
 type quicEarlyFrame struct {
-	id, offset uint64
-	data       []byte
-	fin        bool
-	reset      bool
-	errorCode  uint64
-	at         time.Time
+	id, offset  uint64
+	data        []byte
+	fin         bool
+	reset       bool
+	datagram    bool
+	application bool // Later client 1-RTT DATAGRAM waiting behind early data.
+	errorCode   uint64
+	at          time.Time
 }
+
+// Raw DATAGRAMs have no stream offsets to suppress capture duplicates. Sorted,
+// merged packet-number ranges retain gaps without retaining packet payloads.
+// Continuous traffic uses one range; excessive disjoint ranges fail explicitly.
+type quicPacketRange struct{ first, last uint64 }
 
 type quicEarlyState struct {
 	status         string // empty until authenticated EncryptedExtensions
@@ -89,8 +96,10 @@ type quicFlowState struct {
 	keyPhase        [2]quicKeyPhaseState
 	largest         [2][3]uint64
 	haveLargest     [2][3]bool
+	receivedPN      [2][]quicPacketRange // Raw 0/1-RTT share a packet-number space.
 	pending         []quicDeferredPacket
 	pendingLevels   [2][4]bool
+	retryingEarly   bool // Keep late-key 0-RTT before queued client DATAGRAMs.
 	pendingBytes    int
 	pendingSince    time.Time
 	terminalErr     error
@@ -215,6 +224,8 @@ func sameQUICSecrets(a, b *crypto.TLSSecrets) bool {
 
 func (q *QUICDecryptor) retryDeferredQUICPackets() {
 	deferred := q.flow.pending
+	q.flow.retryingEarly = q.flow.pendingLevels[0][quicLevelEarly]
+	defer func() { q.flow.retryingEarly = false }()
 	q.flow.pending = nil
 	q.flow.pendingBytes = 0
 	q.flow.pendingLevels = [2][4]bool{}
@@ -233,6 +244,12 @@ func (q *QUICDecryptor) retryDeferredQUICPackets() {
 	}
 	if len(q.flow.pending) == 0 {
 		q.flow.pendingSince = time.Time{}
+	}
+	q.flow.retryingEarly = false
+	if !q.flow.pendingLevels[0][quicLevelEarly] && q.flow.early.status != "" {
+		if err := q.flushQUICEarly(); err != nil {
+			q.appendQUICError(err)
+		}
 	}
 }
 
@@ -313,6 +330,16 @@ func (q *QUICDecryptor) processQUICPacket(packet quicPacket, isClient bool, at t
 			if decryptErr != nil {
 				continue
 			}
+			if q.options.RawChunks && space == quicLevelApplication {
+				duplicate, err := q.markQUICPacketNumber(direction, pn)
+				if err != nil {
+					q.reportQUICReassemblyError(err)
+					return false, err
+				}
+				if duplicate {
+					return false, nil
+				}
+			}
 			if !q.flow.haveLargest[direction][space] || pn > q.flow.largest[direction][space] {
 				q.flow.largest[direction][space] = pn
 				q.flow.haveLargest[direction][space] = true
@@ -333,6 +360,36 @@ func (q *QUICDecryptor) processQUICPacket(packet quicPacket, isClient bool, at t
 	q.options.Report(q.connectionInfo, "decrypt", "authentication_failed")
 	return false, fmt.Errorf("cannot authenticate QUIC %s packet (direction=%s, bytes=%d, first=0x%02x)",
 		q.getPacketTypeName(packet.packetType), directionName, len(packet.data), packet.data[0])
+}
+
+func (q *QUICDecryptor) markQUICPacketNumber(direction int, pn uint64) (bool, error) {
+	ranges := q.flow.receivedPN[direction]
+	i := sort.Search(len(ranges), func(i int) bool { return ranges[i].last >= pn })
+	if i < len(ranges) && ranges[i].first <= pn {
+		return true, nil
+	}
+	previous := i > 0 && ranges[i-1].last+1 == pn
+	next := i < len(ranges) && ranges[i].first == pn+1
+	switch {
+	case previous:
+		ranges[i-1].last = pn
+		if next {
+			ranges[i-1].last = ranges[i].last
+			copy(ranges[i:], ranges[i+1:])
+			ranges = ranges[:len(ranges)-1]
+		}
+	case next:
+		ranges[i].first = pn
+	default:
+		if len(ranges) >= maxQUICPendingSegments {
+			return false, errQUICBufferLimit
+		}
+		ranges = append(ranges, quicPacketRange{})
+		copy(ranges[i+1:], ranges[i:])
+		ranges[i] = quicPacketRange{first: pn, last: pn}
+	}
+	q.flow.receivedPN[direction] = ranges
+	return false, nil
 }
 
 func (q *QUICDecryptor) decryptQUICApplication(packet quicPacket, current *QUICKeys, keyIndex, cidLen, direction int) ([]byte, uint64, error) {

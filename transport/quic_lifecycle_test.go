@@ -251,40 +251,162 @@ func TestQUICStreamPendingSegmentLimit(t *testing.T) {
 }
 
 func TestQUICEarlyAcceptanceDeadlineReleasesState(t *testing.T) {
+	for _, frame := range [][]byte{{0x0b, 0, 3, 'a', 'b', 'c'}, {0x31, 1, 0xff}} {
+		synctest.Test(t, func(t *testing.T) {
+			q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true, KeyWaitTimeout: 5 * time.Second})
+			q.version = quicVersion1
+			key, _ := deriveQUICKeys(bytes.Repeat([]byte{4}, 32), quicVersion1, quicAES128)
+			q.flow.keys[0][quicLevelEarly] = []*QUICKeys{key}
+			packet := quicLongTestPacket(t, quicVersion1, QUICPacketType0RTT, nil, nil, nil, key, 0, frame)
+			if err := q.FeedClient(packet.data); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- q.Decrypt() }()
+			defer func() { _ = q.Close(); synctest.Wait() }()
+			synctest.Wait()
+			if len(out) != 0 {
+				t.Fatal("early data escaped acceptance wait")
+			}
+			time.Sleep(5 * time.Second)
+			synctest.Wait()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("unknown acceptance returned success")
+				}
+			default:
+				t.Fatal("acceptance wait did not expire")
+			}
+			if len(out) != 1 || (<-out).Metadata["early_data"] != "unknown" {
+				t.Fatal("raw unknown output was lost")
+			}
+			assertQUICReleased(t, q)
+			if len(q.flow.early.frames) != 0 || len(q.flow.early.streams) != 0 || q.routingHandler != nil || q.flow.handshake.retry != nil {
+				t.Fatal("handshake/early/routing state retained")
+			}
+		})
+	}
+}
+
+func TestQUICDatagramClosePreservesBackpressure(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true, KeyWaitTimeout: 5 * time.Second})
-		q.version = quicVersion1
+		q, _ := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true})
+		q.packetChan = make(chan *types.DecryptedPacket)
 		key, _ := deriveQUICKeys(bytes.Repeat([]byte{4}, 32), quicVersion1, quicAES128)
-		q.flow.keys[0][quicLevelEarly] = []*QUICKeys{key}
-		packet := quicLongTestPacket(t, quicVersion1, QUICPacketType0RTT, nil, nil, nil, key, 0, []byte{0x0b, 0, 3, 'a', 'b', 'c'})
+		q.flow.keys[0][quicLevelApplication] = []*QUICKeys{key}
+		packet := quicKeyPhasePacket(t, key, 0, 0, []byte{0x31, 0, 0x31, 1, 0xff})
 		if err := q.FeedClient(packet.data); err != nil {
 			t.Fatal(err)
 		}
 		done := make(chan error, 1)
 		go func() { done <- q.Decrypt() }()
-		defer func() { _ = q.Close(); synctest.Wait() }()
 		synctest.Wait()
-		if len(out) != 0 {
-			t.Fatal("early data escaped acceptance wait")
+		if err := q.Close(); err != nil {
+			t.Fatal(err)
 		}
-		time.Sleep(5 * time.Second)
 		synctest.Wait()
 		select {
 		case err := <-done:
-			if err == nil {
-				t.Fatal("unknown acceptance returned success")
-			}
+			t.Fatal("Close dropped buffered output instead of preserving backpressure", err)
 		default:
-			t.Fatal("acceptance wait did not expire")
 		}
-		if len(out) != 1 || (<-out).Metadata["early_data"] != "unknown" {
-			t.Fatal("raw unknown output was lost")
+		for _, want := range [][]byte{{}, {0xff}} {
+			if p := <-q.packetChan; p.Metadata["kind"] != "datagram" || !bytes.Equal(p.Data, want) {
+				t.Fatal("Close lost a datagram")
+			}
+		}
+		if err := <-done; err != nil {
+			t.Fatal(err)
 		}
 		assertQUICReleased(t, q)
-		if len(q.flow.early.frames) != 0 || len(q.flow.early.streams) != 0 || q.routingHandler != nil || q.flow.handshake.retry != nil {
-			t.Fatal("handshake/early/routing state retained")
+		if len(q.flow.receivedPN[0]) != 0 {
+			t.Fatal("Close retained packet-number history")
 		}
 	})
+}
+
+func TestQUICDatagramLateKeyWakesWithoutMorePackets(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true})
+		q.version = quicVersion1
+		q.flow.clientRandom = bytes.Repeat([]byte{0x44}, 32)
+		secret := bytes.Repeat([]byte{4}, 32)
+		key, _ := deriveQUICKeys(secret, quicVersion1, quicAES128)
+		packet := quicKeyPhasePacket(t, key, 0, 0, []byte{0x31, 0, 0x31, 1, 0xff})
+		for i := 0; i < 2; i++ {
+			if err := q.FeedClient(packet.data); err != nil {
+				t.Fatal(err)
+			}
+		}
+		done := make(chan error, 1)
+		go func() { done <- q.Decrypt() }()
+		synctest.Wait()
+		if len(out) != 0 || len(q.flow.pending) != 2 || len(q.flow.receivedPN[0]) != 0 {
+			t.Fatal("unavailable keys emitted or reserved a packet number")
+		}
+		q.keyLog.AddSecret("CLIENT_TRAFFIC_SECRET_0", hex.EncodeToString(q.flow.clientRandom), secret)
+		synctest.Wait()
+		if len(out) != 2 || len(q.flow.pending) != 0 {
+			t.Fatal("late key lost DATAGRAMs or emitted duplicate capture", len(out))
+		}
+		q.keyLog.AddSecret("CLIENT_TRAFFIC_SECRET_0", hex.EncodeToString(q.flow.clientRandom), secret)
+		_ = q.Close()
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		assertQUICReleased(t, q)
+	})
+}
+
+func TestQUICDatagramBoundedEarlyAndPacketHistory(t *testing.T) {
+	for _, limit := range []string{"early_frames", "early_bytes", "packet_ranges"} {
+		t.Run(limit, func(t *testing.T) {
+			var diagnostics []types.Diagnostic
+			q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true, OnDiagnostic: func(d types.Diagnostic) { diagnostics = append(diagnostics, d) }})
+			if limit == "packet_ranges" {
+				for i := uint64(0); i < maxQUICPendingSegments; i++ {
+					if duplicate, err := q.markQUICPacketNumber(0, i*2); err != nil || duplicate {
+						t.Fatal("packet range limit fired early", err)
+					}
+				}
+				key, _ := deriveQUICKeys(bytes.Repeat([]byte{4}, 32), quicVersion1, quicAES128)
+				q.flow.keys[0][quicLevelApplication] = []*QUICKeys{key}
+				// A distant authenticated packet needs one more interval. Seed the
+				// reconstruction context because this helper uses a one-byte PN.
+				q.flow.largest[0][quicLevelApplication] = maxQUICPendingSegments * 2
+				q.flow.haveLargest[0][quicLevelApplication] = true
+				packet := quicKeyPhasePacket(t, key, maxQUICPendingSegments*2+2, 0, []byte{0x31, 1, 0xff})
+				if _, err := q.processQUICPacket(packet, true, time.Time{}); !errors.Is(err, errQUICBufferLimit) {
+					t.Fatal("packet interval overflow did not fail explicitly", err)
+				}
+			} else {
+				count, data := maxQUICQueuedPackets, []byte{}
+				if limit == "early_bytes" {
+					data = make([]byte, 32<<10)
+					count = maxQUICBufferedBytes / len(data)
+				}
+				for i := 0; i < count; i++ {
+					if err := q.queueQUICEarly(quicEarlyFrame{datagram: true, data: data}); err != nil {
+						t.Fatal("early limit fired before the limit", err)
+					}
+				}
+				if err := q.parseQUICFrames([]byte{0x31, 1, 0xff}, quicLevelEarly, true, time.Time{}); !errors.Is(err, errQUICBufferLimit) {
+					t.Fatal("early limit was not enforced", err)
+				}
+			}
+			if len(out) != 0 || len(diagnostics) != 1 || diagnostics[0].Code != "resource_limit" || q.flow.terminalErr == nil {
+				t.Fatal("resource failure emitted output or lost diagnostic", diagnostics)
+			}
+			if err := q.Decrypt(); !errors.Is(err, errQUICBufferLimit) {
+				t.Fatal("resource error lost on shutdown", err)
+			}
+			assertQUICReleased(t, q)
+			if len(q.flow.early.frames) != 0 || q.flow.early.bytes != 0 || len(q.flow.receivedPN[0]) != 0 {
+				t.Fatal("resource failure retained DATAGRAM state")
+			}
+		})
+	}
 }
 
 func TestDoQRejectsAcceptedEarlyStreamAndReset(t *testing.T) {

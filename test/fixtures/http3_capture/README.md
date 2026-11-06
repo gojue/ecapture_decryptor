@@ -461,3 +461,49 @@ The fixture regression checks message counts, DNS fields, query/reply associatio
 stream and connection identity with an external keylog and a trailing DSB on a
 non-seekable stream. MQTT and Redis reproduction is in
 [`../http_tcp_capture/README.md`](../http_tcp_capture/README.md#d08-mqtt-and-redis-fixtures).
+
+### D11 QUIC DATAGRAM fixtures
+
+`d11_datagram_v1.pcapng`, `d11_datagram_v2.pcapng` and `d11_datagram.keys`
+come from `aioquic_capture.py --datagram` using aioquic 1.3.0 on Linux arm64.
+They contain real loopback UDP traffic (ports 44465 and 44466), QUIC v1/v2,
+TLS_AES_128_GCM_SHA256 and ALPN `fixture-datagram`. The capture has 92 packets
+in total and zero drops. The generator does not import the SDK or write pcap.
+
+Each version has three connections: a full handshake, accepted resumption with
+0-RTT, and rejected resumption with an explicit application resend at 1-RTT.
+Each exchanges five datagrams: empty, `00 ff 44 31 31`, `repeat`, `repeat`,
+`tail`. The latter two connections first send `early 00 ff` at 0-RTT; the
+rejected connection sends those same bytes again at 1-RTT. The echo endpoint
+checks exact bytes and message counts. Its qlog also confirms multiple DATAGRAM
+frames in one packet. Raw SDK output therefore contains 35 messages per capture
+(18 client and 17 server), including authenticated rejected early data; equal
+payloads in distinct messages remain separate. These captures use the explicit
+length form (`0x31`); implicit length, malformed frames, replay/resource limits
+and cancellation have separate deterministic unit tests. They do not establish
+WebTransport, MASQUE, HTTP DATAGRAM or unreliable application delivery guarantees.
+
+Use the lifecycle section's pinned venv and certificate setup, then run from the
+repository root (replace `$work` with a new temporary directory):
+
+```sh
+sudo -v
+sudo -n dumpcap -i lo -s 0 -B 64 -f 'udp portrange 44465-44466' -w - \
+  > "$work/combined.pcapng" 2> "$work/capture.log" &
+cap_pid=$!
+sleep 1
+"$work/venv/bin/python" test/fixtures/http3_capture/aioquic_capture.py \
+  --cert "$work/server.crt" --key "$work/server.key" --output "$work" --datagram
+sleep 1 # Drain actual final packets before stopping capture.
+sudo -n kill -INT "$cap_pid"
+wait "$cap_pid"
+tshark -r "$work/combined.pcapng" -Y 'udp.port == 44465' -w "$work/d11_datagram_v1.pcapng"
+tshark -r "$work/combined.pcapng" -Y 'udp.port == 44466' -w "$work/d11_datagram_v2.pcapng"
+```
+
+The keylog and both captures are the only required SDK inputs. Private certificate
+keys and the independent qlog/evidence files stay in the temporary directory.
+`TestD11QUICDatagramCaptureAPIs` checks file decoding and non-seekable input with
+both late DSB orders, output before EOF, repeated DSB and duplicated real packet
+blocks. It also verifies the existing requirement for explicit raw output when
+ALPN is outside the supported application parsers.

@@ -556,3 +556,222 @@ func TestQUICApplicationSelectionAndALPN(t *testing.T) {
 		}
 	}
 }
+
+func TestQUICDatagramFrameBoundariesAndDirections(t *testing.T) {
+	for _, client := range []bool{false, true} {
+		q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true})
+		at := time.Unix(123, 456)
+		// Two explicit frames (including empty), a PING, then an implicit frame
+		// whose payload resembles additional frames and must stay uninterpreted.
+		frames := []byte{0x31, 3, 0, 0xff, 0x80, 0x31, 0, 1, 0x30, 0x31, 0, 1}
+		if err := q.parseQUICFrames(frames, quicLevelApplication, client, at); err != nil {
+			t.Fatal(err)
+		}
+		frames[2] = 9 // Caller storage must not alias emitted messages.
+		if len(out) != 3 || len(q.flow.streams) != 0 {
+			t.Fatal("DATAGRAM lost boundaries or entered stream reassembly")
+		}
+		for _, want := range [][]byte{{0, 0xff, 0x80}, {}, {0x31, 0, 1}} {
+			p := <-out
+			direction, src := "response", "192.0.2.2"
+			if client {
+				direction, src = "request", "192.0.2.1"
+			}
+			if !bytes.Equal(p.Data, want) || p.DataLength != uint32(len(want)) || p.Protocol != "quic" || p.Transport != "udp" ||
+				p.Direction != direction || p.SrcIP != src || p.ConnectionID() != q.connectionInfo.String() || !p.Timestamp.Equal(at) ||
+				!reflect.DeepEqual(p.Metadata, map[string]interface{}{"kind": "datagram", "encryption_level": "1rtt"}) {
+				t.Fatalf("incorrect DATAGRAM: %+v", p)
+			}
+		}
+		if err := q.parseQUICFrames([]byte{0x30}, quicLevelApplication, client, at); err != nil || len(out) != 1 || len((<-out).Data) != 0 {
+			t.Fatal("implicit empty DATAGRAM lost", err)
+		}
+	}
+}
+
+func TestQUICDatagramInvalidFramingAndEncryptionLevel(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		frame  []byte
+		level  int
+		client bool
+	}{
+		{"missing_length", []byte{0x31}, quicLevelApplication, true},
+		{"partial_varint", []byte{0x31, 0x40}, quicLevelApplication, true},
+		{"partial_payload", []byte{0x31, 3, 0, 0xff}, quicLevelApplication, true},
+		{"large_length", []byte{0x31, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, quicLevelApplication, true},
+		{"initial", []byte{0x30}, quicLevelInitial, true},
+		{"handshake", []byte{0x31, 0}, quicLevelHandshake, false},
+		{"server_early", []byte{0x30}, quicLevelEarly, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, raw := range []bool{false, true} {
+				var diagnostics []types.Diagnostic
+				q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: raw, OnDiagnostic: func(d types.Diagnostic) { diagnostics = append(diagnostics, d) }})
+				if err := q.parseQUICFrames(tc.frame, tc.level, tc.client, time.Time{}); err == nil || len(out) != 0 || len(diagnostics) != 1 || diagnostics[0].Code != "invalid_frame" {
+					t.Fatalf("invalid DATAGRAM: error=%v output=%d diagnostics=%+v", err, len(out), diagnostics)
+				}
+			}
+		})
+	}
+	for _, level := range []int{quicLevelEarly, quicLevelApplication} {
+		q, out := newQUICOutputTest(t, types.DecryptOptions{})
+		// A valid authenticated h3 ALPN keeps the normal application parser;
+		// unrelated DATAGRAM messages must still be ignored.
+		ee := []byte{8, 0, 0, 11, 0, 9, 0, 16, 0, 5, 0, 3, 2, 'h', '3'}
+		if err := q.observeServerCrypto(quicLevelHandshake, 0, ee); err != nil {
+			t.Fatal(err)
+		}
+		if err := q.parseQUICFrames([]byte{0x31, 0, 0x30, 0xff}, level, true, time.Time{}); err != nil || len(out) != 0 || len(q.flow.early.frames) != 0 || len(q.flow.streams) != 0 {
+			t.Fatal("default output did not ignore DATAGRAM", err)
+		}
+	}
+}
+
+func TestQUICDatagramCaptureDuplicatesAndApplicationRepeats(t *testing.T) {
+	for _, version := range []uint32{quicVersion1, quicVersion2} {
+		q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true})
+		q.version = version
+		key, _ := deriveQUICKeys(bytes.Repeat([]byte{9}, 32), version, quicAES128)
+		q.flow.keys[0][quicLevelApplication] = []*QUICKeys{key}
+		q.flow.keys[1][quicLevelApplication] = []*QUICKeys{key}
+		frame := []byte{0x31, 1, 0xff, 0x31, 1, 0xff}
+		// Same payload in the same packet, another PN, and the opposite direction
+		// are all separate messages. Only a previously authenticated PN repeats.
+		for _, item := range []struct {
+			pn     uint64
+			client bool
+		}{{2, true}, {0, true}, {2, true}, {1, true}, {0, true}, {0, false}} {
+			if pending, err := q.processQUICPacket(quicKeyPhasePacket(t, key, item.pn, 0, frame), item.client, time.Time{}); err != nil || pending {
+				t.Fatal("authenticated DATAGRAM failed", pending, err)
+			}
+		}
+		if len(out) != 8 || !reflect.DeepEqual(q.flow.receivedPN[0], []quicPacketRange{{0, 2}}) {
+			t.Fatal("packet deduplication lost application repeats or reorder", len(out), q.flow.receivedPN)
+		}
+		for len(out) > 0 {
+			if p := <-out; !bytes.Equal(p.Data, []byte{0xff}) {
+				t.Fatal("payload changed")
+			}
+		}
+		bad := quicKeyPhasePacket(t, key, 3, 0, frame)
+		bad.data[len(bad.data)-1] ^= 1
+		if _, err := q.processQUICPacket(bad, true, time.Time{}); err == nil || len(out) != 0 {
+			t.Fatal("bad authentication emitted DATAGRAM")
+		}
+		if _, err := q.processQUICPacket(quicKeyPhasePacket(t, key, 3, 0, frame), true, time.Time{}); err != nil || len(out) != 2 {
+			t.Fatal("failed authentication reserved the packet number", err)
+		}
+	}
+}
+
+func TestQUICDatagramEarlyStatusAndSharedPacketNumbers(t *testing.T) {
+	for _, status := range []string{"accepted", "rejected", "unknown"} {
+		t.Run(status, func(t *testing.T) {
+			q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true})
+			q.version = quicVersion1
+			key, _ := deriveQUICKeys(bytes.Repeat([]byte{9}, 32), quicVersion1, quicAES128)
+			q.flow.keys[0][quicLevelEarly] = []*QUICKeys{key}
+			q.flow.keys[0][quicLevelApplication] = []*QUICKeys{key}
+			at := time.Unix(123, 456)
+			frame := []byte{0x31, 0, 0x31, 1, 0xff}
+			early := quicLongTestPacket(t, quicVersion1, QUICPacketType0RTT, nil, nil, nil, key, 0, frame)
+			for i := 0; i < 2; i++ {
+				if _, err := q.processQUICPacket(early, true, at); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(q.flow.early.frames) != 2 || len(out) != 0 {
+				t.Fatal("early duplicate charged state or emitted before acceptance")
+			}
+			// These complete messages wait behind unresolved early data without
+			// acquiring stream offsets or losing their 1-RTT metadata.
+			for _, pn := range []uint64{0, 1, 1} {
+				if _, err := q.processQUICPacket(quicKeyPhasePacket(t, key, pn, 0, frame), true, at); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(out) != 0 {
+				t.Fatal("1-RTT overtook unresolved early DATAGRAMs")
+			}
+			if status == "unknown" {
+				if err := q.finishQUICEarly(); err == nil {
+					t.Fatal("unknown acceptance reported success")
+				}
+			} else {
+				ee := []byte{8, 0, 0, 2, 0, 0}
+				if status == "accepted" {
+					ee = []byte{8, 0, 0, 6, 0, 4, 0, 42, 0, 0}
+				}
+				if err := q.observeServerCrypto(quicLevelHandshake, 0, ee); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, want := range [][]byte{{}, {0xff}} {
+				p := <-out
+				if !bytes.Equal(p.Data, want) || !p.Timestamp.Equal(at) || !reflect.DeepEqual(p.Metadata, map[string]interface{}{"kind": "datagram", "encryption_level": "0rtt", "early_data": status}) {
+					t.Fatal("early DATAGRAM boundary or status lost", p.Metadata)
+				}
+			}
+			// 0/1-RTT share the PN space; a new PN retains its repeated payload.
+			if len(out) != 2 || len(q.flow.streams) != 0 || len(q.flow.early.streams) != 0 || len(q.flow.early.frames) != 0 || q.flow.early.bytes != 0 {
+				t.Fatal("DATAGRAM used STREAM dedupe or retained waiting data")
+			}
+			for len(out) > 0 {
+				if p := <-out; p.Metadata["encryption_level"] != "1rtt" || p.Metadata["early_data"] != nil {
+					t.Fatal("queued 1-RTT received early metadata", p.Metadata)
+				}
+			}
+		})
+	}
+}
+
+func TestQUICDatagramLateEarlyKeyPreservesPhaseOrder(t *testing.T) {
+	for _, status := range []string{"accepted", "rejected", "unknown"} {
+		t.Run(status, func(t *testing.T) {
+			q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true})
+			q.version = quicVersion1
+			q.flow.clientRandom = bytes.Repeat([]byte{0x44}, 32)
+			secret := bytes.Repeat([]byte{9}, 32)
+			key, _ := deriveQUICKeys(secret, quicVersion1, quicAES128)
+			q.flow.keys[0][quicLevelApplication] = []*QUICKeys{key}
+			for pn := uint64(0); pn < 2; pn++ {
+				packet := quicLongTestPacket(t, quicVersion1, QUICPacketType0RTT, nil, nil, nil, key, pn, []byte{0x31, 1, byte(pn)})
+				q.processQUICDatagram(quicDatagram{data: packet.data, isClient: true})
+			}
+			packet := quicKeyPhasePacket(t, key, 2, 0, []byte{0x31, 1, 2})
+			q.processQUICDatagram(quicDatagram{data: packet.data, isClient: true})
+			if len(out) != 0 || len(q.flow.pending) != 2 || len(q.flow.early.frames) != 1 {
+				t.Fatal("1-RTT bypassed pending early ciphertext")
+			}
+			if status != "unknown" {
+				ee := []byte{8, 0, 0, 2, 0, 0}
+				if status == "accepted" {
+					ee = []byte{8, 0, 0, 6, 0, 4, 0, 42, 0, 0}
+				}
+				if err := q.observeServerCrypto(quicLevelHandshake, 0, ee); err != nil || len(out) != 0 {
+					t.Fatal("acceptance bypassed missing early key", err)
+				}
+			}
+			q.keyLog.AddSecret("CLIENT_EARLY_TRAFFIC_SECRET", fmt.Sprintf("%x", q.flow.clientRandom), secret)
+			q.retryQUICPacketsWithNewKeys()
+			if status == "unknown" {
+				if len(out) != 0 {
+					t.Fatal("unknown early data escaped waiting")
+				}
+				if err := q.finishQUICEarly(); err == nil {
+					t.Fatal("unknown acceptance reported success")
+				}
+			}
+			if len(out) != 3 || len(q.flow.pending) != 0 {
+				t.Fatal("late key did not flush queued phases", len(out), q.flow.errors)
+			}
+			for i := byte(0); i < 3; i++ {
+				p := <-out
+				if !bytes.Equal(p.Data, []byte{i}) || (p.Metadata["encryption_level"] == "0rtt") != (i < 2) {
+					t.Fatal("late key reordered phases or changed metadata", p.Metadata, p.Data)
+				}
+			}
+		})
+	}
+}

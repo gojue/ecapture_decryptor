@@ -175,3 +175,57 @@ func TestEOFDrainDoesNotTriggerIdleTimeout(t *testing.T) {
 		}
 	})
 }
+
+func TestDTLSRoutingLimitAndIdleLifecycle(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		withRoutingDecryptor(t, types.TransportProtocolUDP, func(engine *DecryptorEngine, created *[]*routingDecryptor) {
+			var diagnostics []types.Diagnostic
+			engine.factory.options = types.DecryptOptions{UDPProtocol: "dtls", MaxConnections: 1, IdleTimeout: 2 * time.Second, OnDiagnostic: func(d types.Diagnostic) { diagnostics = append(diagnostics, d) }}
+			packet := func(port uint16, reverse bool, payload string) *transport.UDPAdapter {
+				src, dst := port, uint16(44463)
+				if reverse {
+					src, dst = dst, src
+				}
+				return transport.NewUDPAdapter(&layers.UDP{SrcPort: layers.UDPPort(src), DstPort: layers.UDPPort(dst), BaseLayer: layers.BaseLayer{Payload: []byte(payload)}})
+			}
+			reverseIP := transport.NewIPv4Adapter(&layers.IPv4{SrcIP: net.IPv4(192, 0, 2, 2), DstIP: net.IPv4(192, 0, 2, 1)})
+			// Arbitrary bytes reach the explicitly selected DTLS worker, never the
+			// QUIC header/CID router. Payload validation belongs to that worker.
+			engine.handlePacket(lifecycleIP(), packet(41000, false, "first"), time.Unix(1, 0))
+			engine.handlePacket(reverseIP, packet(41000, true, "reply"), time.Unix(1<<40, 0))
+			engine.handlePacket(lifecycleIP(), packet(41001, false, "limited"), time.Time{})
+			if len(*created) != 1 || engine.active != 1 || len((*created)[0].client) != 1 || len((*created)[0].server) != 1 || len(diagnostics) != 1 || diagnostics[0].Code != "connection_limit" || len(engine.tcpFlows) != 0 {
+				t.Fatal("DTLS routing/admission failed")
+			}
+			finish := make(chan struct{})
+			release := sync.OnceFunc(func() { close(finish) })
+			defer release()
+			(*created)[0].finish = finish
+			time.Sleep(time.Second)
+			engine.handlePacket(reverseIP, packet(41000, true, "active"), time.Unix(1, 0))
+			time.Sleep(time.Second)
+			engine.expireIdleConnections(time.Now(), 2*time.Second)
+			select {
+			case <-(*created)[0].closed:
+				t.Fatal("active DTLS association retired")
+			default:
+			}
+			time.Sleep(time.Second)
+			engine.expireIdleConnections(time.Now(), 2*time.Second)
+			synctest.Wait()
+			if len(engine.conntrack) != 0 || len(engine.lastActivity) != 0 || engine.active != 1 || len(diagnostics) != 2 || diagnostics[1].Code != "idle_timeout" {
+				t.Fatal("idle DTLS route or closing capacity leaked")
+			}
+			engine.handlePacket(lifecycleIP(), packet(41001, false, "still limited"), time.Time{})
+			if len(*created) != 1 {
+				t.Fatal("closing worker released admission early")
+			}
+			release()
+			synctest.Wait()
+			engine.handlePacket(lifecycleIP(), packet(41001, false, "reusable"), time.Time{})
+			if len(*created) != 2 || engine.active != 1 || (*created)[0].addr.Generation == (*created)[1].addr.Generation {
+				t.Fatal("DTLS capacity not reusable")
+			}
+		})
+	})
+}

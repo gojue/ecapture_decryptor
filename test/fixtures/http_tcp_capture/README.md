@@ -356,3 +356,73 @@ are separate from this real-traffic matrix. References:
 [OpenSSL KeyUpdate](https://docs.openssl.org/3.5/man3/SSL_key_update/),
 [OpenSSL early data](https://docs.openssl.org/3.5/man3/SSL_read_early_data/) and
 [RFC 9850 ECH keylog labels](https://www.rfc-editor.org/rfc/rfc9850.html#section-2.3).
+
+## D11 DTLS 1.2 fixtures
+
+`dtls_capture.c` is a separate, build-excluded OpenSSL UDP peer because DTLS
+requires datagram BIOs and handshake fragmentation rather than the TCP fixture's
+stream transport. It links no SDK code and produces only real loopback traffic.
+The committed captures were generated with OpenSSL **3.5.5**: 36 packets total,
+zero reported drops, and 18 packets in each capture.
+
+| Capture | UDP port | Negotiated DTLS 1.2 suite |
+| --- | ---: | --- |
+| `d11_dtls_aes128.pcapng` | 44463 | ECDHE-RSA-AES128-GCM-SHA256 (`0xc02f`) |
+| `d11_dtls_aes256.pcapng` | 44464 | ECDHE-RSA-AES256-GCM-SHA384 (`0xc030`) |
+
+Each capture contains one connection, one HelloVerifyRequest/cookie exchange,
+and four non-complete handshake fragments produced with MTU 512. Record headers
+use `0xfeff` during the initial exchange and `0xfefd` for DTLS 1.2; ServerHello
+negotiates `0xfefd`. The fixture's fixed cookie is local test data, not an example
+of production address-bound cookie protection.
+
+Each peer sends four application records with identical content but distinct
+record sequences: epoch 1, sequence 1 through 4. Client payloads are exactly
+`dtls request\x00\xff\r\n` (16 bytes); server payloads are exactly
+`dtls response\x00\xfe\r\n` (17 bytes). Every SSL read checks the entire datagram
+and its length. Repeated plaintext is intentional application repetition, not
+record retransmission. `d11_dtls.keys` contains two real `CLIENT_RANDOM` entries,
+each with a 48-byte master secret from the client keylog callback. Independent
+standard-library PRF/AES-GCM decoding also verified all 16 application records
+against these fixed byte strings.
+
+OpenSSL 3.5.5 did not emit an application record for a zero-length write; empty
+records, reordered/retransmitted packets and malformed-input behavior therefore
+need separate SDK state tests. These captures do not claim DTLS 1.3, CID,
+resumption, renegotiation, SRTP, SCTP, CoAP or WebRTC coverage.
+
+Reproduce from the repository root on Linux with OpenSSL development headers,
+pkg-config, a C compiler, OpenSSL CLI, timeout, dumpcap and tshark:
+
+```sh
+work=$(mktemp -d)
+umask 077
+cc -Wall -Wextra -Werror test/fixtures/http_tcp_capture/dtls_capture.c \
+  -o "$work/dtls-peer" $(pkg-config --cflags --libs openssl) -lpthread
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$work/peer.key" \
+  -out "$work/peer.crt" -days 1 -subj /CN=localhost
+sudo -v
+sudo -n dumpcap -i lo -s 0 -B 64 -f 'udp portrange 44463-44464' \
+  -w - > "$work/d11_dtls_all.pcapng" 2> "$work/capture.log" &
+capture_pid=$!
+trap 'sudo -n kill -INT "$capture_pid" 2>/dev/null || true; wait "$capture_pid" 2>/dev/null || true' EXIT
+sleep 1
+timeout 20 "$work/dtls-peer" "$work/peer.crt" "$work/peer.key" \
+  "$work/d11_dtls.keys" all > "$work/evidence.jsonl"
+sleep 1
+sudo -n kill -INT "$capture_pid"
+wait "$capture_pid"
+trap - EXIT
+for entry in aes128:44463 aes256:44464; do
+  mode=${entry%:*}
+  port=${entry##*:}
+  tshark -r "$work/d11_dtls_all.pcapng" -Y "udp.port == $port" \
+    -w "$work/d11_dtls_$mode.pcapng"
+done
+```
+
+The keylog path must be new; the final peer argument may select `aes128` or
+`aes256` instead of `all`. Check the endpoint evidence and capture drop counts
+before replacing fixtures. Keep the certificate private key and local evidence
+outside Git. References: [OpenSSL datagram BIO](https://docs.openssl.org/3.5/man3/BIO_s_datagram/)
+and [DTLS 1.2](https://www.rfc-editor.org/rfc/rfc6347.html).

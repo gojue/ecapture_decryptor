@@ -155,11 +155,11 @@ raw 事件复用 `DecryptedPacket`：`Protocol` 为 `tls` 或 `quic`，`Data` �
 
 chunk 边界不是应用消息边界，同一层的 raw 与应用解析互斥，不依赖 ALPN 或自动识别；TLSUpgrade 可同时交付外层 raw 与内层应用消息。
 TLS 终止错误时保留已认证字节并返回错误，不发送正常结束标记；捕获结束本身
-不证明应用消息完整。QUIC 只输出连续 STREAM 字节，已知 offset 缺口在关闭时报错。
+不证明应用消息完整。QUIC STREAM 只输出连续字节，已知 offset 缺口在关闭时报错；DATAGRAM 不参与该重组。
 RESET_STREAM 释放该方向的重组和解析缓存，保留有界终止标记以去重；它不伪装为完整 HTTP 消息。
 0-RTT RESET 使用下述接受/拒绝规则和独立 early 空间，raw reset 同样带阶段/接受状态。
 STOP_SENDING 只表示请求对端停止，不能替代 RESET 或 FIN。
-不支持 DATAGRAM 输出；TLS KeyUpdate 及 TLS 阶段边界见 [TLS 版本与状态](#tls-版本与状态)，STARTTLS/CONNECT 见 [TLSUpgrade](#tlsupgrade)。QUIC Key Update、
+QUIC DATAGRAM 与 DTLS 数据报见 [数据报输出](#数据报输出)；TLS KeyUpdate 及 TLS 阶段边界见 [TLS 版本与状态](#tls-版本与状态)，STARTTLS/CONNECT 见 [TLSUpgrade](#tlsupgrade)。QUIC Key Update、
 CID/Retry/VN 和 0-RTT 支持范围见下节。raw / HTTP 增量模式支持 QUIC 62 位 STREAM offset，完整消息和 CRYPTO 保留 16 MiB 的累计限制。
 
 `Diagnostic` 仅含连接标识、传输、阶段和固定原因码，不含底层错误字符串。
@@ -172,6 +172,24 @@ secret 时，无法区分仅含加密握手的记录与缺少正确密钥的应�
 诊断用于解释输出缺失，不保证每个包一条，也不替代函数返回的终止错误。
 
 ---
+
+#### 数据报输出
+
+QUIC `types.DecryptOptions{RawChunks: true}` 在既有 STREAM 事件之外输出 [RFC 9221](https://www.rfc-editor.org/rfc/rfc9221.html) DATAGRAM：`Protocol="quic"`、`Metadata["kind"]="datagram"`，每个已认证 frame 一条输出，`Data` 保留完整消息边界及空载荷。支持 `0x30` 隐式长度和 `0x31` 显式长度；不设置 `stream_id`、`offset` 或 `end`，也不生成数据报结束事件。`encryption_level` 始终是 `0rtt` 或 `1rtt`；0-RTT 另带 `early_data=accepted/rejected/unknown`，拒绝/未知的已认证字节仍可通过 raw 保留，不表示对端接受了它。
+
+同方向的 0/1-RTT 共享 packet-number 去重，只有认证成功的 packet 才登记；重复捕获不重复输出，不同 packet 或同 packet 中内容相同的多个 DATAGRAM 仍分别输出。已见 packet number 保存为合并区间，每方向最多 65,536 个离散区间，超限明确返回 `resource_limit`，不靠 payload 去重。未决 early 及其后待释放的客户端 DATAGRAM 复用有界 early 队列（32 MiB/65,536 frames）与密钥期限；普通 1-RTT 消息不等 STREAM 缺口。输出使用既有串行回调/背压，不创建无限消息队列。
+
+默认应用模式继续忽略底层 DATAGRAM；未知的已认证 ALPN 仍要求显式 raw。此输出不实现重传、可靠交付、应用排序、HTTP DATAGRAM context、WebTransport session 或 MASQUE capsule，也不完整校验对端 DATAGRAM transport parameter 的协商。独立 aioquic 真实夹具覆盖 QUIC v1/v2、AES-128-GCM、空/二进制/同内容消息、多 frame、accepted/rejected 0-RTT；其他边界由状态测试覆盖，不能据此宣称 WebTransport/MASQUE 已支持。
+
+DTLS 采用独立显式入口选项 `types.DecryptOptions{UDPProtocol: "dtls"}`。空值或 `"quic"` 保留 UDP→QUIC，TCP 仍走 TLS；不按端口猜测，选项作用于本次调用的全部 UDP 连接。DTLS 选项与 `ApplicationProtocol`、`TLSUpgrade`、`HTTPEvents`、非零 `MaxDecodedBodyBytes` 互斥；`RawChunks` 可用但不改变 DTLS 输出。文件 API 必须并发消费 packet channel，流式 API 继续接受外部 keylog/内嵌或迟到 DSB、取消及回调错误排空。CLI/C 示例未增加此选项。
+
+首批仅支持 [DTLS 1.2](https://www.rfc-editor.org/rfc/rfc6347.html) 的 `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256` (`0xc02f`) / `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384` (`0xc030`)，需要包含 ClientHello/ServerHello 的双向捕获及匹配的 `CLIENT_RANDOM <client random> <48-byte master secret>`。复用 TLS PRF/key block，按 [AES-GCM record](https://www.rfc-editor.org/rfc/rfc5288.html) 的 epoch、48 位序号、显式 nonce 和 AAD 认证。允许初始 epoch 0 的兼容 `0xfeff` record header，但实际 Hello 版本必须是 `0xfefd`；加密输出限定 epoch 1。
+
+每个认证成功的 application record 输出一条 `Protocol="dtls"`、`Transport="udp"`、`kind="datagram"`，含 `epoch` (`uint16`) 与 `sequence` (`uint64`)；无 stream offset、FIN 或应用解析。方向由 ClientHello 识别，时间戳来自该 record 的捕获包。每方向保留 128-record replay window，认证失败不推进窗口，重复或落在窗口之前的 record 不输出；窗口内乱序可即时输出，不排序、等待缺口或补包。坏认证保留固定诊断/最终错误，其他可认证记录仍可输出。
+
+连接 ID 固定为首次捕获的 UDP tuple/代次，cookie retry 保持同一连接；同 tuple 的新 random/重协商不自动视为新连接，明确报不支持，直至 EOF/空闲回收。DTLS 输入队列和迟到密钥队列各为 4 MiB/4,096 项，worker 取出的当前批次也最多 4 MiB；单 UDP 最多 65,535 字节，明文 record 最多 16 KiB。握手按方向/epoch/message_seq 重组，单消息 256 KiB，未完成握手与已完成 Hello 留存载荷合计 1 MiB（未完成消息另有等长接收位图），最多 64 个消息身份含完成标记；冲突片段、截断和超限报错。握手/密钥等待使用首次启动的实际时间期限，部分消息或重复密钥不延期；正常 EOF 排空，缺密钥/未完成握手仍返回错误，关闭释放缓存和连接额度。
+
+独立 OpenSSL 真实 DTLS 夹具覆盖两套件、HelloVerifyRequest、MTU 512 的握手分片和双向重复二进制载荷；空 record、乱序、重传、坏认证和资源边界使用确定性状态测试。此最小实现不支持 DTLS 1.0/1.3、CID、epoch 更新/重协商，也不提供完整证书身份或 Finished transcript 验证。DTLS 外层解密不等于 CoAP、SCTP/DataChannel、SRTP 或 WebRTC 已支持；这些应用与 WebTransport/MASQUE 均是后续独立子项。
 
 #### HTTP 增量事件
 
@@ -572,7 +590,7 @@ for packet := range packetChan {
 
 上限：每方向实际动态表 64 KiB、每个解码字段节 64 KiB（按 name + value + 32 计）/1024 字段；每方向最多 64 条阻塞流，同时受对端 SETTINGS 限制。解析器最多保留 1024 个流标记、128 个 push；每个未关联 push 最多 16 个信息响应；待 SETTINGS 重放每方向最多 4096 个片段。连接内消息/流缓冲和待重放字节共 32 MiB，完整消息模式的单消息和 QUIC STREAM offset 上限为 16 MiB。超限返回终止错误并报告 `protocol/resource_limit`，不跳过失败断言或扩大缓存。
 
-QPACK、SETTINGS 和消息顺序错误报告 `protocol/parse_failed`，不归为密码学认证失败。阻塞压缩/未关联 push 使用实际时间的 `KeyWaitTimeout`，逾期报告 `protocol/parse_timeout`；EOF 尚有不完整状态也返回错误。RESET、取消和关闭释放等待数据，正常结束仅保留有界去重/关联信息；输出继续遵守串行背压。缺失必要 encoder 历史或 SETTINGS 的片段捕获不能保证动态解码。长流使用下述 HTTP 增量事件契约。扩展 CONNECT 和 DATAGRAM 属于后续协议范围。
+QPACK、SETTINGS 和消息顺序错误报告 `protocol/parse_failed`，不归为密码学认证失败。阻塞压缩/未关联 push 使用实际时间的 `KeyWaitTimeout`，逾期报告 `protocol/parse_timeout`；EOF 尚有不完整状态也返回错误。RESET、取消和关闭释放等待数据，正常结束仅保留有界去重/关联信息；输出继续遵守串行背压。缺失必要 encoder 历史或 SETTINGS 的片段捕获不能保证动态解码。长流使用下述 HTTP 增量事件契约。扩展 CONNECT、HTTP DATAGRAM 的应用关联与 WebTransport/MASQUE 尚未实现；底层 QUIC DATAGRAM 可显式 raw 输出，见 [数据报输出](#数据报输出)。
 
 独立 `http3_dynamic_aioquic` 夹具及 [复现步骤](../test/fixtures/http3_capture/README.md#dynamic-qpack-and-message-state-fixture) 覆盖 QUIC v1、两条连接、双向动态表、延迟/拆分 encoder、103→200→trailers、push/reset；v2 的动态 HTTP/3 组合和 0-RTT RESET 尚无真实夹具，后者仅有状态回归。
 
