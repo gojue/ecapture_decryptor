@@ -956,6 +956,17 @@ func (p *HTTP2StreamParser) eventHeaders(id uint32, client bool, block []byte, f
 		}
 		if !info {
 			half.body = body
+			if body.grpc != nil && client && h.method != "POST" {
+				return errGRPC
+			}
+			if body.grpc != nil && !client && h.headers.Get("Grpc-Status") != "" {
+				if !fin {
+					return errGRPC
+				}
+				if err := body.trailers(h.headers); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	if fin {

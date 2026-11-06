@@ -26,11 +26,12 @@ var ErrHTTPEventLimit = errors.New("HTTP event resource limit exceeded")
 // One output belongs to one connection. The parser serializes its calls and
 // blocking sends propagate backpressure all the way to the capture reader.
 type eventOutput struct {
-	conn      types.ConnectionKey
-	ch        chan *types.DecryptedPacket
-	limit     int64
-	active    map[*eventBody]struct{}
-	inflaters int
+	conn         types.ConnectionKey
+	ch           chan *types.DecryptedPacket
+	limit        int64
+	active       map[*eventBody]struct{}
+	inflaters    int
+	grpcBuffered int
 }
 
 func newEventOutput(conn types.ConnectionKey, ch chan *types.DecryptedPacket, limit int64) *eventOutput {
@@ -46,11 +47,15 @@ type eventBody struct {
 	gzip       bool
 	decoder    *gzipFeed
 	sse        *eventSource
+	grpc       *grpcMessages
 	done       bool
 }
 
 func (o *eventOutput) headers(proto string, id uint64, client bool, at time.Time, h http.Header, meta map[string]any, info bool) (*eventBody, error) {
 	b := &eventBody{out: o, proto: proto, id: id, client: client, at: at}
+	if meta == nil {
+		meta = make(map[string]any)
+	}
 	if !info {
 		if len(o.active) >= 1024 {
 			return nil, ErrHTTPEventLimit
@@ -59,12 +64,20 @@ func (o *eventOutput) headers(proto string, id uint64, client bool, at time.Time
 		coding := strings.TrimSpace(strings.Join(h.Values("Content-Encoding"), ","))
 		b.gzip = o.limit > 0 && strings.EqualFold(coding, "gzip")
 		media, _, _ := mime.ParseMediaType(h.Get("Content-Type"))
+		if proto == "http/2" && isGRPC(media) {
+			if coding != "" && !strings.EqualFold(coding, "identity") {
+				delete(o.active, b)
+				return nil, errGRPC
+			}
+			b.grpc = &grpcMessages{encoding: h.Get("Grpc-Encoding")}
+			if b.grpc.encoding == "" {
+				b.grpc.encoding = "identity"
+			}
+			meta["grpc"] = true
+		}
 		if !client && media == "text/event-stream" && (coding == "" || strings.EqualFold(coding, "identity") || b.gzip) {
 			b.sse = &eventSource{first: true}
 		}
-	}
-	if meta == nil {
-		meta = make(map[string]any)
 	}
 	meta["headers"] = h.Clone()
 	if info {
@@ -104,6 +117,11 @@ func (b *eventBody) decoded(data []byte) error {
 		b.offset += uint64(len(part))
 		if b.sse != nil {
 			if err := b.sse.feed(b, part, start); err != nil {
+				return err
+			}
+		}
+		if b.grpc != nil {
+			if err := b.grpc.feed(b, part, start); err != nil {
 				return err
 			}
 		}
@@ -148,7 +166,17 @@ func (b *eventBody) trailers(h http.Header) error {
 	if err := b.finishCoding(); err != nil {
 		return err
 	}
-	b.emit("trailers", nil, map[string]any{"trailers": h.Clone()}, b.offset)
+	meta := map[string]any{"trailers": h.Clone()}
+	if b.grpc != nil && !b.client {
+		status, err := b.grpc.trailers(h)
+		if err != nil {
+			return err
+		}
+		for k, v := range status {
+			meta[k] = v
+		}
+	}
+	b.emit("trailers", nil, meta, b.offset)
 	return nil
 }
 func (b *eventBody) finish(kind string, meta map[string]any) error {
@@ -160,6 +188,27 @@ func (b *eventBody) finish(kind string, meta map[string]any) error {
 		if err = b.finishCoding(); err != nil {
 			kind = "partial"
 		}
+	}
+	if b.grpc != nil {
+		if kind == "end" {
+			err = b.grpc.complete()
+			if err == nil && !b.client && b.grpc.status == nil {
+				err = errGRPC
+			}
+			if err != nil {
+				kind = "partial"
+			}
+		}
+		if b.grpc.status != nil {
+			if meta == nil {
+				meta = make(map[string]any)
+			}
+			for k, v := range b.grpc.status {
+				meta[k] = v
+			}
+		}
+		b.grpc.release(b)
+		b.grpc = nil
 	}
 	b.stopCoding()
 	b.sse = nil

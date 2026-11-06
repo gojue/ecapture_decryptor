@@ -981,12 +981,10 @@ func (td *TLSDecryptor) recordParserFailure(err error) {
 
 // Called under protocolMu after feeding authenticated application data.
 func (td *TLSDecryptor) checkEventParser() {
-	if td.options.HTTPEvents {
-		if p, ok := td.parser.(interface{ Err() error }); ok {
-			if err := p.Err(); err != nil {
-				td.recordParserFailure(err)
-				td.abortInput()
-			}
+	if p, ok := td.parser.(interface{ Err() error }); ok {
+		if err := p.Err(); err != nil {
+			td.recordParserFailure(err)
+			td.abortInput()
 		}
 	}
 }

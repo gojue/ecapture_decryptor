@@ -235,3 +235,60 @@ func assertTLSBuffersReleased(t *testing.T, decryptor *TLSDecryptor) {
 		t.Fatal("finished TLS decryptor retained buffered input or output")
 	}
 }
+
+func TestTLSWebSocketSplitUpgradeAndMalformedFrame(t *testing.T) {
+	for _, malformed := range []bool{false, true} {
+		synctest.Test(t, func(t *testing.T) {
+			diagnostic := make(chan types.Diagnostic, 8)
+			td, packets := newTLSRawTest(types.DecryptOptions{OnDiagnostic: func(d types.Diagnostic) { diagnostic <- d }})
+			secret := bytes.Repeat([]byte{0x11}, 32)
+			prepareTLS13RawHandshake(t, td, secret)
+			done := make(chan error, 1)
+			go func() { done <- td.Decrypt() }()
+			request := []byte("GET /chat HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
+			for i, part := range [][]byte{request[:4], request[4:35], request[35:]} {
+				if err := td.FeedClient(tls13RawTestRecord(t, secret, uint64(i), part, 0x17)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			response := []byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
+			response = append(response, 0x81, 2, 'o', 'k')
+			if malformed {
+				response[len(response)-4] = 0x83
+			}
+			for i, part := range [][]byte{response[:20], response[20:]} {
+				if err := td.FeedServer(tls13RawTestRecord(t, secret, uint64(i), part, 0x17)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_ = td.Close()
+			err := <-done
+			if (err != nil) != malformed {
+				t.Fatalf("malformed %v: %v", malformed, err)
+			}
+			expected := 3
+			if malformed {
+				expected = 2
+			}
+			if len(packets) != expected {
+				t.Fatalf("got %d packets", len(packets))
+			}
+			for len(packets) > 0 {
+				if packet := <-packets; packet.Protocol != "websocket" {
+					t.Fatal(packet.Protocol)
+				}
+			}
+			if malformed {
+				found := false
+				for len(diagnostic) > 0 {
+					d := <-diagnostic
+					found = found || d.Stage == "protocol" && d.Code == "parse_failed"
+				}
+				if !found {
+					t.Fatal("missing payload-free parser diagnostic")
+				}
+			}
+			assertTLSBuffersReleased(t, td)
+		})
+	}
+}

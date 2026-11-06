@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -445,4 +446,159 @@ func checkRawLongCapture(t *testing.T, base string) {
 	if pos != 17<<20+37 {
 		t.Fatal("raw DATA length", pos)
 	}
+}
+
+func TestWebSocketGRPCCaptureAPIs(t *testing.T) {
+	const keyPath = "test/testdata/websocket_grpc.keys"
+	for _, name := range []string{"websocket", "grpc_h2"} {
+		for _, streaming := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", name, streaming), func(t *testing.T) {
+				options := types.DecryptOptions{HTTPEvents: name == "grpc_h2"}
+				var packets []*types.DecryptedPacket
+				path := "test/testdata/" + name + ".pcapng"
+				if streaming {
+					capture, client, server := quicDSBBlocks(t, path, keyPath)
+					// Non-seek input, with both secrets arriving after the last network packet.
+					capture = append(capture, client...)
+					capture = append(capture, server...)
+					err := DecryptPcapngStreamWithOptions(context.Background(), io.NopCloser(bytes.NewBuffer(capture)), func(p *types.DecryptedPacket) error { packets = append(packets, p); return nil }, options)
+					if err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					keys, err := os.ReadFile(keyPath)
+					if err != nil {
+						t.Fatal(err)
+					}
+					f, err := os.Open(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer f.Close()
+					ch := make(chan *types.DecryptedPacket)
+					done := make(chan struct{})
+					go func() {
+						for p := range ch {
+							packets = append(packets, p)
+						}
+						close(done)
+					}()
+					err = DecryptWithConfig(NewDecryptorConfig().WithSSLKeyLog(bytes.NewReader(keys)).WithPcapReader(f).WithPacketChan(ch).WithOptions(options).WithLogger(log.New(io.Discard, "", 0)))
+					close(ch)
+					<-done
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				counts := map[string]int{}
+				connections := map[string]bool{}
+				messages, ends, controls := 0, 0, 0
+				for _, p := range packets {
+					connections[p.ConnectionID()] = true
+					if name == "websocket" {
+						switch p.Metadata["kind"] {
+						case "upgrade":
+						case "control":
+							controls++
+						case "message":
+							key := p.ConnectionID() + "/" + p.Direction
+							want := strings.Repeat(fmt.Sprintf("websocket-%s-%d-", p.Direction, counts[key]), 100)
+							if string(p.Data) != want || p.Metadata["compressed"] != true {
+								t.Fatalf("WebSocket body mismatch: %v", p.Metadata)
+							}
+							counts[key]++
+							messages++
+						default:
+							t.Fatal(p.Metadata)
+						}
+					} else {
+						id := p.Metadata["stream_id"].(uint64)
+						key := fmt.Sprintf("%s/%d/%s", p.ConnectionID(), id, p.Direction)
+						switch p.Metadata["kind"] {
+						case "grpc_message":
+							text := fmt.Sprintf("%s-%d-%d", p.Direction, id, counts[key])
+							want := append([]byte{0x0a, byte(len(text))}, []byte(text)...)
+							if !bytes.Equal(p.Data, want) || p.Metadata["message_index"] != uint64(counts[key]) {
+								t.Fatalf("gRPC message mismatch: %v", p.Metadata)
+							}
+							counts[key]++
+							messages++
+						case "end":
+							ends++
+							if p.Direction == "response" {
+								want := uint32(0)
+								if id == 3 {
+									want = 5
+								}
+								if id == 9 {
+									want = 13
+								}
+								if p.Metadata["grpc_status"] != want {
+									t.Fatalf("status mismatch: %v", p.Metadata)
+								}
+							}
+						case "headers", "body_chunk", "trailers":
+						default:
+							t.Fatal(p.Metadata)
+						}
+					}
+				}
+				if name == "websocket" {
+					if len(connections) != 2 || messages != 12 || controls < 16 {
+						t.Fatalf("connections=%d messages=%d controls=%d", len(connections), messages, controls)
+					}
+				} else if len(connections) != 1 || messages != 16 || ends != 10 {
+					t.Fatalf("connections=%d messages=%d ends=%d", len(connections), messages, ends)
+				}
+			})
+		}
+	}
+}
+
+func TestGRPCCaptureMessagesBeforeEOF(t *testing.T) {
+	packets, client, server := quicDSBBlocks(t, "test/testdata/grpc_h2.pcapng", "test/testdata/websocket_grpc.keys")
+	synctest.Test(t, func(t *testing.T) {
+		stream := newLiveStreamWithOptions(t, types.DecryptOptions{HTTPEvents: true})
+		data := packets
+		block, checked := 0, 0
+		early := false
+		messages := 0
+		ended := map[string]bool{}
+		for len(data) > 0 {
+			n := int(binary.LittleEndian.Uint32(data[4:8]))
+			stream.write(t, data[:n])
+			data = data[n:]
+			block++
+			if block == 2 {
+				stream.write(t, client)
+				stream.write(t, server)
+			}
+			synctest.Wait()
+			for _, p := range stream.packets[checked:] {
+				key := fmt.Sprintf("%v/%s", p.Metadata["stream_id"], p.Direction)
+				if p.Metadata["kind"] == "end" {
+					ended[key] = true
+				}
+				if p.Metadata["kind"] == "grpc_message" {
+					if ended[key] {
+						t.Fatal("message after end")
+					}
+					messages++
+				}
+			}
+			checked = len(stream.packets)
+			if messages > 0 && messages < 16 {
+				early = true
+			}
+		}
+		stream.assertOpen(t)
+		if !early || messages != 16 {
+			t.Fatalf("incremental=%t messages=%d", early, messages)
+		}
+		_ = stream.writer.Close()
+		synctest.Wait()
+		if err := <-stream.done; err != nil {
+			t.Fatal(err)
+		}
+	})
 }

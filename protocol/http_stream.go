@@ -35,6 +35,8 @@ type HTTPStreamParser struct {
 	currentRespData bytes.Buffer
 	parseErr        error
 	events          *http1Events
+	websocket       *WebSocketStreamParser
+	skipWebSocket   bool
 }
 
 const maxHTTPMessageBytes = 16 << 20
@@ -42,6 +44,9 @@ const maxHTTPMessageBytes = 16 << 20
 func (p *HTTPStreamParser) Err() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.parseErr == nil && p.websocket != nil {
+		return p.websocket.Err()
+	}
 	return p.parseErr
 }
 
@@ -52,6 +57,9 @@ func NewHTTPStreamParser(ci types.ConnectionKey, packetChan chan *types.Decrypte
 func (p *HTTPStreamParser) SetPacketTime(t time.Time) {
 	p.mu.Lock()
 	p.packetTime = t
+	if p.websocket != nil {
+		p.websocket.SetPacketTime(t)
+	}
 	p.mu.Unlock()
 }
 
@@ -59,6 +67,11 @@ func (p *HTTPStreamParser) FeedRequest(data []byte) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.parseErr != nil {
+		return
+	}
+	if p.websocket != nil {
+		p.websocket.FeedRequest(data)
+		p.adoptWebSocketFallback()
 		return
 	}
 	if p.events != nil {
@@ -83,6 +96,11 @@ func (p *HTTPStreamParser) FeedResponse(data []byte) {
 	if p.parseErr != nil {
 		return
 	}
+	if p.websocket != nil {
+		p.websocket.FeedResponse(data)
+		p.adoptWebSocketFallback()
+		return
+	}
 	if p.events != nil {
 		p.parseErr = p.events.feed(false, data, p.packetTime)
 		return
@@ -96,12 +114,44 @@ func (p *HTTPStreamParser) FeedResponse(data []byte) {
 	p.parseResponses(false)
 }
 
+// Flatten a rejected upgrade back into this parser so repeated failed upgrades
+// on a keepalive connection cannot accumulate nested parser history.
+func (p *HTTPStreamParser) adoptWebSocketFallback() {
+	p.websocket.mu.Lock()
+	fallback := p.websocket.httpFallback
+	p.websocket.mu.Unlock()
+	if fallback == nil {
+		return
+	}
+	fallback.mu.Lock()
+	defer fallback.mu.Unlock()
+	p.pendingReqs = fallback.pendingReqs
+	p.currentReqData = fallback.currentReqData
+	p.currentRespData = fallback.currentRespData
+	p.requestStart = fallback.requestStart
+	p.parseErr = fallback.parseErr
+	p.websocket = fallback.websocket
+}
+
 func (p *HTTPStreamParser) parseRequests() {
 	for p.currentReqData.Len() > 0 {
 		data := p.currentReqData.Bytes()
 		reader := bufio.NewReader(bytes.NewReader(data))
 		req, err := http.ReadRequest(reader)
 		if err != nil {
+			return
+		}
+		if !p.skipWebSocket && headerToken(req.Header, "Upgrade", "websocket") {
+			if len(p.pendingReqs) != 0 {
+				return
+			}
+			p.websocket = NewWebSocketStreamParser(p.connectionInfo, p.packetChan)
+			p.websocket.SetPacketTime(p.packetTime)
+			p.websocket.FeedRequest(data)
+			p.websocket.FeedResponse(p.currentRespData.Bytes())
+			p.currentReqData = bytes.Buffer{}
+			p.currentRespData = bytes.Buffer{}
+			p.adoptWebSocketFallback()
 			return
 		}
 		if _, err := io.ReadAll(req.Body); err != nil {
@@ -170,6 +220,10 @@ func (p *HTTPStreamParser) parseResponses(final bool) {
 		p.pendingReqs = p.pendingReqs[1:]
 		p.currentRespData.Next(consumed)
 	}
+	if len(p.pendingReqs) == 0 && IsWebSocketUpgrade(p.currentReqData.Bytes()) {
+		p.parseRequests()
+	}
+
 }
 
 func (p *HTTPStreamParser) FinishHTTPEvents(reason string) {
@@ -189,6 +243,10 @@ func (p *HTTPStreamParser) FinishHTTPEvents(reason string) {
 func (p *HTTPStreamParser) Flush() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.websocket != nil {
+		p.websocket.Flush()
+		return
+	}
 	if p.events != nil {
 		reason := ""
 		if p.parseErr != nil {
