@@ -298,7 +298,7 @@ raw 的 rejected/unknown early assembler 与正常 STREAM 分开，各受现有 
 独立真实夹具与固定向量覆盖 v1/v2 × AES-128-GCM/AES-256-GCM/ChaCha20-Poly1305。
 实际 18 条连接产生 24 次请求/响应，其中 6 条经过迁移，6 条接受 early data，6 条拒绝后
 以 1-RTT 重传；文件、内嵌 DSB、末尾 DSB 和 raw/messages 回放相互核对。
-另有独立 v1/v2、AES-128-GCM 的 Retry＋0-RTT 夹具：各版本 seed/accepted/rejected，四条 early 连接在 Retry 前后使用同一 ClientHello/early key，改用新 DCID/token，包号不回退；拒绝后以 1-RTT 重发，raw 独立保留 rejected 字节，业务消息只交付一次。固定 aioquic 版本的测试适配保留握手状态并通过其原生丢包回调重排待重传内容，详情见 fixture 说明；SDK 不因此放宽认证。该组合未实测其他套件，draft-29 仍未通过真实捕获验证。
+另有独立 v1/v2 × AES-128-GCM/AES-256-GCM/ChaCha20-Poly1305 的 Retry＋0-RTT 夹具：各版本/套件 seed/accepted/rejected，共 18 条连接，其中 12 条 early 连接在 Retry 前后使用同一 ClientHello/early key，改用新 DCID/token，包号不回退；拒绝后以 1-RTT 重发，raw 独立保留 rejected 字节，业务消息只交付一次。固定 aioquic 版本的测试适配保留握手状态并通过其原生丢包回调重排待重传内容，详情见 fixture 说明；SDK 不因此放宽认证。上述六个版本/套件单元同时覆盖 early 与握手密钥迟到、拒绝后的独立 raw 空间；draft-29 仍未通过真实捕获验证。
 
 
 ---
@@ -635,24 +635,27 @@ TCP TLS 接受 TLS 1.2/1.3，必须有捕获到的 ClientHello、ServerHello 和
 | 版本 / 套件 | 本仓库证据与范围 |
 | --- | --- |
 | TLS 1.3 AES-128-GCM/SHA256、AES-256-GCM/SHA384、ChaCha20-Poly1305/SHA256 | 三套件独立 KeyUpdate 派生向量、状态单测与真实 OpenSSL 抓包；每方向多次更新及 request_update，文件/尾部 DSB、messages/raw/HTTPEvents 逐字节回归。 |
-| TLS 1.3 AES-128-GCM/SHA256 | 独立真实 HRR、PSK 恢复、accepted/rejected early data、GREASE、HRR 强制拒绝 early；Go 对端实际 ECH 接受/拒绝及各自与 HRR 的组合。其他套件的这些状态组合不由 KeyUpdate 实测外推。 |
+| TLS 1.3 三套件状态矩阵 | 独立 OpenSSL 实测 HRR 拒绝 early、无 early 的 HRR 后 PSK 恢复、ECH＋HRR、ECH 接受且 HRR 拒绝 early 的三重组合。另有 AES-128 early → ChaCha20/AES-256 最终套件的 HRR 完整握手回退；不代表跨套件 PSK 恢复。 |
+| TLS 1.3 AES-128-GCM/SHA256 | 独立真实普通 PSK 恢复、accepted/rejected early data、GREASE；Go 对端 ECH 接受/拒绝及各自与 HRR 的组合；OpenSSL 实测 ECH 拒绝且已发送 early、Inner/Outer 分别索引。ECH 拒绝＋HRR＋early 尚无合法真实夹具。 |
 | TLS 1.2 AES-GCM/SHA256、AES-GCM/SHA384 | 独立双向记录向量覆盖 RSA、ECDHE-RSA、ECDHE-ECDSA 的对应记录算法；新增 ECDHE-RSA-AES256-GCM-SHA384 完整连接及恢复真实抓包。相同记录算法不等于已实测全部握手组合。 |
 | TLS 1.2 AES-CBC/SHA、ChaCha20-Poly1305 | 有注册项/记录实现，尚未补齐独立实际状态矩阵；不承诺 Encrypt-then-MAC、重协商或任意组合可用。 |
 | TLS 1.0/1.1、TLS 1.3 以外的 KeyUpdate | 不支持；旧版本被明确拒绝。 |
 
 **TLS 1.3 KeyUpdate。** 使用初始 `CLIENT_TRAFFIC_SECRET_0` / `SERVER_TRAFFIC_SECRET_0`，收到当前方向已认证的完整 KeyUpdate 后，以 `traffic upd` 派生下一代 secret、key 和 IV，并将该方向 record 序号重置为 0；另一方向不跟随改变。`request_update` 只表示对端应答义务，被动解密器不发回复，也不提前替对端换代。只保留当前代，不接受 QUIC 式旧代回退；TCP 重传仍由 TCP 重组去重。坏认证、非法长度/请求值及跨越换代边界的内容不会推进代次。诊断为 `decrypt/key_update` / `key_update_requested`，不携带 secret。
 
-**握手分帧与恢复。** 握手头可逐字节跨 record，单 record 可含多条消息；保留尾部，完整 Finished/KeyUpdate 到达才切换。每方向增量握手消息最多 1 MiB，明文 hello 读取还限制为 4,096 个 record；不增加无界累计历史。HRR 消费第二个 ClientHello 和最终 ServerHello，拒绝重复 HRR、版本/套件改变及 CH2 的 early_data 扩展。TLS 1.2/1.3 恢复仍需要当前连接 random 对应的 master/application secrets，不从 ticket 自行恢复密钥。支持 HRR＋普通 early data、ECH＋HRR 两组；ECH＋HRR＋early 三者组合仍明确报 `handshake/unsupported_handshake`。不宣称支持重协商或 post-handshake authentication。
+**握手分帧与恢复。** 握手头可逐字节跨 record，单 record 可含多条消息；保留尾部，完整 Finished/KeyUpdate 到达才切换。每方向增量握手消息最多 1 MiB，明文 hello 读取还限制为 4,096 个 record；不增加无界累计历史。HRR 消费第二个 ClientHello 和最终 ServerHello，拒绝重复 HRR、版本/套件改变及有效 CH2 的 early_data 扩展；接受 ECH 时检查已认证的 Inner CH2，Outer CH2 可按 RFC 9849 复制该扩展。TLS 1.2/1.3 恢复仍需要当前连接 random 对应的 master/application secrets，不从 ticket 自行恢复密钥。支持 HRR＋普通 early data、ECH＋HRR 及 ECH 接受的三重组合。不宣称支持重协商或 post-handshake authentication。
 
-**TLS early data。** ClientHello 的 early_data offer 启用独立客户端 early 阶段，需 `CLIENT_EARLY_TRAFFIC_SECRET`；普通流程用服务端 handshake secret 认证的 EncryptedExtensions 确认接受/拒绝；HRR 则强制拒绝 early data。EndOfEarlyData 在 early 密钥下认证，完整消息到达后切换至 handshake 阶段；确认接受但缺失该边界会报错。正常应用消息及 HTTPEvents 仅交付确认接受的 early 字节，拒绝的 early 不进入应用 parser，后续 1-RTT 重发按正常数据处理。raw 保留已认证的 early：`encryption_level="0rtt"`，`early_data="accepted"|"rejected"|"unknown"`；该连接的正常 raw 标记 `encryption_level="1rtt"`。accepted early 与正常 request 共用连续 offset，rejected/unknown early 有独立的 request offset，不能拼接成已接受的正文。认证解密不保证服务端实际执行业务或防重放。
+**TLS early data。** ClientHello 的 early_data offer 启用独立客户端 early 阶段，需 `CLIENT_EARLY_TRAFFIC_SECRET`；普通流程用服务端 handshake secret 认证的 EncryptedExtensions 确认接受/拒绝；HRR 则强制拒绝 early data。EndOfEarlyData 在 early 密钥下认证，完整消息到达后切换至 handshake 阶段；确认接受但缺失该边界，或已拒绝却出现该消息，均会报错。正常应用消息及 HTTPEvents 仅交付确认接受的 early 字节，拒绝的 early 不进入应用 parser，后续 1-RTT 重发按正常数据处理。raw 保留已认证的 early：`encryption_level="0rtt"`，`early_data="accepted"|"rejected"|"unknown"`；该连接的正常 raw 标记 `encryption_level="1rtt"`。accepted early 与正常 request 共用连续 offset，rejected/unknown early 有独立的 request offset，不能拼接成已接受的正文。认证解密不保证服务端实际执行业务或防重放。
 
-HRR 前已发送的 early record 按 TLS record 边界保留，最多 8 MiB，并与读取 CH2 共用原有 4,096 条 record 上限；不扫描密文寻找 ClientHello。它们仅用 early secret 认证并以 rejected raw 输出，不进入应用 parser；CH2 后从握手阶段处理，禁止 early/EndOfEarlyData 或 EE 再次接受 early。独立 OpenSSL HRR 夹具最终使用完整握手而非 PSK 恢复，真实证据不外推为 HRR 后恢复的完整套件矩阵。
+HRR 前已发送的 early record 按 TLS record 边界保留，最多 8 MiB，并与读取 CH2 共用原有 4,096 条 record 上限；不扫描密文寻找 ClientHello。它们仅用 early secret 认证并以 rejected raw 输出，不进入应用 parser；CH2 后从握手阶段处理，禁止 early/EndOfEarlyData 或 EE 再次接受 early。被拒绝的 early 可使用旧 ticket 的套件，与最终 ServerHello 不同；根据 early secret 的 hash 长度，仅尝试三种已支持 TLS 1.3 套件中的兼容候选（最多两个），首次 AEAD 认证后固定套件及序号。接受 early 时仍要求其套件与 ServerHello 相同；失败认证不推进序号。
 
-缺少 early/handshake secrets 时保留有界密文，并由 keylog/末尾 DSB 唤醒；待接受状态确定的客户端明文最多 8 MiB/65,536 块，仍受初始 `KeyWaitTimeout` 总期限约束。未知接受状态在 EOF/期限到达时报告 `handshake/early_data_unknown` 并返回错误；raw 可保留标记 unknown 的已认证字节，应用模式不交付可能跨阶段的客户端消息。缺 early secret 不伪造解密结果，会返回错误；可认证的其他方向数据仍按原契约保留。
+缺少 early/handshake secrets 时保留有界密文，并由 keylog/末尾 DSB 唤醒；已从输入取出的待定 early record 最多一条（含头最多 65,540 字节），不能因 EE 拒绝便丢弃。只有 offer、未实际发送 early 时，可直接认证 handshake record，无需等待不存在的 early key。待接受状态确定的客户端明文最多 8 MiB/65,536 块，仍受初始 `KeyWaitTimeout` 总期限约束。未知接受状态在 EOF/期限到达时报告 `handshake/early_data_unknown` 并返回错误；raw 可保留标记 unknown 的已认证字节，应用模式不交付可能跨阶段的客户端消息。实际 early record 缺 secret 不伪造解密结果，会返回错误；可认证的其他方向数据仍按原契约保留。
 
 **ECH 输入。** 按 [RFC 9850](https://www.rfc-editor.org/rfc/rfc9850.html#section-2.3)，`ECH_SECRET` 是 HPKE 的 KEM shared_secret，`ECH_CONFIG` 是单个 ECHConfig 的编码，两者必须用 **Outer ClientHello random** 索引；它们不是 TLS application secret 或 Inner random。当前支持 RFC 9849 ECH、X25519/HKDF-SHA256/AES-128-GCM HPKE（不代表 TLS record 必须用同一套件）。认证解开 payload、恢复 outer_extensions 并校验 ServerHello 的 accept_confirmation 后，接受时才改用 Inner random 查找 TLS secrets，拒绝时继续用 Outer random。ECH＋HRR 用 CH1 的 Outer random 查找 ECH 材料；接受时验证两次 payload（HPKE sequence 0/1）、HRR 的 `hrr ech accept confirmation` 和最终 ServerHello 的确认，transcript 按 `message_hash(CH1)` 重建，CH2 的 enc 为空且 Inner random 不变。拒绝/GREASE 的 CH2 保留完整原 ECH 扩展与 Outer random；缺 ECH 材料只允许该外层候选在 record 认证后标记未接受/未知，不推测 Inner random。损坏或错误关联、缺信息及其他 HPKE 参数都不会触发随机 secret 扫描。
 
-若仅有 Outer random 下的 TLS secrets、没有完整 ECH 标签，可尝试外层解密；只有 record 认证成功后才报告 `handshake/ech_not_accepted_or_grease`，不能据此区分真实拒绝与 GREASE。完全没有认证结果则报告 `ech_unknown`；有完整证据时为 `ech_accepted` / `ech_rejected`，ECH 解码失败为 `ech_unavailable`。缺少关联或必要 traffic secrets 保留终止错误，不输出未经认证的应用字节。普通 application-only keylog 仍可跳过有限的不可解 handshake record；始终未认证任何 application 候选时以 `decrypt/no_authenticated_application_data` 返回错误，不发送正常 raw 结束标记。
+ECH 的 early secret 始终按已认证 CH1 的 **Inner random** 查找，即使服务端拒绝 ECH、后续 handshake/application 改用 Outer random。ECH 接受＋HRR 的 Outer CH2 可保留 early_data，但 Inner CH2 必须移除；两次 ECH payload 及两次确认均需通过。实际 OpenSSL ECH 拒绝会在客户端导出 application secret 前中止；若已具备 Inner early 和 Outer 双向 handshake/server application secrets，可交付经认证的 rejected raw，仍报告 `handshake/ech_rejected` 及终止错误，不伪造 client application secret 或成功连接。
+
+若仅有 Outer random 下的 TLS secrets、没有完整 ECH 标签，可尝试外层解密；带 early offer 的 GREASE 外层候选还需 Outer 的 early、双向 handshake 和 application secrets。只有 record 认证成功后才报告 `handshake/ech_not_accepted_or_grease`，不能据此区分真实拒绝与 GREASE。完全没有认证结果则报告 `ech_unknown`；有完整证据时为 `ech_accepted` / `ech_rejected`，ECH 解码失败为 `ech_unavailable`。缺少关联或必要 traffic secrets 保留终止错误，不输出未经认证的应用字节。普通 application-only keylog 仍可跳过有限的不可解 handshake record；始终未认证任何 application 候选时以 `decrypt/no_authenticated_application_data` 返回错误，不发送正常 raw 结束标记。
 
 缺握手、中途接入、截断或丢失 record 无法保证恢复：分别保留 `missing_client_hello` / `invalid_server_hello`、`truncated_record` / `truncated_handshake`、认证或缺 secret 诊断及终止错误。SDK 不补猜缺失的 TLS 序号。规范依据 [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446.html)、[RFC 9849](https://www.rfc-editor.org/rfc/rfc9849.html)；[独立 TLS 发生器与复现方法](../test/fixtures/http_tcp_capture/README.md#d10-tls-state-fixtures)说明各项实测边界。
 

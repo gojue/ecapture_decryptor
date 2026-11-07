@@ -1383,6 +1383,338 @@ func TestD10TLSCaptureAPIs(t *testing.T) {
 	}
 }
 
+func TestTLSStateMatrixCaptureAPIs(t *testing.T) {
+	for _, fixture := range []string{"resumption", "ech_early"} {
+		t.Run(fixture, func(t *testing.T) { testTLSStateMatrixCapture(t, fixture) })
+	}
+}
+
+func testTLSStateMatrixCapture(t *testing.T, fixture string) {
+	t.Helper()
+	path := "test/testdata/d10_" + fixture + "_matrix.pcapng"
+	keys, err := os.ReadFile("test/testdata/d10_" + fixture + "_matrix.keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type scenario struct {
+		mode                             string
+		port                             uint32
+		count                            int
+		early, hrr, resumed, rejectedECH bool
+	}
+	cases := []scenario{
+		{"hrr_early_aes128", 44482, 2, true, true, false, false}, {"hrr_early_aes256", 44483, 2, true, true, false, false}, {"hrr_early_chacha", 44484, 2, true, true, false, false},
+		{"hrr_psk_aes128", 44485, 2, false, true, true, false}, {"hrr_psk_aes256", 44486, 2, false, true, true, false}, {"hrr_psk_chacha", 44487, 2, false, true, true, false},
+		{"hrr_early_switch_chacha", 44488, 2, true, true, false, false}, {"hrr_early_switch_aes256", 44489, 2, true, true, false, false},
+	}
+	if fixture == "ech_early" {
+		cases = []scenario{
+			{"ech_hrr_aes128", 44490, 1, false, true, false, false}, {"ech_hrr_aes256", 44491, 1, false, true, false, false}, {"ech_hrr_chacha", 44492, 1, false, true, false, false},
+			{"ech_hrr_early_aes128", 44493, 2, true, true, true, false}, {"ech_hrr_early_aes256", 44494, 2, true, true, true, false}, {"ech_hrr_early_chacha", 44495, 2, true, true, true, false},
+			{"ech_rejected_early_aes128", 44496, 2, true, false, false, true},
+		}
+	}
+	for _, output := range []string{"messages", "raw", "events"} {
+		var reference map[string]string
+		inputs := []string{"file", "late_early", "late_handshake"}
+		if fixture == "ech_early" {
+			inputs = append(inputs, "late_ech")
+		}
+		for _, input := range inputs {
+			t.Run(output+"/"+input, func(t *testing.T) {
+				type exchange struct {
+					port                     uint32
+					request, response, early []byte
+					bodyOffset               [2]uint64
+					headers, ends, messages  [2]int
+					rawEnds                  [2]int
+				}
+				check := func(t *testing.T, packets []*types.DecryptedPacket, final bool) map[string]string {
+					t.Helper()
+					got := map[string]*exchange{}
+					for _, p := range packets {
+						port := p.DstPort
+						if p.Direction == "response" {
+							port = p.SrcPort
+						} else if p.Direction != "request" {
+							t.Fatal("invalid direction", p.Direction)
+						}
+						e := got[p.ConnectionID()]
+						if e == nil {
+							e = &exchange{port: port}
+							got[p.ConnectionID()] = e
+						}
+						if p.Transport != "tcp" || p.SrcIP != "127.0.0.1" || p.DstIP != "127.0.0.1" {
+							t.Fatal("fixture endpoints changed")
+						}
+						if e.port != port {
+							t.Fatal("connection crossed fixture endpoints")
+						}
+						if p.Metadata["encryption_level"] == "0rtt" {
+							if output != "raw" || p.Protocol != "tls" || p.Direction != "request" || p.Metadata["early_data"] != "rejected" || p.Metadata["offset"] != uint64(len(e.early)) || p.Metadata["kind"] != "stream_chunk" || p.Metadata["end"] != false {
+								t.Fatal("rejected early data entered accepted output", p.Metadata)
+							}
+							e.early = append(e.early, p.Data...)
+							continue
+						}
+						data, direction := &e.request, 0
+						if p.Direction == "response" {
+							data, direction = &e.response, 1
+						}
+						if output == "raw" {
+							if p.Protocol != "tls" || p.Metadata["offset"] != uint64(len(*data)) || p.Metadata["early_data"] != nil || e.rawEnds[direction] != 0 {
+								t.Fatal("normal raw bytes lost their independent offset", p.Metadata)
+							}
+							if p.Metadata["encryption_level"] != nil && p.Metadata["encryption_level"] != "1rtt" {
+								t.Fatal("normal raw chunk has an invalid encryption level")
+							}
+							if p.Metadata["kind"] == "stream_end" {
+								if p.Metadata["end"] != true || len(p.Data) != 0 {
+									t.Fatal("invalid raw end marker", p.Metadata)
+								}
+								e.rawEnds[direction]++
+								continue
+							}
+							if p.Metadata["kind"] != "stream_chunk" || p.Metadata["end"] != false {
+								t.Fatal("invalid raw chunk", p.Metadata)
+							}
+						} else if p.Protocol != "http/1.1" {
+							t.Fatal("unexpected application protocol", p.Protocol)
+						}
+						if output == "events" {
+							if e.ends[direction] != 0 {
+								t.Fatal("HTTP event after direction ended")
+							}
+							if p.Metadata["kind"] != "headers" && e.headers[direction] != 1 {
+								t.Fatal("HTTP event before headers")
+							}
+							switch p.Metadata["kind"] {
+							case "headers":
+								e.headers[direction]++
+								if e.headers[direction] != 1 || p.Direction == "response" && p.Metadata["status"] != 200 {
+									t.Fatal("duplicate headers or incorrect response status")
+								}
+								if p.Direction == "request" {
+									e.request = fmt.Appendf(e.request, "%v\n", p.Metadata["url"])
+								}
+							case "body_chunk":
+								if p.Metadata["offset"] != e.bodyOffset[direction] {
+									t.Fatal("HTTP body offset changed", p.Metadata)
+								}
+								e.bodyOffset[direction] += uint64(len(p.Data))
+								*data = append(*data, p.Data...)
+							case "end":
+								e.ends[direction]++
+							default:
+								t.Fatal("unexpected HTTP event", p.Metadata)
+							}
+						} else {
+							e.messages[direction]++
+							*data = append(*data, p.Data...)
+						}
+					}
+					wantConnections := 0
+					for _, tc := range cases {
+						wantConnections += tc.count
+						if tc.rejectedECH && output != "raw" {
+							wantConnections--
+						}
+					}
+					if len(got) != wantConnections {
+						t.Fatalf("connections=%d, want %d", len(got), wantConnections)
+					}
+					normalized := map[string]string{}
+					for _, tc := range cases {
+						for index := 0; index < tc.count; index++ {
+							rejected := tc.rejectedECH && index == 1
+							if rejected && output != "raw" {
+								continue
+							}
+							request, response, body := d10HTTP(tc.mode, index)
+							var early []byte
+							if output == "raw" && tc.early && index == 1 {
+								early = request
+							}
+							if output == "events" {
+								request = fmt.Appendf(nil, "/d10/%s/%d\n", tc.mode, index)
+								response = body
+							}
+							if rejected {
+								request, response = nil, nil
+							}
+							matched := false
+							for id, e := range got {
+								if e.port == tc.port && bytes.Equal(e.request, request) && bytes.Equal(e.response, response) && bytes.Equal(e.early, early) && (output != "events" || e.ends == [2]int{1, 1}) && (output != "messages" || e.messages == [2]int{1, 1}) && (output != "raw" || !final || rejected || e.rawEnds == [2]int{1, 1}) {
+									if rejected && e.rawEnds != [2]int{} {
+										t.Fatal("incomplete ECH rejection emitted a normal raw end")
+									}
+									normalized[fmt.Sprintf("%s/%d", tc.mode, index)] = id
+									delete(got, id)
+									matched = true
+									break
+								}
+							}
+							if !matched {
+								t.Fatalf("missing exact %s/%d exchange or rejected early bytes", tc.mode, index)
+							}
+						}
+					}
+					return normalized
+				}
+				var mu sync.Mutex
+				diagnostics := map[string]map[string]int{}
+				options := types.DecryptOptions{RawChunks: output == "raw", HTTPEvents: output == "events", OnDiagnostic: func(d types.Diagnostic) {
+					mu.Lock()
+					defer mu.Unlock()
+					if diagnostics[d.ConnectionID] == nil {
+						diagnostics[d.ConnectionID] = map[string]int{}
+					}
+					diagnostics[d.ConnectionID][d.Code]++
+				}}
+				var packets []*types.DecryptedPacket
+				if input == "file" {
+					packets, err = decryptTLSCapture(t, path, keys, options)
+					if (err != nil) != (fixture == "ech_early") {
+						t.Fatal(err)
+					}
+				} else {
+					var groups [4][]byte
+					for _, line := range bytes.Split(keys, []byte{'\n'}) {
+						f := bytes.Fields(line)
+						if len(f) != 3 || f[0][0] == '#' {
+							continue
+						}
+						group := 1
+						if strings.HasSuffix(string(f[0]), "TRAFFIC_SECRET_0") {
+							group = 0
+						} else if string(f[0]) == "CLIENT_EARLY_TRAFFIC_SECRET" {
+							group = 2
+						} else if strings.HasPrefix(string(f[0]), "ECH_") {
+							group = 3
+						}
+						groups[group] = append(groups[group], append(bytes.Clone(line), '\n')...)
+					}
+					if input == "late_handshake" {
+						groups[1], groups[2] = groups[2], groups[1]
+					}
+					ordered := [][]byte{groups[0], groups[1], groups[2], groups[3]}
+					if fixture == "ech_early" && input != "late_ech" {
+						ordered = [][]byte{groups[3], groups[0], groups[1], groups[2]}
+					}
+					synctest.Test(t, func(t *testing.T) {
+						stream := newLiveStreamWithOptions(t, options)
+						stream.write(t, capture)
+						synctest.Wait()
+						if len(stream.packets) != 0 {
+							t.Fatal("output without secrets")
+						}
+						for i, group := range ordered {
+							if len(group) == 0 {
+								continue
+							}
+							stream.write(t, tlsFixtureDSB(t, group))
+							synctest.Wait()
+							stream.assertOpen(t)
+							if input == "late_ech" && i < len(ordered)-1 && len(stream.packets) != 0 {
+								t.Fatal("ECH output before authenticated random association")
+							}
+						}
+						check(t, stream.packets, false)
+						before := len(stream.packets)
+						stream.write(t, tlsFixtureDSB(t, keys))
+						synctest.Wait()
+						if len(stream.packets) != before {
+							t.Fatal("duplicate DSB repeated output")
+						}
+						if err := stream.writer.Close(); err != nil {
+							t.Fatal(err)
+						}
+						synctest.Wait()
+						if err := <-stream.done; (err != nil) != (fixture == "ech_early") {
+							t.Fatal(err)
+						}
+						if output != "raw" && len(stream.packets) != before {
+							t.Fatal("complete HTTP output delayed until EOF")
+						}
+						for _, p := range stream.packets[before:] {
+							if output != "raw" || p.Metadata["kind"] != "stream_end" {
+								t.Fatal("data delayed until EOF")
+							}
+						}
+						packets = stream.packets
+					})
+				}
+				got := check(t, packets, true)
+				mu.Lock()
+				for _, tc := range cases {
+					for index := 0; index < tc.count; index++ {
+						if tc.rejectedECH && index == 1 && output != "raw" {
+							continue
+						}
+						d := diagnostics[got[fmt.Sprintf("%s/%d", tc.mode, index)]]
+						hrr, resumed := 0, 0
+						if tc.hrr && (tc.count == 1 || index == 1) {
+							hrr = 1
+						}
+						if tc.resumed && index == 1 {
+							resumed = 1
+						}
+						if d["hello_retry_request"] != hrr || d["session_resumed"] != resumed {
+							t.Errorf("%s/%d HRR/resumption state: %v", tc.mode, index, d)
+						}
+						if fixture == "ech_early" {
+							want := "ech_accepted"
+							if tc.rejectedECH && index == 1 {
+								want = "ech_rejected"
+							}
+							if d[want] == 0 {
+								t.Errorf("missing definitive %s for %s/%d", want, tc.mode, index)
+							}
+						}
+					}
+				}
+				accepted, rejected := 0, 0
+				for _, d := range diagnostics {
+					if d["ech_accepted"] > 0 {
+						accepted++
+					}
+					if d["ech_rejected"] > 0 {
+						rejected++
+					}
+					if d["ech_accepted"] > 0 && d["ech_rejected"] > 0 {
+						t.Error("ECH connection changed acceptance state")
+					}
+					if d["ech_rejected"] == 0 {
+						for _, code := range []string{"missing_secret", "ech_unavailable", "ech_unknown", "no_authenticated_application_data"} {
+							if d[code] != 0 {
+								t.Errorf("completed connection reported %s", code)
+							}
+						}
+					}
+					for _, code := range []string{"authentication_failed", "invalid_handshake", "invalid_secret", "resource_limit", "truncated_record"} {
+						if d[code] != 0 {
+							t.Errorf("unexpected matrix diagnostic %s", code)
+						}
+					}
+				}
+				if fixture == "ech_early" && (accepted != 10 || rejected != 1) {
+					t.Errorf("ECH outcomes accepted/rejected=%d/%d", accepted, rejected)
+				}
+				mu.Unlock()
+				if reference == nil {
+					reference = got
+				} else if !reflect.DeepEqual(reference, got) {
+					t.Fatal("connection identity changed across APIs")
+				}
+			})
+		}
+	}
+}
+
 func TestD10TLSCaptureInvalidSecrets(t *testing.T) {
 	for _, name := range []string{"wrong_application", "wrong_application_only", "wrong_handshake", "missing_ech", "wrong_ech", "wrong_ech_random", "ech_outer_unconfirmed", "missing_ech_hrr", "wrong_ech_hrr", "wrong_ech_random_hrr", "ech_outer_unconfirmed_hrr"} {
 		t.Run(name, func(t *testing.T) {

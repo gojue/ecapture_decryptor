@@ -6,6 +6,7 @@ package transport
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -26,15 +27,55 @@ var errTLS13Handshake = errors.New("invalid TLS 1.3 handshake phase")
 // Each state is owned by its direction's process lock. Early acceptance/output
 // has a separate lock; no direction ever acquires the opposite direction lock.
 type tls13Direction struct {
-	phase         int
-	handshake     crypto.HandshakeAssembler
-	early         *crypto.RecordDecryptor
-	waiting       bool
-	finished      bool
-	ee            bool
-	skipped       int
-	generation    uint64
-	authenticated bool
+	phase           int
+	handshake       crypto.HandshakeAssembler
+	early           *crypto.RecordDecryptor
+	earlyCandidates []tlsEarlyKey
+	pendingRecord   []byte // At most one uint16-length TLS record awaiting its early key.
+	waiting         bool
+	finished        bool
+	ee              bool
+	skipped         int
+	generation      uint64
+	authenticated   bool
+}
+
+type tlsEarlyKey struct {
+	suite     uint16
+	decryptor *crypto.RecordDecryptor
+}
+
+func (s *tls13Direction) earlyKeysReady() bool {
+	return s.early != nil || len(s.earlyCandidates) != 0
+}
+
+// A rejected offer may use a different ticket cipher from ServerHello. NSS
+// does not name that cipher: try only the three supported TLS 1.3 suites whose
+// hash matches the secret length, and retain only the first authenticated key.
+func (td *TLSDecryptor) decryptTLS13Early(record []byte) ([]byte, byte, error) {
+	s := &td.tls13[0]
+	if s.early != nil {
+		return s.early.Decrypt(record)
+	}
+	err := errors.New("TLS early traffic secret unavailable")
+	for _, candidate := range s.earlyCandidates {
+		var plaintext []byte
+		var typ byte
+		plaintext, typ, err = candidate.decryptor.Decrypt(record)
+		if err != nil {
+			continue
+		}
+		td.earlyMu.Lock()
+		invalid := td.earlyStatus == "accepted" && candidate.suite != td.cipherSuite
+		td.earlyCipherSuite = candidate.suite
+		td.earlyMu.Unlock()
+		if invalid {
+			return nil, 0, errTLS13Handshake
+		}
+		s.early, s.earlyCandidates = candidate.decryptor, nil
+		return plaintext, typ, nil
+	}
+	return nil, 0, err
 }
 
 type tlsEarlyChunk struct {
@@ -80,7 +121,10 @@ func (td *TLSDecryptor) resolveTLSEarly(status string) error {
 	if td.earlyStatus != "" {
 		return nil
 	}
-	if status == "accepted" && td.earlyHandshakeWithoutEnd {
+	if status == "rejected" && td.earlyEndSeen {
+		return errTLS13Handshake
+	}
+	if status == "accepted" && (td.echRejected || td.earlyHandshakeWithoutEnd || td.earlyCipherSuite != 0 && td.earlyCipherSuite != td.cipherSuite) {
 		return errTLS13Handshake
 	}
 	td.earlyStatus = status
@@ -110,8 +154,8 @@ func (td *TLSDecryptor) tls13Fail(stage, code string, err error) {
 }
 
 // refreshTLS13Keys is called under one direction lock. Missing early/handshake
-// keys leave ciphertext in the existing bounded StreamBuffer until key updates
-// wake the worker, or finalization reports the unavailable boundary.
+// keys leave ciphertext in the bounded input/retry buffers and one pending
+// record until updates wake the worker or finalization reports the boundary.
 func (td *TLSDecryptor) refreshTLS13Keys(client bool) error {
 	secrets := td.keyLog.GetSecrets(td.clientRandom)
 	if secrets == nil {
@@ -135,12 +179,25 @@ func (td *TLSDecryptor) refreshTLS13Keys(client bool) error {
 			td.tls13[i].phase = tls13Handshake
 		}
 	}
-	if client && td.earlyOffered && td.tls13[0].early == nil && len(secrets.ClientEarlyTrafficSecret) > 0 && (td.tls13[0].phase == tls13Early || len(td.retryEarlyRecords) > 0) {
-		next, err := crypto.NewRecordDecryptor(td.version, td.cipherSuite, secrets.ClientEarlyTrafficSecret)
-		if err != nil {
-			return err
+	earlySecrets := secrets
+	if client && len(td.earlyClientRandom) > 0 {
+		earlySecrets = td.keyLog.GetSecrets(td.earlyClientRandom)
+	}
+	if client && td.earlyOffered && !td.tls13[0].earlyKeysReady() && earlySecrets != nil && len(earlySecrets.ClientEarlyTrafficSecret) > 0 && (td.tls13[0].phase == tls13Early || len(td.retryEarlyRecords) > 0) {
+		for _, suite := range [...]uint16{tls.TLS_AES_128_GCM_SHA256, tls.TLS_AES_256_GCM_SHA384, tls.TLS_CHACHA20_POLY1305_SHA256} {
+			config, _ := crypto.GetCipherSuite(suite)
+			if len(earlySecrets.ClientEarlyTrafficSecret) != config.HashFunc().Size() {
+				continue
+			}
+			next, err := crypto.NewRecordDecryptor(td.version, suite, earlySecrets.ClientEarlyTrafficSecret)
+			if err != nil {
+				return err
+			}
+			td.tls13[0].earlyCandidates = append(td.tls13[0].earlyCandidates, tlsEarlyKey{suite, next})
 		}
-		td.tls13[0].early = next
+		if !td.tls13[0].earlyKeysReady() {
+			return errors.New("invalid TLS 1.3 early traffic secret length")
+		}
 	}
 	return nil
 }
@@ -163,16 +220,16 @@ func (td *TLSDecryptor) processTLS13Records(client bool) {
 	for !td.aborted.Load() {
 		s.waiting = false
 		if client && len(td.retryEarlyRecords) > 0 {
-			if s.early == nil && !td.tls13Finalizing.Load() {
+			if !s.earlyKeysReady() && !td.tls13Finalizing.Load() {
 				s.waiting = true
 				return
 			}
 			for _, record := range td.retryEarlyRecords {
-				if s.early == nil {
+				if !s.earlyKeysReady() {
 					td.recordFailure("keys", "missing_early_secret", errors.New("TLS pre-retry early records could not be authenticated"))
 					break
 				}
-				plaintext, typ, err := s.early.Decrypt(record)
+				plaintext, typ, err := td.decryptTLS13Early(record)
 				if err != nil {
 					td.tls13Fail("decrypt", "authentication_failed", err)
 					return
@@ -187,18 +244,21 @@ func (td *TLSDecryptor) processTLS13Records(client bool) {
 				}
 			}
 			td.retryEarlyRecords, td.retryEarlyBytes, s.early = nil, 0, nil
+			s.earlyCandidates = nil
 		}
-		if s.phase == tls13Handshake && *handshake == nil || s.phase == tls13Early && s.early == nil && td.tlsEarlyStatus() != "rejected" {
+		if s.phase == tls13Handshake && *handshake == nil {
 			if !td.tls13Finalizing.Load() {
 				s.waiting = true
 				return
 			}
-			if s.phase == tls13Handshake {
-				td.recordFailure("keys", "missing_secret", errors.New("TLS handshake traffic secret unavailable"))
-				s.phase = tls13Probe
-			}
+			td.recordFailure("keys", "missing_secret", errors.New("TLS handshake traffic secret unavailable"))
+			s.phase = tls13Probe
 		}
-		record := in.TryReadRecord()
+		record := s.pendingRecord
+		s.pendingRecord = nil
+		if record == nil {
+			record = in.TryReadRecord()
+		}
 		if record == nil {
 			return
 		}
@@ -217,13 +277,13 @@ func (td *TLSDecryptor) processTLS13Records(client bool) {
 		decryptor := application
 		if phase == tls13Handshake {
 			decryptor = *handshake
-		} else if phase == tls13Early {
-			decryptor = s.early
 		}
 		var plaintext []byte
 		var typ byte
 		err := errors.New("TLS early traffic secret unavailable")
-		if decryptor != nil {
+		if phase == tls13Early {
+			plaintext, typ, err = td.decryptTLS13Early(record)
+		} else if decryptor != nil {
 			plaintext, typ, err = decryptor.Decrypt(record)
 		}
 		if phase == tls13Early && err != nil && *handshake != nil {
@@ -240,16 +300,24 @@ func (td *TLSDecryptor) processTLS13Records(client bool) {
 					return
 				}
 				s.phase, phase = tls13Handshake, tls13Handshake
+				s.early, s.earlyCandidates = nil, nil
 			}
 		}
-		if phase == tls13Early && err != nil && *handshake == nil && td.tls13Finalizing.Load() {
+		if phase == tls13Early && err != nil && !s.earlyKeysReady() && !td.tls13Finalizing.Load() {
+			// A rejected offer can contain no early records at all: first try
+			// the handshake key above, but retain a failed record for late early
+			// keys instead of discarding authenticated raw output prematurely.
+			s.pendingRecord, s.waiting = record, true
+			return
+		}
+		if phase == tls13Early && err != nil && *handshake == nil && application != nil && td.tls13Finalizing.Load() {
 			plaintext, typ, err = application.Decrypt(record)
 			if err == nil {
 				s.phase, phase = tls13Application, tls13Application
 			}
 		}
 		if err != nil {
-			canSkip := phase == tls13Probe && !s.authenticated || phase == tls13Early && s.early == nil && (td.tlsEarlyStatus() == "rejected" || td.tls13Finalizing.Load())
+			canSkip := phase == tls13Probe && !s.authenticated || phase == tls13Early && !s.earlyKeysReady() && (td.tlsEarlyStatus() == "rejected" || td.tls13Finalizing.Load())
 			if canSkip {
 				s.skipped += len(record)
 				*probeErr = err
@@ -338,7 +406,15 @@ func (td *TLSDecryptor) handleTLS13Handshake(s *tls13Direction, data []byte, cli
 			if !client || phase != tls13Early || len(body) != 0 || !boundary {
 				return errTLS13Handshake
 			}
+			td.earlyMu.Lock()
+			rejected := td.echRejected || td.earlyStatus == "rejected"
+			td.earlyEndSeen = true
+			td.earlyMu.Unlock()
+			if rejected {
+				return errTLS13Handshake
+			}
 			s.phase = tls13Handshake
+			s.early, s.earlyCandidates = nil, nil
 		case 8: // Only authenticated EncryptedExtensions can confirm 0-RTT.
 			if client || phase != tls13Handshake || s.ee || len(body) < 2 || int(binary.BigEndian.Uint16(body)) != len(body)-2 {
 				return errTLS13Handshake
@@ -382,6 +458,9 @@ func (td *TLSDecryptor) handleTLS13Handshake(s *tls13Direction, data []byte, cli
 			if client {
 				decryptor = td.clientDecryptor
 			}
+			if decryptor == nil {
+				return errTLS13Handshake
+			}
 			if err := decryptor.UpdateTrafficSecret(); err != nil {
 				return err
 			}
@@ -413,6 +492,9 @@ func (td *TLSDecryptor) tls13Waiting() bool {
 func (td *TLSDecryptor) finishTLS13() {
 	if td.version != 0x0304 {
 		return
+	}
+	if td.echRejectedDrain {
+		td.recordFailure("handshake", "ech_rejected", errors.New("TLS ECH rejection ended the handshake without client application keys"))
 	}
 	td.handshakeMu.RLock()
 	unknownECH := td.echOuterCandidate && !td.echOuterReported
