@@ -33,6 +33,12 @@ func GetVersion() *C.char {
 - 修复的问题
 ```
 
+准备阶段可使用 `# vX.Y.Z (Unreleased)`，不创建标签或 Release。正式发布前核对：
+
+- 将 `Unreleased` 改为实际发布日期，按上一已发布标签到最终候选提交检查变更范围，并确认 `scripts/version.sh show` 与目标版本一致。
+- 确认最终候选提交的 CI 通过；按本文构建并测试静态、动态库，实际调用 `GetVersion()` 核对版本，不能仅凭源码字符串判断产物版本。
+- 当前 Release 工作流使用 `generate_release_notes: true`，不会读取 CHANGELOG。发布时需将对应版本的功能及兼容性说明同步到 Release 正文；编辑工作流已创建的 Release，不重复创建同版本。
+
 #### 更新文档
 
 - 更新 README.md 中的版本信息
