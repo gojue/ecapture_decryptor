@@ -423,3 +423,50 @@ func TestQUICZeroCIDTupleIsolationAndCleanup(t *testing.T) {
 		}
 	})
 }
+
+func TestLateProcessAttributionDoesNotSplitTCPOrCrossGenerations(t *testing.T) {
+	withRoutingDecryptor(t, "tcp", func(e *DecryptorEngine, created *[]*routingDecryptor) {
+		ip := transport.NewIPv6Adapter(&layers.IPv6{SrcIP: net.ParseIP("::1"), DstIP: net.ParseIP("::1")})
+		tcp := func(seq uint32, syn bool) *transport.TCPAdapter {
+			return transport.NewTCPAdapter(&layers.TCP{SrcPort: 45001, DstPort: 443, Seq: seq, SYN: syn})
+		}
+		e.handlePacket(ip, tcp(100, true), time.Now())
+		first := (*created)[0].addr
+		if pid, _ := first.Process.Identity("request"); pid != 0 {
+			t.Fatal("invented first packet PID")
+		}
+		observation := &types.ConnectionProcess{}
+		observation.Observe(101, "client", 1)
+		e.handlePacket(ip, tcp(101, false), time.Now(), observation)
+		server := &types.ConnectionProcess{}
+		server.Observe(202, "server", 1)
+		e.handlePacket(ip, transport.NewTCPAdapter(&layers.TCP{SrcPort: 443, DstPort: 45001, Seq: 900, ACK: true}), time.Now(), server)
+		if len(*created) != 1 || first.String() != (*created)[0].addr.String() {
+			t.Fatal("metadata changed route identity")
+		}
+		for dir, want := range map[string]int64{"request": 101, "response": 202} {
+			p := types.NewDecryptedPacket("tcp", "tls", dir, nil, time.Now(), first)
+			if p.PID != want {
+				t.Fatalf("%s ownership=%d", dir, p.PID)
+			}
+		}
+		e.handlePacket(ip, tcp(200, true), time.Now())
+		if len(*created) != 2 {
+			t.Fatal("new SYN did not create generation")
+		}
+		if pid, _ := (*created)[1].addr.Process.Identity("request"); pid != 0 {
+			t.Fatal("process leaked across reuse")
+		}
+		conflict := &types.ConnectionProcess{}
+		conflict.Observe(999, "other", 1)
+		first.Process.Merge(conflict, false)
+		if pid, _ := first.Process.Identity("request"); pid != 0 {
+			t.Fatal("ambiguous shared endpoint attributed")
+		}
+		legacy := e.factory.Create(types.ConnectionKey{Proto: "tcp", Pid: 303, ProcessName: "explicit"})
+		packet := types.NewDecryptedPacket("tcp", "tls", "request", nil, time.Now(), legacy.GetAddr())
+		if packet.PID != 303 || packet.PName != "explicit" {
+			t.Fatal("factory discarded explicit caller process metadata")
+		}
+	})
+}

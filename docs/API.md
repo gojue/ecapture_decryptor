@@ -441,6 +441,27 @@ type DecryptedPacket struct {
 }
 ```
 
+#### PID / PName 归属
+
+文件和增量 pcapng API 均读取 eCapture 的以太网包尾元信息；它不是
+EPB option 或 Custom Block。历史格式为大端 `0xCC0C4CFC`、uint32 PID、
+uint8 Comm 长度及最多 16 字节 Comm，可带四字节全零 FCS 占位。
+新格式在 Comm 后、FCS 前附加版本 `1` 和端点标志（`1`=包源端，
+`2`=包目的端）。支持 IPv4/IPv6、VLAN 和最小以太网帧的零填充；
+仅在 IP 声明的包尾边界解析，不扫描应用载荷中的魔数。
+
+归属只表示采集端实际观察的本机进程，不表示远端进程。仅观察到一个
+本机端点时，请求与响应使用该进程；loopback 两端均有可靠元信息时，
+各方向使用发送端 PID/Comm。历史格式未标记端点，遇到不同 PID 时保留未知。
+无元信息、格式不合法或同一端点归属冲突时，不通过 UUID/端口猜测 PID；
+未知为 `PID=0, PName=""`，不再填写 `decryptor` 占位名称。
+
+迟到元信息更新该连接代次的独立状态，影响后续回调；已经发出的回调不
+回写。PID/Comm 不进入路由 key 或 ConnectionID，TCP 新 SYN/QUIC 新连接
+的状态与旧代次隔离，保持双向关联和多连接路由。`ConnectionKey.Process`
+只承载这一并发安全状态，不参与 JSON 序列化。该机制不能恢复采集端
+漏掉的归属，也不保证共享 socket、多网络命名空间碰撞或不完整握手的归属。
+
 #### 方法
 
 ##### NewDecryptedPacket

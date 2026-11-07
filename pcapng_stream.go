@@ -4,6 +4,7 @@
 package ecapture_decryptor
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -11,6 +12,9 @@ import (
 	"io"
 	"log"
 	"sync"
+
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 
 	"github.com/gojue/ecapture_decryptor/crypto"
 	"github.com/gojue/ecapture_decryptor/types"
@@ -168,4 +172,68 @@ func (r *pcapngBlockReader) nextBlock() ([]byte, error) {
 		}
 	}
 	return block, nil
+}
+
+// packetProcess reads eCapture's historical big-endian Ethernet trailer. It is
+// packet data, not an EPB option; pcapgo preserves it in file and streaming APIs.
+func packetProcess(packet gopacket.Packet) *types.ConnectionProcess {
+	eth, ok := packet.Layer(layers.LayerTypeEthernet).(*layers.Ethernet)
+	if !ok {
+		return nil
+	}
+	data := packet.Data()
+	offset := len(eth.Contents)
+	// VLAN headers precede the IP packet and are retained unchanged.
+	for _, layer := range packet.Layers() {
+		if vlan, ok := layer.(*layers.Dot1Q); ok {
+			offset += len(vlan.Contents)
+		}
+	}
+	if ip, ok := packet.Layer(layers.LayerTypeIPv4).(*layers.IPv4); ok {
+		if ip.IHL < 5 || int(ip.Length) < int(ip.IHL)*4 {
+			return nil
+		}
+		offset += int(ip.Length)
+	} else if ip, ok := packet.Layer(layers.LayerTypeIPv6).(*layers.IPv6); ok {
+		if ip.Length == 0 {
+			return nil
+		} // no inferred jumbo-payload boundary
+		offset += 40 + int(ip.Length)
+	} else {
+		return nil
+	}
+	if offset > len(data) {
+		return nil
+	}
+	trailer := data[offset:]
+	// Ethernet minimum-frame zero padding may precede an appended trailer.
+	if offset < 60 && len(trailer) >= 60-offset && bytes.Equal(trailer[:60-offset], make([]byte, 60-offset)) {
+		trailer = trailer[60-offset:]
+	}
+	if len(trailer) < 9 || binary.BigEndian.Uint32(trailer) != 0xCC0C4CFC {
+		return nil
+	}
+	n := int(trailer[8])
+	if n > 16 || len(trailer) < 9+n {
+		return nil
+	}
+	endpoint := uint32(0)
+	suffix := trailer[9+n:]
+	// Historical writers append four zero FCS placeholder bytes.
+	if len(suffix) >= 4 && bytes.Equal(suffix[len(suffix)-4:], []byte{0, 0, 0, 0}) {
+		suffix = suffix[:len(suffix)-4]
+	}
+	if len(suffix) > 0 {
+		if len(suffix) != 2 || suffix[0] != 1 || suffix[1] < 1 || suffix[1] > 2 {
+			return nil
+		}
+		endpoint = uint32(suffix[1])
+	}
+	pid := binary.BigEndian.Uint32(trailer[4:8])
+	if pid == 0 {
+		return nil
+	}
+	p := &types.ConnectionProcess{}
+	p.Observe(pid, string(bytes.TrimRight(trailer[9:9+n], "\x00")), endpoint)
+	return p
 }

@@ -57,6 +57,8 @@ type ConnectionKey struct {
 	FD          int
 	ProcessName string
 	Generation  uint64
+	// Process holds mutable observations; it is deliberately excluded from String.
+	Process *ConnectionProcess `json:"-"`
 }
 
 func (k ConnectionKey) String() string {
@@ -74,6 +76,7 @@ func (k ConnectionKey) Reverse() ConnectionKey {
 		FD:          k.FD,
 		ProcessName: k.ProcessName,
 		Generation:  k.Generation,
+		Process:     k.Process,
 	}
 }
 

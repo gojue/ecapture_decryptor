@@ -66,6 +66,10 @@ func (f *DecryptorFactory) Create(key types.ConnectionKey) types.Decryptor {
 		return nil
 	}
 
+	// Keep explicit legacy caller metadata; capture routes start without it.
+	if key.Process == nil && key.Pid == 0 && key.ProcessName == "" {
+		key.Process = &types.ConnectionProcess{}
+	}
 	decryptor := creator(key, f)
 	if configurable, ok := decryptor.(interface{ SetOptions(types.DecryptOptions) }); ok {
 		configurable.SetOptions(f.options)
