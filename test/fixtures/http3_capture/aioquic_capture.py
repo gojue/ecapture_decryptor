@@ -134,6 +134,8 @@ class DynamicHTTP(HTTP):
         self.instances.append(self)
 
     def quic_event_received(self, event):
+        if isinstance(event, HandshakeCompleted):
+            self.handshake = event
         if isinstance(event, StreamReset):
             self.events.append(dict(kind="reset", stream=event.stream_id, code=event.error_code))
             future = self.responses.get(event.stream_id)
@@ -216,24 +218,30 @@ async def run_dynamic(args):
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     qlog = QuicLogger()
+    version = 1 if args.version == 1 else 0x6B3343CF
+    suite = CipherSuite.AES_256_GCM_SHA384 if args.version == 1 else CipherSuite.AES_128_GCM_SHA256
     with (output / "dynamic.keys").open("w") as secrets:
         config = QuicConfiguration(is_client=False, alpn_protocols=["h3"], secrets_log_file=secrets, quic_logger=qlog,
-            supported_versions=[1])
+            supported_versions=[version], cipher_suites=[suite])
         config.load_cert_chain(args.cert, args.key)
         server = await serve("127.0.0.1", 44433, configuration=config, create_protocol=DynamicHTTP)
         try:
             for label in ["alpha", "beta"]:
                 client_config = QuicConfiguration(is_client=True, alpn_protocols=["h3"], verify_mode=ssl.CERT_NONE,
-                    secrets_log_file=secrets, quic_logger=qlog, supported_versions=[1])
+                    secrets_log_file=secrets, quic_logger=qlog, supported_versions=[version], cipher_suites=[suite])
                 async with connect("127.0.0.1", 44433, configuration=client_config, create_protocol=DynamicHTTP) as client:
                     await client.request(f"/{label}/warmup")
                     await asyncio.gather(client.request(f"/{label}/one"), client.request(f"/{label}/two"))
                     await client.request(f"/{label}/reset")
                     await asyncio.sleep(0.2)
                     validate_dynamic(client.events, label)
+                    assert client.handshake is not None
+                    assert client._quic._version == version
+                    assert client._quic.tls.key_schedule.cipher_suite == suite
         finally:
             server.close()
-    evidence = [dict(client=p._quic.configuration.is_client, events=p.events,
+    evidence = [dict(client=p._quic.configuration.is_client, version=hex(p._quic._version),
+        suite=p._quic.tls.key_schedule.cipher_suite.name, events=p.events,
         sections=p.http.sections, fragmented=p.http.fragmented) for p in DynamicHTTP.instances]
     assert len(evidence) == 4
     for item in evidence:
@@ -244,7 +252,144 @@ async def run_dynamic(args):
             assert any(e["kind"] == "PushPromiseReceived" for e in item["events"])
     (output / "dynamic.qlog").write_text(json.dumps(qlog.to_dict()))
     (output / "dynamic-evidence.json").write_text(json.dumps(evidence, indent=2))
-    print("D05: two connections, dynamic QPACK in both directions, delayed/fragmented encoder, 103/final/trailers, push and reset")
+    print(f"D05 v{args.version}: two connections, dynamic QPACK in both directions, delayed/fragmented encoder, 103/final/trailers, push and reset")
+
+
+class EarlyResetHTTP(HTTP):
+    """Static QPACK isolates the early RESET state from dynamic-table testing."""
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.headers = {}
+        self.bodies = {}
+        self.resets = []
+        self.instances.append(self)
+
+    def quic_event_received(self, event):
+        if isinstance(event, HandshakeCompleted):
+            self.handshake = event
+        if isinstance(event, StreamReset):
+            self.resets.append(dict(stream=event.stream_id, code=event.error_code))
+        for h3 in self.http.handle_event(event):
+            if isinstance(h3, HeadersReceived):
+                self.headers[h3.stream_id] = dict(h3.headers)
+                self.paths[h3.stream_id] = self.headers[h3.stream_id].get(b":path", b"")
+            if isinstance(h3, DataReceived):
+                self.bodies.setdefault(h3.stream_id, bytearray()).extend(h3.data)
+            if isinstance(h3, (HeadersReceived, DataReceived)) and h3.stream_ended:
+                if self._quic.configuration.is_client:
+                    self.responses[h3.stream_id].set_result(True)
+                else:
+                    body = b"reply " + self.paths[h3.stream_id]
+                    self.http.send_headers(h3.stream_id, [(b":status", b"200"), (b"content-length", str(len(body)).encode())])
+                    self.http.send_data(h3.stream_id, body, end_stream=True)
+                    self.transmit()
+
+    async def request(self, path):
+        stream = self._quic.get_next_available_stream_id()
+        await super().request(path)
+        assert self.headers[stream][b":status"] == b"200"
+        assert self.bodies[stream] == b"reply " + path.encode()
+        return stream
+
+    def cancel_early_request(self):
+        stream = self._quic.get_next_available_stream_id()
+        assert stream == 0 and self.handshake is None
+        self.http.send_headers(stream, [(b":method", b"POST"), (b":scheme", b"https"),
+            (b":authority", b"localhost"), (b":path", b"/early/reset"), (b"content-length", b"64")])
+        self.http.send_data(stream, b"partial\x00\xff", end_stream=False)
+        self.transmit()
+        sender = self._quic._streams[stream].sender
+        final_size = sender.highest_offset
+        # No event-loop yield: the real prefix must leave before RESET, while
+        # server handshake data cannot yet change the client's sending epoch.
+        assert final_size > 0 and sender._buffer_start == 0
+        prefix = bytes(sender._buffer[:final_size])
+        self._quic.reset_stream(stream, 0x10c)
+        self.transmit()
+        return prefix, final_size
+
+
+def reset_frames(peer, event_name):
+    return [dict(packet_type=e["data"]["header"]["packet_type"], **frame)
+        for e in peer._quic._quic_logger.to_dict()["events"]
+        if e["name"] == event_name
+        for frame in e["data"].get("frames", []) if frame["frame_type"] == "reset_stream"]
+
+
+async def run_early_reset(args):
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=True)
+    qlog, evidence = QuicLogger(), []
+    suite = CipherSuite.AES_128_GCM_SHA256
+    with (output / "early-reset.keys").open("w") as secrets:
+        for number, version, port in [(1, 1, 44467), (2, 0x6B3343CF, 44468)]:
+            tickets, received = {}, []
+            common = dict(alpn_protocols=["h3"], supported_versions=[version], cipher_suites=[suite],
+                secrets_log_file=secrets, quic_logger=qlog)
+            config = QuicConfiguration(is_client=False, **common)
+            config.load_cert_chain(args.cert, args.key)
+            for mode in ["seed", "accepted", "rejected"]:
+                if mode == "rejected":
+                    tickets.clear()
+                start = len(EarlyResetHTTP.instances)
+                server = await serve("127.0.0.1", port, configuration=config, create_protocol=EarlyResetHTTP,
+                    session_ticket_fetcher=tickets.get,
+                    session_ticket_handler=lambda ticket: tickets.__setitem__(ticket.ticket, ticket))
+                try:
+                    client_config = QuicConfiguration(is_client=True, verify_mode=ssl.CERT_NONE,
+                        session_ticket=received[-1] if mode != "seed" else None, **common)
+                    async with connect("127.0.0.1", port, configuration=client_config, create_protocol=EarlyResetHTTP,
+                            session_ticket_handler=received.append, wait_connected=(mode == "seed")) as client:
+                        prefix, final_size = b"", 0
+                        if mode != "seed":
+                            prefix, final_size = client.cancel_early_request()
+                            await client.wait_connected()
+                        assert client.handshake.early_data_accepted == (mode == "accepted")
+                        assert client._quic._version == version
+                        assert client._quic.tls.key_schedule.cipher_suite == suite
+                        path = f"/v{number}/{mode}/ok"
+                        stream = await client.request(path)
+                        assert stream == (0 if mode == "seed" else 4)
+                        peers = [p for p in EarlyResetHTTP.instances[start:] if not p._quic.configuration.is_client]
+                        assert len(peers) == 1
+                        peer = peers[0]
+                        if mode != "seed":
+                            for _ in range(200):
+                                if peer.resets:
+                                    break
+                                await asyncio.sleep(0.01)
+                            assert peer.resets == [dict(stream=0, code=0x10c)]
+                            if mode == "accepted":
+                                assert peer.headers[0][b":path"] == b"/early/reset"
+                                assert peer.headers[0][b"content-length"] == b"64"
+                                assert peer.bodies[0] == b"partial\x00\xff"
+                            else:
+                                assert 0 not in peer.headers and 0 not in peer.bodies
+                        await asyncio.sleep(0.05)
+                        sent, seen = reset_frames(client, "transport:packet_sent"), reset_frames(peer, "transport:packet_received")
+                        if mode != "seed":
+                            reset = dict(error_code=0x10c, final_size=final_size, frame_type="reset_stream", stream_id=0)
+                            levels = ["0RTT"] if mode == "accepted" else ["0RTT", "1RTT"]
+                            assert sent == [dict(packet_type=level, **reset) for level in levels]
+                            assert seen == [dict(packet_type=levels[-1], **reset)]
+                            assert any(e["name"] == "transport:packet_sent" and
+                                e["data"]["header"]["packet_type"] == "0RTT" and any(
+                                    f["frame_type"] == "stream" and f["stream_id"] == 0 and
+                                    f["offset"] == 0 and f["length"] == final_size and not f["fin"]
+                                    for f in e["data"].get("frames", []))
+                                for e in client._quic._quic_logger.to_dict()["events"])
+                        evidence.append(dict(version=hex(version), mode=mode, path=path, normal_stream=stream,
+                            suite=suite.name, early_accepted=client.handshake.early_data_accepted,
+                            partial_prefix=prefix.hex(), final_size=final_size, sent_resets=sent, received_resets=seen,
+                            received_partial=bytes(peer.bodies.get(0, b"")).hex() if mode != "seed" else ""))
+                finally:
+                    server.close()
+                await asyncio.sleep(0.05)
+    (output / "early-reset.qlog").write_text(json.dumps(qlog.to_dict()))
+    (output / "early-reset-evidence.json").write_text(json.dumps(evidence, indent=2))
+    print(json.dumps(evidence, indent=2))
 
 
 class Forward(asyncio.DatagramProtocol):
@@ -411,8 +556,10 @@ if __name__ == "__main__":
     parser.add_argument("--key", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--dynamic", action="store_true", help="generate the D05 dynamic QPACK/message fixture")
+    parser.add_argument("--version", type=int, choices=[1, 2], default=1, help="QUIC version for --dynamic (default: 1)")
+    parser.add_argument("--early-reset", action="store_true", help="generate v1/v2 accepted/rejected 0-RTT RESET fixtures")
     parser.add_argument("--datagram", action="store_true", help="generate the D11 QUIC DATAGRAM fixture")
     args = parser.parse_args()
-    if args.dynamic and args.datagram:
+    if sum([args.dynamic, args.datagram, args.early_reset]) > 1:
         parser.error("choose one fixture mode")
-    asyncio.run(run_datagram(args) if args.datagram else run_dynamic(args) if args.dynamic else run(args))
+    asyncio.run(run_datagram(args) if args.datagram else run_early_reset(args) if args.early_reset else run_dynamic(args) if args.dynamic else run(args))

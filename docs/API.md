@@ -157,7 +157,7 @@ chunk 边界不是应用消息边界，同一层的 raw 与应用解析互斥，
 TLS 终止错误时保留已认证字节并返回错误，不发送正常结束标记；捕获结束本身
 不证明应用消息完整。QUIC STREAM 只输出连续字节，已知 offset 缺口在关闭时报错；DATAGRAM 不参与该重组。
 RESET_STREAM 释放该方向的重组和解析缓存，保留有界终止标记以去重；它不伪装为完整 HTTP 消息。
-0-RTT RESET 使用下述接受/拒绝规则和独立 early 空间，raw reset 同样带阶段/接受状态。
+0-RTT RESET 使用下述接受/拒绝规则和独立 early 空间，raw reset 同样带阶段/接受状态。已捕获的 early 密文或接受状态尚待确认时，后续客户端 1-RTT STREAM/RESET 复用有界 early 队列等待，并保持这些帧的顺序，避免 RESET 丢失 early 前缀或被后到 FIN 越过。正常后缀保留 1-RTT 阶段；拒绝/未知 early 与正常 1-RTT STREAM/RESET 分别处理。
 STOP_SENDING 只表示请求对端停止，不能替代 RESET 或 FIN。
 QUIC DATAGRAM 与 DTLS 数据报见 [数据报输出](#数据报输出)；TLS KeyUpdate 及 TLS 阶段边界见 [TLS 版本与状态](#tls-版本与状态)，STARTTLS/CONNECT 见 [TLSUpgrade](#tlsupgrade)。QUIC Key Update、
 CID/Retry/VN 和 0-RTT 支持范围见下节。raw / HTTP 增量模式支持 QUIC 62 位 STREAM offset，完整消息和 CRYPTO 保留 16 MiB 的累计限制。
@@ -592,7 +592,7 @@ for packet := range packetChan {
 
 QPACK、SETTINGS 和消息顺序错误报告 `protocol/parse_failed`，不归为密码学认证失败。阻塞压缩/未关联 push 使用实际时间的 `KeyWaitTimeout`，逾期报告 `protocol/parse_timeout`；EOF 尚有不完整状态也返回错误。RESET、取消和关闭释放等待数据，正常结束仅保留有界去重/关联信息；输出继续遵守串行背压。缺失必要 encoder 历史或 SETTINGS 的片段捕获不能保证动态解码。长流使用下述 HTTP 增量事件契约。扩展 CONNECT、HTTP DATAGRAM 的应用关联与 WebTransport/MASQUE 尚未实现；底层 QUIC DATAGRAM 可显式 raw 输出，见 [数据报输出](#数据报输出)。
 
-独立 `http3_dynamic_aioquic` 夹具及 [复现步骤](../test/fixtures/http3_capture/README.md#dynamic-qpack-and-message-state-fixture) 覆盖 QUIC v1、两条连接、双向动态表、延迟/拆分 encoder、103→200→trailers、push/reset；v2 的动态 HTTP/3 组合和 0-RTT RESET 尚无真实夹具，后者仅有状态回归。
+独立 `http3_dynamic_aioquic`（v1、AES-256-GCM）及 `http3_dynamic_aioquic_v2`（v2、AES-128-GCM）夹具各覆盖两条连接、双向动态表、延迟/拆分 encoder、103→200→trailers、push/reset；messages/raw/HTTPEvents、文件与迟到 DSB 均有回归。另有 `http3_early_reset_aioquic` 实测 v1/v2、AES-128-GCM 的 accepted/rejected 0-RTT RESET：40 字节非完整请求前缀后取消，拒绝时对端仅在 1-RTT 重发 RESET；完整消息不输出该 POST，HTTPEvents 仅为接受的前缀输出 body/reset，raw 保留独立 early 状态。后者不覆盖动态 QPACK 与 early RESET 的组合，也不扩大 Key Update 的真实套件矩阵。[复现步骤](../test/fixtures/http3_capture/README.md#dynamic-qpack-and-message-state-fixture)说明独立对端断言和抓包过程。
 
 ### WebSocket
 

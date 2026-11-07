@@ -60,7 +60,7 @@ type quicEarlyFrame struct {
 	fin         bool
 	reset       bool
 	datagram    bool
-	application bool // Later client 1-RTT DATAGRAM waiting behind early data.
+	application bool // Later client 1-RTT STREAM / RESET / DATAGRAM waiting behind early data.
 	errorCode   uint64
 	at          time.Time
 }
@@ -99,7 +99,7 @@ type quicFlowState struct {
 	receivedPN      [2][]quicPacketRange // Raw 0/1-RTT share a packet-number space.
 	pending         []quicDeferredPacket
 	pendingLevels   [2][4]bool
-	retryingEarly   bool // Keep late-key 0-RTT before queued client DATAGRAMs.
+	retryingEarly   bool // Keep late-key 0-RTT before queued client application frames.
 	pendingBytes    int
 	pendingSince    time.Time
 	terminalErr     error

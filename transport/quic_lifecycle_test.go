@@ -251,7 +251,7 @@ func TestQUICStreamPendingSegmentLimit(t *testing.T) {
 }
 
 func TestQUICEarlyAcceptanceDeadlineReleasesState(t *testing.T) {
-	for _, frame := range [][]byte{{0x0b, 0, 3, 'a', 'b', 'c'}, {0x31, 1, 0xff}} {
+	for _, frame := range [][]byte{{0x0b, 0, 3, 'a', 'b', 'c'}, {0x31, 1, 0xff}, {4, 0, 0, 0}} {
 		synctest.Test(t, func(t *testing.T) {
 			q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true, KeyWaitTimeout: 5 * time.Second})
 			q.version = quicVersion1
@@ -260,6 +260,12 @@ func TestQUICEarlyAcceptanceDeadlineReleasesState(t *testing.T) {
 			packet := quicLongTestPacket(t, quicVersion1, QUICPacketType0RTT, nil, nil, nil, key, 0, frame)
 			if err := q.FeedClient(packet.data); err != nil {
 				t.Fatal(err)
+			}
+			if frame[0] == 4 {
+				q.flow.keys[0][quicLevelApplication] = []*QUICKeys{key}
+				if err := q.FeedClient(quicKeyPhasePacket(t, key, 1, 0, frame).data); err != nil {
+					t.Fatal(err)
+				}
 			}
 			done := make(chan error, 1)
 			go func() { done <- q.Decrypt() }()
@@ -278,8 +284,17 @@ func TestQUICEarlyAcceptanceDeadlineReleasesState(t *testing.T) {
 			default:
 				t.Fatal("acceptance wait did not expire")
 			}
-			if len(out) != 1 || (<-out).Metadata["early_data"] != "unknown" {
+			want := 1
+			if frame[0] == 4 {
+				want = 2
+			}
+			if len(out) != want || (<-out).Metadata["early_data"] != "unknown" {
 				t.Fatal("raw unknown output was lost")
+			}
+			if want == 2 {
+				if p := <-out; p.Metadata["kind"] != "stream_reset" || p.Metadata["encryption_level"] != "1rtt" || p.Metadata["early_data"] != nil {
+					t.Fatal("queued application reset was lost or inherited early metadata", p.Metadata)
+				}
 			}
 			assertQUICReleased(t, q)
 			if len(q.flow.early.frames) != 0 || len(q.flow.early.streams) != 0 || q.routingHandler != nil || q.flow.handshake.retry != nil {
@@ -360,7 +375,7 @@ func TestQUICDatagramLateKeyWakesWithoutMorePackets(t *testing.T) {
 }
 
 func TestQUICDatagramBoundedEarlyAndPacketHistory(t *testing.T) {
-	for _, limit := range []string{"early_frames", "early_bytes", "packet_ranges"} {
+	for _, limit := range []string{"early_frames", "early_bytes", "application_resets", "application_bytes", "packet_ranges"} {
 		t.Run(limit, func(t *testing.T) {
 			var diagnostics []types.Diagnostic
 			q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true, OnDiagnostic: func(d types.Diagnostic) { diagnostics = append(diagnostics, d) }})
@@ -382,12 +397,23 @@ func TestQUICDatagramBoundedEarlyAndPacketHistory(t *testing.T) {
 				}
 			} else {
 				count, data := maxQUICQueuedPackets, []byte{}
-				if limit == "early_bytes" {
+				if limit == "early_bytes" || limit == "application_bytes" {
 					data = make([]byte, 32<<10)
 					count = maxQUICBufferedBytes / len(data)
 				}
+				stream := append([]byte{0x08, 0}, data...)
 				for i := 0; i < count; i++ {
-					if err := q.queueQUICEarly(quicEarlyFrame{datagram: true, data: data}); err != nil {
+					var err error
+					if limit == "application_resets" {
+						q.flow.pendingLevels[0][quicLevelEarly] = true
+						err = q.parseQUICFrames([]byte{4, 0, 0, 0}, quicLevelApplication, true, time.Time{})
+					} else if limit == "application_bytes" {
+						q.flow.pendingLevels[0][quicLevelEarly] = true
+						err = q.parseQUICFrames(stream, quicLevelApplication, true, time.Time{})
+					} else {
+						err = q.queueQUICEarly(quicEarlyFrame{datagram: true, data: data})
+					}
+					if err != nil {
 						t.Fatal("early limit fired before the limit", err)
 					}
 				}
