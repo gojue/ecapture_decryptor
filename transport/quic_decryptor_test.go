@@ -689,6 +689,31 @@ func quicLongTestPacket(t *testing.T, version uint32, typ uint8, dcid, scid, tok
 	return packets[0]
 }
 
+func TestQUICClientInitialRoutingAuthentication(t *testing.T) {
+	for _, version := range []uint32{quicVersion1, quicVersion2} {
+		t.Run(fmt.Sprintf("%x", version), func(t *testing.T) {
+			dcid := []byte("original")
+			client, server := quicInitialKeys(version, dcid)
+			fresh := quicLongTestPacket(t, version, QUICPacketTypeInitial, dcid, nil, nil, client, 1, nil)
+			changed := quicLongTestPacket(t, version, QUICPacketTypeInitial, []byte("rotated!"), nil, nil, client, 2, nil)
+			response := quicLongTestPacket(t, version, QUICPacketTypeInitial, dcid, nil, nil, server, 1, nil)
+			if !IsQUICClientInitial(fresh.data, dcid) || IsQUICClientInitial(changed.data, changed.dcid) || IsQUICClientInitial(response.data, dcid) {
+				t.Fatal("new client Initial confused with peer CID or server keys")
+			}
+			if _, _, _, err := decryptQUICPacket(changed, client, 0, 1, true); err != nil {
+				t.Fatal("changed CID vector is not an authenticated continuation")
+			}
+			bad := bytes.Clone(fresh.data)
+			bad[len(bad)-1] ^= 1
+			for _, data := range [][]byte{nil, fresh.data[:8], bad, {0x40, 0, 0, 0}} {
+				if IsQUICClientInitial(data, dcid) {
+					t.Fatal("unauthenticated input classified as a new client Initial")
+				}
+			}
+		})
+	}
+}
+
 func TestQUICRetryEpochAndIntegrity(t *testing.T) {
 	for _, vector := range []string{
 		"ff000000010008f067a5502a4262b5746f6b656e04a265ba2eff4d829058fb3f0f2496ba",

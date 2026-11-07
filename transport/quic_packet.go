@@ -328,6 +328,24 @@ func InspectQUICHeader(data []byte) (QUICHeaderInfo, error) {
 	return h, nil
 }
 
+// IsQUICClientInitial reports whether the first packet authenticates with client
+// Initial keys derived from initialDCID. The router uses this to link zero-SCID
+// Initials even before the worker has published an authenticated peer CID.
+// Initial protection uses public keys; this does not authenticate peer identity.
+func IsQUICClientInitial(data, initialDCID []byte) bool {
+	packets, err := splitQUICDatagram(data)
+	if err != nil || len(packets) == 0 {
+		return false
+	}
+	p := packets[0]
+	if !p.long || p.packetType != QUICPacketTypeInitial || !IsQUICVersionSupported(p.version) {
+		return false
+	}
+	client, _ := quicInitialKeys(p.version, initialDCID)
+	_, _, _, err = decryptQUICPacket(p, client, 0, 0, false)
+	return err == nil
+}
+
 // RFC 9001 §5.8 and RFC 9369 §3.3.3. This public integrity key detects corrupt
 // Retry packets; it does not authenticate the server's identity.
 func validQUICRetry(packet quicPacket, originalDCID []byte) bool {
