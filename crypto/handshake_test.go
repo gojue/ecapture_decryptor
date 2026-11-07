@@ -164,6 +164,14 @@ func makeECHTest(t *testing.T) (*ClientHelloInfo, []byte, *TLSSecrets, []byte) {
 
 func makeECHFlight(t *testing.T, retry bool, change ...string) (*ClientHelloInfo, *ClientHelloInfo, []byte, []byte, *TLSSecrets, []byte) {
 	t.Helper()
+	hasChange := func(want string) bool {
+		for _, item := range change {
+			if item == want {
+				return true
+			}
+		}
+		return false
+	}
 	suite, newHash := byte(1), sha256.New
 	if len(change) > 0 {
 		if change[0] == "aes256" {
@@ -204,7 +212,15 @@ func makeECHFlight(t *testing.T, retry bool, change ...string) (*ClientHelloInfo
 	innerRandom := bytes.Repeat([]byte{0x21}, 32)
 	outerRandom := bytes.Repeat([]byte{0x32}, 32)
 	session := []byte{9, 8, 7}
-	innerExt := append(helloTestExtension(0xfe0d, []byte{1}), helloTestExtension(43, []byte{2, 3, 4})...)
+	baseInnerExt := append(helloTestExtension(0xfe0d, []byte{1}), helloTestExtension(43, []byte{2, 3, 4})...)
+	innerExt := bytes.Clone(baseInnerExt)
+	outerExt := helloTestExtension(43, []byte{2, 3, 4})
+	if hasChange("early") || hasChange("early_without_outer") {
+		innerExt = append(innerExt, helloTestExtension(42, nil)...)
+	}
+	if hasChange("early") || hasChange("outer_early") {
+		outerExt = append(outerExt, helloTestExtension(42, nil)...)
+	}
 	encoded := append(clientHello(innerRandom, nil, innerExt)[4:], make([]byte, 17)...)
 	inner := clientHello(innerRandom, session, innerExt)
 	ech := []byte{0, 0, 1, 0, 1, 7, 0, 32}
@@ -212,7 +228,7 @@ func makeECHFlight(t *testing.T, retry bool, change ...string) (*ClientHelloInfo
 	n := len(encoded) + 16
 	ech = append(ech, byte(n>>8), byte(n))
 	ech = append(ech, make([]byte, n)...)
-	outerWire := clientHello(outerRandom, session, append(helloTestExtension(43, []byte{2, 3, 4}), helloTestExtension(0xfe0d, ech)...))
+	outerWire := clientHello(outerRandom, session, append(bytes.Clone(outerExt), helloTestExtension(0xfe0d, ech)...))
 	ciphertext, err := sender.Seal(outerWire[4:], encoded)
 	if err != nil {
 		t.Fatal(err)
@@ -278,10 +294,10 @@ func makeECHFlight(t *testing.T, retry bool, change ...string) (*ClientHelloInfo
 		hrr = serverHello(helloRetryRandom, ext)
 		accept := confirm("hrr ech accept confirmation", append(bytes.Clone(transcript), hrr...))
 		copy(hrr[len(hrr)-8:], accept)
-		innerExt2 := append(bytes.Clone(innerExt), helloTestExtension(44, []byte{0, 2, 0xaa, 0xbb})...)
+		innerExt2 := append(bytes.Clone(baseInnerExt), helloTestExtension(44, []byte{0, 2, 0xaa, 0xbb})...)
 		random2, session2 := bytes.Clone(innerRandom), bytes.Clone(session)
-		if len(change) > 0 {
-			switch change[0] {
+		for _, item := range change {
+			switch item {
 			case "inner_random":
 				random2[0] ^= 1
 			case "inner_session":
@@ -295,7 +311,7 @@ func makeECHFlight(t *testing.T, retry bool, change ...string) (*ClientHelloInfo
 		n := len(encoded2) + 16
 		ech2 := []byte{0, 0, 1, 0, 1, 7, 0, 0, byte(n >> 8), byte(n)}
 		ech2 = append(ech2, make([]byte, n)...)
-		wire2 := clientHello(outerRandom, session2, append(helloTestExtension(43, []byte{2, 3, 4}), helloTestExtension(0xfe0d, ech2)...))
+		wire2 := clientHello(outerRandom, session2, append(bytes.Clone(outerExt), helloTestExtension(0xfe0d, ech2)...))
 		ciphertext, err := sender.Seal(wire2[4:], encoded2)
 		if err != nil {
 			t.Fatal(err)
@@ -313,6 +329,82 @@ func makeECHFlight(t *testing.T, retry bool, change ...string) (*ClientHelloInfo
 	accept := confirm("ech accept confirmation", append(transcript, sh...))
 	copy(sh[30:38], accept)
 	return outer, second, hrr, sh, &TLSSecrets{ECHSecret: shared, ECHConfig: config}, innerRandom
+}
+
+func TestECHEarlyRandomAndRetry(t *testing.T) {
+	for _, suite := range []string{"aes128", "aes256", "chacha"} {
+		t.Run(suite, func(t *testing.T) {
+			first, second, retry, final, secrets, random := makeECHFlight(t, true, suite, "early")
+			inner1, inner2, status, err := ResolveECHClientHelloRetry(first, second, retry, final, secrets)
+			if err != nil || status != "accepted" || !first.EarlyData || !second.EarlyData || !inner1.EarlyData || inner2.EarlyData {
+				t.Fatalf("accepted ECH outer/inner early states: %s %v", status, err)
+			}
+			got, err := ECHClientEarlyRandom(first, secrets)
+			if err != nil || !bytes.Equal(got, random) || bytes.Equal(got, first.Random) {
+				t.Fatalf("authenticated early index: %x %v", got, err)
+			}
+			got[0] ^= 1
+			again, err := ECHClientEarlyRandom(first, secrets)
+			if err != nil || !bytes.Equal(again, random) {
+				t.Fatal("early index aliases caller state", err)
+			}
+			// A rejecting server selects Outer for the handshake, while the
+			// already-sent early records keep their authenticated Inner index.
+			var extensions []byte
+			for _, ext := range first.extensions {
+				if ext.typ != 42 {
+					extensions = append(extensions, helloTestExtension(ext.typ, ext.data)...)
+				}
+			}
+			wire := helloTestClient(first.Random, first.sessionID, extensions)
+			wire[42+len(first.sessionID)] = first.Message[42+len(first.sessionID)]
+			outer2, err := parseClientHello(wire)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rejected := bytes.Clone(retry)
+			rejected[len(rejected)-1] ^= 1
+			a, b, status, err := ResolveECHClientHelloRetry(first, outer2, rejected, final, secrets)
+			if err != nil || status != "rejected" || !bytes.Equal(a.Random, first.Random) || !bytes.Equal(b.Random, first.Random) {
+				t.Fatalf("rejected app identity: %s %v", status, err)
+			}
+			for _, material := range []*TLSSecrets{nil, secrets} {
+				if _, _, _, err := ResolveECHClientHelloRetry(first, first, rejected, final, material); !errors.Is(err, ErrECHInvalid) {
+					t.Fatal("rejected/GREASE CH2 kept early_data", err)
+				}
+			}
+		})
+	}
+	first, _, _, _, secrets, _ := makeECHFlight(t, false, "early")
+	for name, material := range map[string]*TLSSecrets{"missing": nil, "wrong": {ECHSecret: bytes.Repeat([]byte{1}, 32), ECHConfig: secrets.ECHConfig}, "missing_config": {ECHSecret: secrets.ECHSecret}} {
+		t.Run(name, func(t *testing.T) {
+			if random, err := ECHClientEarlyRandom(first, material); err == nil || random != nil {
+				t.Fatal("unauthenticated early identity", err)
+			}
+		})
+	}
+	for _, index := range []int{6, len(first.Message) - 1} {
+		bad := *first
+		bad.Message = bytes.Clone(first.Message)
+		bad.Message[index] ^= 1
+		if _, err := ECHClientEarlyRandom(&bad, secrets); !errors.Is(err, ErrECHAuthentication) {
+			t.Fatal("changed wire supplied early identity", err)
+		}
+	}
+	for _, change := range []string{"no_early", "outer_early"} {
+		first, _, _, _, secrets, _ := makeECHFlight(t, false, change)
+		if random, err := ECHClientEarlyRandom(first, secrets); err != nil || random != nil {
+			t.Fatal("inner without early data supplied an early identity", err)
+		}
+	}
+	first, _, _, _, secrets, _ = makeECHFlight(t, false, "early_without_outer")
+	if _, err := ECHClientEarlyRandom(first, secrets); !errors.Is(err, ErrECHInvalid) {
+		t.Fatal("CH1 outer must copy the inner early offer", err)
+	}
+	first, second, retry, final, secrets, _ := makeECHFlight(t, true, "early", "inner_early")
+	if _, _, _, err := ResolveECHClientHelloRetry(first, second, retry, final, secrets); !errors.Is(err, ErrECHInvalid) {
+		t.Fatal("authenticated CH2 inner kept early_data", err)
+	}
 }
 
 func TestECHHelloRetryTranscriptAndHPKESequence(t *testing.T) {

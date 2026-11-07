@@ -411,6 +411,141 @@ EOF, duplicate DSBs and missing/wrong ECH associations. State tests complement
 real captures with bad HRR/final confirmations, altered CH2 payload/AAD/enc,
 repeated HRR, forbidden early/EOED boundaries, limits and key-wait deadlines.
 
+### HRR resumption and ECH/early matrices
+
+The same C generator adds two explicit modes; `all` keeps its previous scope.
+`d10_resumption_matrix.pcapng` and its matching `.keys` were captured with
+OpenSSL **3.5.5**: 308 packets, zero drops, 16 connections and 16 HTTP exchanges.
+Each row below runs a seed connection (index 0) and an HRR attempt (index 1).
+Suffixes `aes128`, `aes256` and `chacha` mean TLS_AES_128_GCM_SHA256,
+TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256 respectively.
+
+| `matrix` modes | TCP ports, in listed order | Actual attempt outcome |
+| --- | --- | --- |
+| `hrr_early_aes128`, `hrr_early_aes256`, `hrr_early_chacha` | 44482, 44483, 44484 | Rejected early data; full handshake, not resumed |
+| `hrr_psk_aes128`, `hrr_psk_aes256`, `hrr_psk_chacha` | 44485, 44486, 44487 | PSK resumed after HRR; no early data |
+| `hrr_early_switch_chacha`, `hrr_early_switch_aes256` | 44488, 44489 | AES-128 seed/early cipher; final ChaCha20 or AES-256; rejected early and full handshake |
+
+Both peers assert the selected cipher and session-reuse result. Callbacks count
+the actual HRR, two ClientHellos, removal of early_data from CH2 and absence of
+EndOfEarlyData. The early attempts retransmit the exact request at 1-RTT;
+ordinary OpenSSL anti-replay policy remains enabled. These are distinct PSK
+resumption and early-rejection cases, not a claim that every early attempt
+resumes. HTTP bytes and indices use the format above.
+
+Run from the repository root with OpenSSL 3.5.5 development files selected by
+pkg-config; use a new working directory and keylog:
+
+```sh
+matrix_work=$(mktemp -d)
+umask 077
+pkg-config --modversion openssl
+cc -O2 -Wall -Wextra -Werror test/fixtures/http_tcp_capture/tls_d10_openssl.c \
+  -o "$matrix_work/tls-d10-openssl" $(pkg-config --cflags --libs openssl) -lpthread
+openssl req -x509 -newkey rsa:2048 -nodes -keyout "$matrix_work/peer.key" \
+  -out "$matrix_work/peer.crt" -days 1 -subj /CN=localhost
+sudo -v
+sudo -n dumpcap -i lo -s 0 -B 64 -f 'tcp portrange 44482-44489' -w - \
+  > "$matrix_work/d10_resumption_matrix.pcapng" 2> "$matrix_work/capture.log" &
+capture_pid=$!
+trap 'sudo -n kill -INT "$capture_pid" 2>/dev/null || true; wait "$capture_pid" 2>/dev/null || true' EXIT
+sleep 1
+"$matrix_work/tls-d10-openssl" "$matrix_work/peer.crt" "$matrix_work/peer.key" \
+  "$matrix_work/d10_resumption_matrix.keys" matrix > "$matrix_work/evidence.jsonl"
+sleep 1
+sudo -n kill -INT "$capture_pid"
+wait "$capture_pid"
+trap - EXIT
+```
+
+`d10_ech_early_matrix.pcapng` and its matching `.keys` use a separate official
+**OpenSSL 4.0.3** build: 207 packets, zero drops, 11 connections and 10 HTTP
+exchanges. TLS uses the three suites above; ECH uses only
+X25519/HKDF-SHA256/AES-128-GCM HPKE.
+
+| `ech-matrix` modes | TCP ports, in listed order | Connections per mode / outcome |
+| --- | --- | --- |
+| `ech_hrr_aes128`, `ech_hrr_aes256`, `ech_hrr_chacha` | 44490, 44491, 44492 | 1; accepted ECH and HRR, no early data |
+| `ech_hrr_early_aes128`, `ech_hrr_early_aes256`, `ech_hrr_early_chacha` | 44493, 44494, 44495 | 2; accepted ECH seed, then accepted ECH + HRR + resumed PSK, rejected early retransmitted at 1-RTT |
+| `ech_rejected_early_aes128` | 44496 | 2; accepted ECH seed, then rejected ECH/early without HRR; expected ECH-required alert, no HTTP exchange on the rejected connection |
+
+Both accepted peers assert ECH status 1. Only the four ECH modes that attempt
+early data set server `SSL_OP_NO_ANTI_REPLAY`, isolating single-use loopback
+ticket/HRR behavior from OpenSSL's replay policy. This does not validate replay
+protection and is not a production-server configuration recommendation.
+[OpenSSL documents the separate replay-policy controls.](https://docs.openssl.org/4.0/man3/SSL_read_early_data/)
+The ECH client loads the ephemeral certificate as a trust anchor and enables
+`SSL_VERIFY_PEER`; its SAN covers the inner, public and localhost names.
+
+Build OpenSSL in a fresh temporary directory without installing it or replacing
+the system library. The official release archive has SHA-256
+`325b5c806167c13b40b1ffeadfe0248197c00eccc4cf123ec1e28d2d2fd216d9`.
+The following Linux commands require curl, Perl, make and a C compiler:
+
+```sh
+ech_work=$(mktemp -d)
+umask 077
+curl -fL https://github.com/openssl/openssl/releases/download/openssl-4.0.3/openssl-4.0.3.tar.gz \
+  -o "$ech_work/openssl-4.0.3.tar.gz"
+printf '%s  %s\n' 325b5c806167c13b40b1ffeadfe0248197c00eccc4cf123ec1e28d2d2fd216d9 \
+  "$ech_work/openssl-4.0.3.tar.gz" | sha256sum -c -
+tar -xzf "$ech_work/openssl-4.0.3.tar.gz" -C "$ech_work"
+openssl_src="$ech_work/openssl-4.0.3"
+(cd "$openssl_src" && ./Configure no-shared no-tests --prefix="$ech_work/install" && make -j4)
+"$openssl_src/apps/openssl" version
+cc -O2 -Wall -Wextra -Werror -I"$openssl_src/include" \
+  test/fixtures/http_tcp_capture/tls_d10_openssl.c \
+  "$openssl_src/libssl.a" "$openssl_src/libcrypto.a" -lpthread -ldl \
+  -o "$ech_work/tls-d10-openssl4"
+"$openssl_src/apps/openssl" req -x509 -newkey rsa:2048 -nodes \
+  -keyout "$ech_work/peer.key" -out "$ech_work/peer.crt" -days 1 \
+  -subj /CN=secret.example \
+  -addext 'subjectAltName=DNS:localhost,DNS:secret.example,DNS:public.example'
+sudo -v
+sudo -n dumpcap -i lo -s 0 -B 64 -f 'tcp portrange 44490-44496' -w - \
+  > "$ech_work/d10_ech_early_matrix.pcapng" 2> "$ech_work/capture.log" &
+capture_pid=$!
+trap 'sudo -n kill -INT "$capture_pid" 2>/dev/null || true; wait "$capture_pid" 2>/dev/null || true' EXIT
+sleep 1
+"$ech_work/tls-d10-openssl4" "$ech_work/peer.crt" "$ech_work/peer.key" \
+  "$ech_work/d10_ech_early_matrix.keys" ech-matrix > "$ech_work/evidence.jsonl"
+sleep 1
+sudo -n kill -INT "$capture_pid"
+wait "$capture_pid"
+trap - EXIT
+```
+
+The generator creates ECH configurations through public `OSSL_ECHSTORE` APIs,
+then serializes and reloads PEM into a fresh store so HPKE uses a single
+canonical ECHConfig rather than its ECHConfigList prefix. No OpenSSL source,
+SDK dependency or network packet is patched. Its read-only exporter derives
+DHKEM shared_secret from the generator-owned private key and the actual CH1
+encapsulated key, using OpenSSL X25519/HMAC. It writes standard
+[RFC 9850 ECH_SECRET/ECH_CONFIG labels](https://www.rfc-editor.org/rfc/rfc9850.html#section-2.3)
+under CH1 OuterRandom alongside normal OpenSSL traffic-secret callbacks.
+For rejected ECH, early traffic uses InnerRandom while the outer handshake uses
+a different random; the peer explicitly checks that separation.
+
+Accepted ECH CH2 Outer may retain early_data; the authenticated Inner2 must
+remove it after HRR. This follows
+[RFC 9849's HRR processing](https://www.rfc-editor.org/rfc/rfc9849.html#section-6.1.5)
+and is not an invalid early-data attempt. A conforming rejected-ECH + HRR +
+early combination still lacks real-traffic evidence; the rejected case here
+deliberately has no HRR. These fixtures do not expand HPKE algorithms or claim
+all TLS state combinations.
+
+Check both evidence logs and capture drop counts, and keep private keys out of
+Git. From the repository root, validate exact messages/raw/HTTPEvents, separate
+rejected-early offsets, connection identity and HRR/resumption diagnostics:
+
+```sh
+CGO_ENABLED=1 go test -race -run '^TestTLSStateMatrixCaptureAPIs$' -v .
+```
+
+The regression also delivers application, handshake, early and ECH labels in
+different trailing-DSB orders, requires complete output before EOF, checks
+duplicate DSBs do not repeat output, and validates raw end markers at EOF.
+
 ## D11 DTLS 1.2 fixtures
 
 `dtls_capture.c` is a separate, build-excluded OpenSSL UDP peer because DTLS

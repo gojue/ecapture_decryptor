@@ -315,7 +315,7 @@ and local self-signed certificate are only for reproducible test traffic.
 
 ## AES-256/ChaCha20 updates and Retry with 0-RTT
 
-Two additional aioquic 1.3.0 modes use real loopback sockets and static QPACK.
+Additional aioquic 1.3.0 modes use real loopback sockets and static QPACK.
 The QUIC production code and its dependencies are unchanged. Capture files contain actual
 network packets from dumpcap, not reconstructed or synthesized packets.
 
@@ -323,6 +323,7 @@ network packets from dumpcap, not reconstructed or synthesized packets.
 | --- | --- | --- | --- |
 | `http3_keyupdate_matrix_aioquic` | `--key-update-matrix` | 4 / 24 | 128 / 0 |
 | `http3_retry_early_aioquic` | `--retry-early` | 6 / 12 | 68 / 0 |
+| `http3_retry_early_matrix_aioquic` | `--retry-early-matrix` | 12 / 24 | 137 / 0 |
 
 The update matrix uses ports 44469 (v1 AES-256), 44470 (v1 ChaCha20), 44471
 (v2 AES-256), and 44472 (v2 ChaCha20). Each connection sends three GETs on
@@ -341,7 +342,7 @@ and restores the original function afterward. Native `apply_key_phase` already
 preserves HP. This is interoperability with the disclosed fixture adapter, not
 a claim that unmodified aioquic performs conforming v2 updates.
 
-Retry uses AES-128 only, on ports 44473 (v1) and 44474 (v2). Each version has
+The original `--retry-early` mode uses AES-128 on ports 44473 (v1) and 44474 (v2). Each version has
 three connections with one GET on stream 0: `/retry/vN/seed`,
 `/retry/vN/accepted`, and `/retry/vN/rejected`. Responses again are `reply PATH`.
 The seed has no Retry and establishes a ticket. Each other connection receives
@@ -351,6 +352,20 @@ has no 1-RTT request replay. Clearing the server ticket cache rejects early data
 the rejected connection additionally retransmits that same request on stream 0
 at 1-RTT. Peer status/body checks and qlog STREAM-frame assertions verify these
 sequences; merely enabling a Retry flag is insufficient.
+
+`--retry-early-matrix` preserves that original mode and capture, adding four
+cells: 44478 (v1 AES-256), 44479 (v1 ChaCha20), 44480 (v2 AES-256), and 44481
+(v2 ChaCha20). Each cell has separate seed/accepted/rejected connections with
+paths `/retry/vN/SUITE/MODE` (`SUITE` is `aes256` or `chacha`), stream 0, and
+exact `reply PATH` responses. The request stream is 31 bytes for seed and 34
+bytes for accepted/rejected. All eight early connections send identical complete
+requests before and after Retry; the four rejected requests also reappear at
+1-RTT. The generator records the actual request wire bytes and verifies every
+qlog frame covers offset 0 through FIN. An independent capture decoder, without
+SDK code, authenticated all 16 pre/post-Retry early requests using one secret
+per connection, compared complete ClientHello/request bytes, and checked
+increasing packet numbers. Actual ServerHello suites are AES-256/SHA384
+(`0x1302`) and ChaCha20/SHA256 (`0x1303`), three connections per version/suite.
 
 Native aioquic 1.3.0 `_connect` rebuilds TLS and packet spaces after Retry,
 changing ClientHello/early secrets and losing sent early STREAM ranges. A
@@ -366,20 +381,24 @@ No secret values are included in the evidence JSON. These adaptations are local
 to this generator; neither the installed aioquic package nor SDK is patched.
 
 Reuse the pinned venv and temporary self-signed certificate preparation above,
-then run from the repository root. Both modes write keylogs, qlogs, and JSON
+then run from the repository root. These modes write keylogs, qlogs, and JSON
 fixture evidence under their output directory; keep the certificate private key
 and auxiliary logs outside Git.
 
 ```sh
-for mode in key-update-matrix retry-early; do
+for mode in key-update-matrix retry-early retry-early-matrix; do
   if [ "$mode" = key-update-matrix ]; then
     name=http3_keyupdate_matrix_aioquic
     filter='udp portrange 44469-44472'
     keyname=keyupdate-matrix.keys
-  else
+  elif [ "$mode" = retry-early ]; then
     name=http3_retry_early_aioquic
     filter='udp portrange 44473-44474'
     keyname=retry-early.keys
+  else
+    name=http3_retry_early_matrix_aioquic
+    filter='udp portrange 44478-44481'
+    keyname=retry-early-matrix.keys
   fi
   mkdir "$work/$mode"
   sudo -n dumpcap -i lo -f "$filter" -w - \
@@ -405,14 +424,20 @@ go test -race -run TestQUICStateMatrixCapturedTransitions ./transport
 messages and raw bytes with external keys, seekable/non-seekable DSB, and both
 trailing DSB direction orders, including output before EOF. The transport test
 checks actual generation 2 in both directions, stable ClientHello random across
-Retry, and accepted/rejected early state. Retry with other suites, combined
-migration/Key Update, and draft-29 are not added by these captures.
+Retry, and accepted/rejected early state. The new matrix additionally delays
+early or handshake secrets independently of application secrets. All three
+suites retain the Retry state regression for PN 255 → 256, invalid Retry/token,
+failed authentication, retransmission, delayed early secrets, output isolation,
+and cleanup. Combined migration/Key Update and draft-29 are not added by these
+captures.
 
 ```text
 b4752bcbf7be06441ceccdb200793d29364a7285f35d572290bd6baa9aa10f5d  http3_keyupdate_matrix_aioquic.pcapng
 fda2c22f946c1adf9e5773e895aefb67da93be809bd3b1bb51879bf60c61fa18  http3_keyupdate_matrix_aioquic.keys
 34bd857c0f46c28841e04624a007147893a0ef4544d3187954e55d15ab61c1e2  http3_retry_early_aioquic.pcapng
 ab4da2a29012ec3efb2653dcabd9cce3be0aec468e4e1259756e7796bda30366  http3_retry_early_aioquic.keys
+22e0e9cb41ab2ce339833b4e24a07a26eab73c235977196f9f1f7d80570b42a5  http3_retry_early_matrix_aioquic.pcapng
+7b8a57d834a53adbbbdfcf9e1d13694da0803a9522234df0edd59491a5a7ddbf  http3_retry_early_matrix_aioquic.keys
 ```
 
 

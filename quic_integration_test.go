@@ -312,7 +312,7 @@ func TestQUICKeyUpdateCaptureAPIs(t *testing.T) {
 }
 
 func TestQUICStateMatrixCaptureAPIs(t *testing.T) {
-	for _, fixture := range []string{"keyupdate_matrix", "retry_early"} {
+	for _, fixture := range []string{"keyupdate_matrix", "retry_early", "retry_early_matrix"} {
 		t.Run(fixture, func(t *testing.T) {
 			base := "test/testdata/http3_" + fixture + "_aioquic"
 			capture, clientKeys, serverKeys := quicDSBBlocks(t, base+".pcapng", base+".keys")
@@ -324,7 +324,11 @@ func TestQUICStateMatrixCaptureAPIs(t *testing.T) {
 			var reference map[string]string
 			for _, raw := range []bool{false, true} {
 				var referenceRaw map[string][]byte
-				for _, mode := range []string{"external", "seek_dsb", "nonseek_dsb", "late_client_first", "late_server_first"} {
+				modes := []string{"external", "seek_dsb", "nonseek_dsb", "late_client_first", "late_server_first"}
+				if fixture == "retry_early_matrix" {
+					modes = append(modes, "late_early", "late_handshake")
+				}
+				for _, mode := range modes {
 					t.Run(fmt.Sprintf("raw=%v/%s", raw, mode), func(t *testing.T) {
 						var output []*types.DecryptedPacket
 						if strings.HasPrefix(mode, "late_") {
@@ -338,6 +342,26 @@ func TestQUICStateMatrixCaptureAPIs(t *testing.T) {
 								groups := [][]byte{clientKeys, serverKeys}
 								if mode == "late_server_first" {
 									groups[0], groups[1] = groups[1], groups[0]
+								}
+								if mode == "late_early" || mode == "late_handshake" {
+									var first, last bytes.Buffer
+									for _, line := range strings.Split(string(keys), "\n") {
+										fields := strings.Fields(line)
+										if len(fields) != 3 {
+											continue
+										}
+										late := mode == "late_early" && fields[0] == "CLIENT_EARLY_TRAFFIC_SECRET" ||
+											mode == "late_handshake" && strings.Contains(fields[0], "HANDSHAKE_TRAFFIC_SECRET")
+										if late {
+											last.WriteString(line + "\n")
+										} else {
+											first.WriteString(line + "\n")
+										}
+									}
+									if first.Len() == 0 || last.Len() == 0 {
+										t.Fatal("missing independent late-secret group")
+									}
+									groups = [][]byte{tlsFixtureDSB(t, first.Bytes()), tlsFixtureDSB(t, last.Bytes())}
 								}
 								for _, group := range groups {
 									stream.write(t, group)
@@ -430,7 +454,7 @@ func checkQUICStateMatrixOutput(t *testing.T, fixture string, output []*types.De
 		status, _ := p.Metadata["early_data"].(string)
 		space := ""
 		if level == "0rtt" {
-			if fixture != "retry_early" || p.Direction != "request" || status != "accepted" && status != "rejected" || early[conn] != "" && early[conn] != status {
+			if !strings.HasPrefix(fixture, "retry_early") || p.Direction != "request" || status != "accepted" && status != "rejected" || early[conn] != "" && early[conn] != status {
 				t.Fatal("early state/connection mismatch", p.Metadata)
 			}
 			early[conn] = status
@@ -471,8 +495,14 @@ func checkQUICStateMatrixOutput(t *testing.T, fixture string, output []*types.De
 				}
 			}
 		} else {
-			for _, mode := range []string{"seed", "accepted", "rejected"} {
-				expected[fmt.Sprintf("/retry/v%d/%s", version, mode)] = 0
+			suites := []string{""}
+			if fixture == "retry_early_matrix" {
+				suites = []string{"aes256/", "chacha/"}
+			}
+			for _, suite := range suites {
+				for _, mode := range []string{"seed", "accepted", "rejected"} {
+					expected[fmt.Sprintf("/retry/v%d/%s%s", version, suite, mode)] = 0
+				}
 			}
 		}
 	}
@@ -526,7 +556,7 @@ func checkQUICStateMatrixOutput(t *testing.T, fixture string, output []*types.De
 				t.Fatal("duplicate complete message", key)
 			}
 			result[key] = fmt.Sprintf("%s/%d/%s", conn, id, body[1])
-			if raw && fixture == "retry_early" {
+			if raw && strings.HasPrefix(fixture, "retry_early") {
 				want := path[strings.LastIndex(path, "/")+1:]
 				if want == "seed" {
 					want = ""
@@ -543,8 +573,11 @@ func checkQUICStateMatrixOutput(t *testing.T, fixture string, output []*types.De
 		}
 	}
 	wantConnections := 4
-	if fixture == "retry_early" {
+	if strings.HasPrefix(fixture, "retry_early") {
 		wantConnections = 6
+		if fixture == "retry_early_matrix" {
+			wantConnections = 12
+		}
 	}
 	if len(connections) != wantConnections || len(owners) != wantConnections || len(result) != len(expected)*2 {
 		t.Fatalf("connections/cells/messages=%d/%d/%d, want %d/%d/%d", len(connections), len(owners), len(result), wantConnections, wantConnections, len(expected)*2)

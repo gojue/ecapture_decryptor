@@ -371,6 +371,33 @@ func ResolveECHClientHello(outer *ClientHelloInfo, serverMessage []byte, secrets
 	return inner, "accepted", nil
 }
 
+// ECHClientEarlyRandom authenticates CH1's encrypted payload and returns its
+// inner random only when it offers early data. ECH rejection does not change
+// that early-secret index; this result never selects the application handshake
+// or asserts server acceptance. The caller supplies material for this outer CH.
+func ECHClientEarlyRandom(outer *ClientHelloInfo, secrets *TLSSecrets) ([]byte, error) {
+	if outer == nil {
+		return nil, ErrECHInvalid
+	}
+	outer, err := parseClientHello(outer.Message)
+	if err != nil || !outer.ECHOffered {
+		return nil, ErrECHInvalid
+	}
+	inner, err := decryptECHHello(outer, secrets, 0)
+	if err != nil {
+		return nil, err
+	}
+	if !inner.EarlyData {
+		return nil, nil
+	}
+	// RFC 9849 Section 6.1 requires the first outer CH to copy early_data,
+	// allowing a rejecting server to safely discard the early records.
+	if !outer.EarlyData {
+		return nil, ErrECHInvalid
+	}
+	return bytes.Clone(inner.Random), nil
+}
+
 func decryptECHHello(outer *ClientHelloInfo, secrets *TLSSecrets, sequence byte) (*ClientHelloInfo, error) {
 	if secrets == nil || len(secrets.ECHSecret) == 0 || len(secrets.ECHConfig) == 0 {
 		return nil, ErrECHSecretsUnavailable
@@ -472,7 +499,7 @@ func ResolveECHClientHelloRetry(first, second *ClientHelloInfo, retry, final []b
 		return nil, nil, "unknown", err
 	}
 	second, err = parseClientHello(second.Message)
-	if err != nil || !first.ECHOffered || !second.ECHOffered || second.EarlyData {
+	if err != nil || !first.ECHOffered || !second.ECHOffered {
 		return nil, nil, "unknown", ErrECHInvalid
 	}
 	version, suite, extensions, err := serverHello(retry)
@@ -504,6 +531,9 @@ func ResolveECHClientHelloRetry(first, second *ClientHelloInfo, retry, final []b
 	outerRetry := bytes.Equal(first.Random, second.Random) && bytes.Equal(first.sessionID, second.sessionID) && bytes.Equal(firstECH, secondECH)
 	if secrets == nil || len(secrets.ECHSecret) == 0 || len(secrets.ECHConfig) == 0 {
 		if outerRetry {
+			if second.EarlyData {
+				return nil, nil, "unknown", ErrECHInvalid
+			}
 			return first, second, "unknown", nil
 		}
 		return nil, nil, "unknown", ErrECHSecretsUnavailable
@@ -521,6 +551,9 @@ func ResolveECHClientHelloRetry(first, second *ClientHelloInfo, retry, final []b
 		return nil, nil, "unknown", err
 	}
 	if !hmac.Equal(confirm, signal.data) {
+		if second.EarlyData {
+			return nil, nil, "unknown", ErrECHInvalid
+		}
 		if !outerRetry {
 			return nil, nil, "unknown", ErrECHAuthentication
 		}
@@ -533,6 +566,8 @@ func ResolveECHClientHelloRetry(first, second *ClientHelloInfo, retry, final []b
 	if err != nil {
 		return nil, nil, "unknown", err
 	}
+	// An accepted ECH CH2 outer AAD may copy CH1's extensions, including
+	// early_data (RFC 9849 Section 6.1.5). Its authenticated inner must remove it.
 	if inner2.EarlyData || !bytes.Equal(inner1.Random, inner2.Random) || !bytes.Equal(inner1.sessionID, inner2.sessionID) {
 		return nil, nil, "unknown", ErrECHInvalid
 	}

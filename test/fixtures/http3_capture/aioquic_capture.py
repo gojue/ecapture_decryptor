@@ -589,6 +589,18 @@ class RetryEarlyHTTP(EarlyResetHTTP):
         super().__init__(*args, **kwargs)
         self.requeued_early = 0
         self.retry_preserved = False
+        self.request_wire = b""
+        transmit_original = self.transmit
+
+        def transmit_checked():
+            if self._quic.configuration.is_client and not self.request_wire:
+                stream = self._quic._streams.get(0)
+                if stream is not None and stream.sender._buffer:
+                    assert stream.sender._buffer_start == 0
+                    self.request_wire = bytes(stream.sender._buffer)
+            return transmit_original()
+
+        self.transmit = transmit_checked
         connect_original = self._quic._connect
 
         def connect_checked(now):
@@ -600,6 +612,7 @@ class RetryEarlyHTTP(EarlyResetHTTP):
             early_secret = quic._cryptos[Epoch.ZERO_RTT].send.secret
             packet_number, tls = quic._packet_number, quic.tls
             assert handshake and early_secret
+            assert bytes(quic._streams[0].sender._buffer) == self.request_wire
             assert quic._peer_cid.cid == quic._retry_source_connection_id
             assert quic._peer_token and quic._peer_cid.cid != quic._original_destination_connection_id
             for version, pair in quic._cryptos_initial.items():
@@ -623,9 +636,17 @@ async def run_retry_early(args):
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     qlog, evidence = QuicLogger(), []
-    suite = CipherSuite.AES_128_GCM_SHA256
-    with (output / "retry-early.keys").open("w") as secrets:
-        for number, version, port in [(1, 1, 44473), (2, 0x6B3343CF, 44474)]:
+    name = "retry-early-matrix" if args.retry_early_matrix else "retry-early"
+    cells = [(1, 1, 44473, "", CipherSuite.AES_128_GCM_SHA256),
+             (2, 0x6B3343CF, 44474, "", CipherSuite.AES_128_GCM_SHA256)]
+    if args.retry_early_matrix:
+        cells = [(number, version, 44478 + 2 * (number - 1) + index, suite_name, suite)
+            for number, version in [(1, 1), (2, 0x6B3343CF)]
+            for index, (suite_name, suite) in enumerate([
+                ("aes256", CipherSuite.AES_256_GCM_SHA384),
+                ("chacha", CipherSuite.CHACHA20_POLY1305_SHA256)])]
+    with (output / (name + ".keys")).open("w") as secrets:
+        for number, version, port, suite_name, suite in cells:
             tickets, received = {}, []
             common = dict(alpn_protocols=["h3"], supported_versions=[version], cipher_suites=[suite],
                 secrets_log_file=secrets, quic_logger=qlog)
@@ -643,7 +664,7 @@ async def run_retry_early(args):
                         session_ticket=received[-1] if mode != "seed" else None, **common)
                     async with connect("127.0.0.1", port, configuration=client_config, create_protocol=RetryEarlyHTTP,
                             session_ticket_handler=received.append, wait_connected=mode == "seed") as client:
-                        path = f"/retry/v{number}/{mode}"
+                        path = f"/retry/v{number}/" + (suite_name + "/" if suite_name else "") + mode
                         assert await client.request(path) == 0
                         await asyncio.sleep(0.05)
                         assert client.handshake.early_data_accepted == (mode == "accepted")
@@ -666,21 +687,24 @@ async def run_retry_early(args):
                             expected.append("1RTT")
                         assert [f["packet_type"] for f in sent] == expected
                         assert all(f["offset"] == 0 and f["fin"] and
-                            f["length"] == (26 if mode == "seed" else 29) for f in sent)
+                            f["length"] == len(client.request_wire) for f in sent)
+                        if not args.retry_early_matrix:
+                            assert len(client.request_wire) == (26 if mode == "seed" else 29)
                         if mode == "seed":
                             assert not retries
                         else:
                             assert len(retries) == 1 and client.requeued_early > 0 and client.retry_preserved
                             assert any(f["packet_type"] == "0RTT" and f["index"] < retries[0] for f in sent)
                             assert any(f["packet_type"] == "0RTT" and f["index"] > retries[0] for f in sent)
-                        evidence.append(dict(version=hex(version), mode=mode, path=path, suite=suite.name,
+                        evidence.append(dict(version=hex(version), mode=mode, path=path, port=port, suite=suite.name,
+                            request_wire=client.request_wire.hex(),
                             early_accepted=client.handshake.early_data_accepted, retry_count=len(retries),
                             requeued_packets=client.requeued_early, preserved_handshake=client.retry_preserved, request_frames=sent))
                 finally:
                     server.close()
                 await asyncio.sleep(0.05)
-    (output / "retry-early.qlog").write_text(json.dumps(qlog.to_dict()))
-    (output / "retry-early-evidence.json").write_text(json.dumps(evidence, indent=2))
+    (output / (name + ".qlog")).write_text(json.dumps(qlog.to_dict()))
+    (output / (name + "-evidence.json")).write_text(json.dumps(evidence, indent=2))
     print(json.dumps(evidence, indent=2))
 
 
@@ -770,7 +794,8 @@ if __name__ == "__main__":
     parser.add_argument("--datagram", action="store_true", help="generate the D11 QUIC DATAGRAM fixture")
     parser.add_argument("--key-update-matrix", action="store_true", help="generate v1/v2 AES256/ChaCha key updates")
     parser.add_argument("--retry-early", action="store_true", help="generate actual Retry with accepted/rejected 0-RTT")
+    parser.add_argument("--retry-early-matrix", action="store_true", help="generate v1/v2 AES256/ChaCha Retry with 0-RTT")
     args = parser.parse_args()
-    if sum([args.dynamic, args.datagram, args.early_reset, args.key_update_matrix, args.retry_early]) > 1:
+    if sum([args.dynamic, args.datagram, args.early_reset, args.key_update_matrix, args.retry_early, args.retry_early_matrix]) > 1:
         parser.error("choose one fixture mode")
-    asyncio.run(run_retry_early(args) if args.retry_early else run_key_update_matrix(args) if args.key_update_matrix else run_datagram(args) if args.datagram else run_early_reset(args) if args.early_reset else run_dynamic(args) if args.dynamic else run(args))
+    asyncio.run(run_retry_early(args) if args.retry_early or args.retry_early_matrix else run_key_update_matrix(args) if args.key_update_matrix else run_datagram(args) if args.datagram else run_early_reset(args) if args.early_reset else run_dynamic(args) if args.dynamic else run(args))

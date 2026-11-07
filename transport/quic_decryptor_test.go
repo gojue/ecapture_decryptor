@@ -507,7 +507,7 @@ func TestQUICKeyUpdateCapturedGenerations(t *testing.T) {
 // Check negotiated suites and authenticated state transitions independently of
 // the root API's exact-message assertions for these real endpoint captures.
 func TestQUICStateMatrixCapturedTransitions(t *testing.T) {
-	for _, fixture := range []string{"keyupdate_matrix", "retry_early"} {
+	for _, fixture := range []string{"keyupdate_matrix", "retry_early", "retry_early_matrix"} {
 		t.Run(fixture, func(t *testing.T) {
 			base := "../test/testdata/http3_" + fixture + "_aioquic"
 			file, err := os.Open(base + ".pcapng")
@@ -522,6 +522,10 @@ func TestQUICStateMatrixCapturedTransitions(t *testing.T) {
 			keys, err := os.ReadFile(base + ".keys")
 			if err != nil {
 				t.Fatal(err)
+			}
+			firstPort, lastPort := 44469, 44474
+			if fixture == "retry_early_matrix" {
+				firstPort, lastPort = 44478, 44481
 			}
 			flows, ports := make(map[string]*QUICDecryptor), make(map[string]int)
 			randoms := make(map[string][]byte)
@@ -539,11 +543,11 @@ func TestQUICStateMatrixCapturedTransitions(t *testing.T) {
 					t.Fatal("fixture contains non-UDP packet")
 				}
 				server, client := int(udp.DstPort), int(udp.SrcPort)
-				isClient := server >= 44469 && server <= 44474
+				isClient := server >= firstPort && server <= lastPort
 				if !isClient {
 					server, client = client, server
 				}
-				if server < 44469 || server > 44474 {
+				if server < firstPort || server > lastPort {
 					t.Fatal("unexpected fixture endpoint", server)
 				}
 				id := fmt.Sprintf("%d/%d", client, server)
@@ -571,15 +575,19 @@ func TestQUICStateMatrixCapturedTransitions(t *testing.T) {
 					t.Fatalf("capture failed: errors=%v pending=%d", q.flow.errors, len(q.flow.pending))
 				}
 				version, suite := quicVersion1, uint16(0x1301)
-				if fixture == "keyupdate_matrix" {
-					cell := ports[id] - 44469
+				if fixture != "retry_early" {
+					cell := ports[id] - firstPort
 					if cell < 0 || cell >= 4 {
-						t.Fatal("unexpected KU port", ports[id])
+						t.Fatal("unexpected matrix port", ports[id])
 					}
 					if cell >= 2 {
 						version = quicVersion2
 					}
 					suite = uint16(0x1302 + cell%2)
+				} else if ports[id] == 44474 {
+					version = quicVersion2
+				}
+				if fixture == "keyupdate_matrix" {
 					counts[fmt.Sprintf("%x/%x", version, suite)]++
 					for dir, phase := range q.flow.keyPhase {
 						if phase.generation != 2 || !phase.authenticated || phase.previous == nil {
@@ -587,19 +595,16 @@ func TestQUICStateMatrixCapturedTransitions(t *testing.T) {
 						}
 					}
 				} else {
-					if ports[id] == 44474 {
-						version = quicVersion2
-					}
 					if q.flow.early.seen {
 						if !q.flow.handshake.retryApplied || q.flow.handshake.previousInitial[0] == nil || q.flow.early.status != "accepted" && q.flow.early.status != "rejected" {
 							t.Fatal("early connection did not complete Retry and acceptance", id)
 						}
-						counts[fmt.Sprintf("%x/%s", version, q.flow.early.status)]++
+						counts[fmt.Sprintf("%x/%x/%s", version, suite, q.flow.early.status)]++
 					} else {
 						if q.flow.handshake.retryApplied {
 							t.Fatal("seed unexpectedly retried")
 						}
-						counts[fmt.Sprintf("%x/seed", version)]++
+						counts[fmt.Sprintf("%x/%x/seed", version, suite)]++
 					}
 				}
 				if q.version != version || q.flow.cipherSuite != suite {
@@ -612,12 +617,18 @@ func TestQUICStateMatrixCapturedTransitions(t *testing.T) {
 				assertQUICReleased(t, q)
 			}
 			want := 4
-			if fixture == "retry_early" {
+			if fixture != "keyupdate_matrix" {
 				want = 6
+				suites := []uint16{0x1301}
+				if fixture == "retry_early_matrix" {
+					want, suites = 12, []uint16{0x1302, 0x1303}
+				}
 				for _, version := range []uint32{quicVersion1, quicVersion2} {
-					for _, status := range []string{"seed", "accepted", "rejected"} {
-						if counts[fmt.Sprintf("%x/%s", version, status)] != 1 {
-							t.Fatal("Retry matrix cell missing/duplicated", counts)
+					for _, suite := range suites {
+						for _, status := range []string{"seed", "accepted", "rejected"} {
+							if counts[fmt.Sprintf("%x/%x/%s", version, suite, status)] != 1 {
+								t.Fatal("Retry matrix cell missing/duplicated", counts)
+							}
 						}
 					}
 				}
@@ -742,110 +753,116 @@ func TestQUICRetryPreservesEarlyKeysPacketNumbersAndReplay(t *testing.T) {
 			t.Fatal(err)
 		}
 		retry := packets[0]
-		for _, accepted := range []bool{false, true} {
-			for _, late := range []bool{false, true} {
-				t.Run(fmt.Sprintf("v%x/accepted=%v/late=%v", retry.version, accepted, late), func(t *testing.T) {
-					q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true})
-					original := mustDecodeHex(t, "8394c8f03e515708")
-					random, secret := bytes.Repeat([]byte{0x44}, 32), bytes.Repeat([]byte{7}, 32)
-					if !late {
-						q.keyLog.AddSecret("CLIENT_EARLY_TRAFFIC_SECRET", hex.EncodeToString(random), secret)
-					}
-					initialKey, _ := quicInitialKeys(retry.version, original)
-					hello := append([]byte{1, 0, 0, 34, 3, 3}, random...)
-					crypto := append([]byte{6, 0, byte(len(hello))}, hello...)
-					initial := quicLongTestPacket(t, retry.version, QUICPacketTypeInitial, original, nil, nil, initialKey, 10, crypto)
-					q.processQUICDatagram(quicDatagram{data: initial.data, isClient: true})
-					earlyKey, _ := deriveQUICKeys(secret, retry.version, quicAES128)
-					prefix := quicLongTestPacket(t, retry.version, QUICPacketType0RTT, original, nil, nil, earlyKey, 255, []byte{0x0e, 0, 0, 3, 'a', 'b', 'c'})
-					q.processQUICDatagram(quicDatagram{data: prefix.data, isClient: true, at: time.Unix(1, 0)})
-					earlySince, pendingSince := q.flow.early.since, q.flow.pendingSince
-					badRetry := retry
-					badRetry.data = bytes.Clone(retry.data)
-					badRetry.data[len(badRetry.data)-1] ^= 1
-					if _, err := q.processQUICPacket(badRetry, false, time.Time{}); err == nil || q.flow.handshake.retry != nil {
-						t.Fatal("forged Retry changed early connection state", err)
-					}
-					q.processQUICDatagram(quicDatagram{data: retry.data})
-					newInitialKey, _ := quicInitialKeys(retry.version, retry.scid)
-					badToken := quicLongTestPacket(t, retry.version, QUICPacketTypeInitial, retry.scid, nil, []byte("wrong"), newInitialKey, 11, crypto)
-					if _, err := q.processQUICPacket(badToken, true, time.Time{}); err == nil || q.flow.handshake.retryApplied {
-						t.Fatal("invalid Retry token changed Initial epoch", err)
-					}
-					post := quicLongTestPacket(t, retry.version, QUICPacketTypeInitial, retry.scid, nil, []byte("token"), newInitialKey, 11, crypto)
-					q.processQUICDatagram(quicDatagram{data: post.data, isClient: true})
-					if !bytes.Equal(q.flow.clientRandom, random) || q.flow.largest[0][quicLevelInitial] != 11 {
-						t.Fatal("Retry changed ClientHello identity or reset Initial PN")
-					}
-					if !q.flow.early.since.Equal(earlySince) || !q.flow.pendingSince.Equal(pendingSince) {
-						t.Fatal("Retry extended early/key wait deadline")
-					}
-					// The wrapped one-byte packet number needs the pre-Retry PN.
-					// Retry changes Initial keys, never the early secret or app PN.
-					suffix := quicLongTestPacket(t, retry.version, QUICPacketType0RTT, retry.scid, nil, nil, earlyKey, 256, []byte{0x0f, 0, 3, 3, 'd', 'e', 'f'})
-					if !late {
-						bad := suffix
-						bad.data = bytes.Clone(suffix.data)
-						bad.data[len(bad.data)-1] ^= 1
-						if _, err := q.processQUICPacket(bad, true, time.Time{}); err == nil || q.flow.largest[0][quicLevelApplication] != 255 {
-							t.Fatal("bad early authentication consumed the next PN", err)
+		for _, suite := range []quicCipherSuite{quicAES128, quicAES256, quicChaCha20} {
+			for _, accepted := range []bool{false, true} {
+				for _, late := range []bool{false, true} {
+					t.Run(fmt.Sprintf("v%x/suite%d/accepted=%v/late=%v", retry.version, suite, accepted, late), func(t *testing.T) {
+						q, out := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true})
+						original := mustDecodeHex(t, "8394c8f03e515708")
+						secretLen := 32
+						if suite == quicAES256 {
+							secretLen = 48
 						}
-					}
-					q.processQUICDatagram(quicDatagram{data: suffix.data, isClient: true, at: time.Unix(2, 0)})
-					// New-PN retransmission and a capture duplicate share stream bytes.
-					replay := quicLongTestPacket(t, retry.version, QUICPacketType0RTT, retry.scid, nil, nil, earlyKey, 257, []byte{0x0e, 0, 0, 3, 'a', 'b', 'c'})
-					q.processQUICDatagram(quicDatagram{data: replay.data, isClient: true})
-					q.processQUICDatagram(quicDatagram{data: prefix.data, isClient: true})
-					if len(out) != 0 {
-						t.Fatal("early bytes escaped before acceptance was authenticated")
-					}
-					ee := []byte{8, 0, 0, 2, 0, 0}
-					status := "rejected"
-					if accepted {
-						ee, status = []byte{8, 0, 0, 6, 0, 4, 0, 42, 0, 0}, "accepted"
-					}
-					if err := q.observeServerCrypto(quicLevelHandshake, 0, ee); err != nil {
-						t.Fatal(err)
-					}
-					if late {
+						random, secret := bytes.Repeat([]byte{0x44}, 32), bytes.Repeat([]byte{7}, secretLen)
+						if !late {
+							q.keyLog.AddSecret("CLIENT_EARLY_TRAFFIC_SECRET", hex.EncodeToString(random), secret)
+						}
+						initialKey, _ := quicInitialKeys(retry.version, original)
+						hello := append([]byte{1, 0, 0, 34, 3, 3}, random...)
+						crypto := append([]byte{6, 0, byte(len(hello))}, hello...)
+						initial := quicLongTestPacket(t, retry.version, QUICPacketTypeInitial, original, nil, nil, initialKey, 10, crypto)
+						q.processQUICDatagram(quicDatagram{data: initial.data, isClient: true})
+						earlyKey, _ := deriveQUICKeys(secret, retry.version, suite)
+						prefix := quicLongTestPacket(t, retry.version, QUICPacketType0RTT, original, nil, nil, earlyKey, 255, []byte{0x0e, 0, 0, 3, 'a', 'b', 'c'})
+						q.processQUICDatagram(quicDatagram{data: prefix.data, isClient: true, at: time.Unix(1, 0)})
+						earlySince, pendingSince := q.flow.early.since, q.flow.pendingSince
+						badRetry := retry
+						badRetry.data = bytes.Clone(retry.data)
+						badRetry.data[len(badRetry.data)-1] ^= 1
+						if _, err := q.processQUICPacket(badRetry, false, time.Time{}); err == nil || q.flow.handshake.retry != nil {
+							t.Fatal("forged Retry changed early connection state", err)
+						}
+						q.processQUICDatagram(quicDatagram{data: retry.data})
+						newInitialKey, _ := quicInitialKeys(retry.version, retry.scid)
+						badToken := quicLongTestPacket(t, retry.version, QUICPacketTypeInitial, retry.scid, nil, []byte("wrong"), newInitialKey, 11, crypto)
+						if _, err := q.processQUICPacket(badToken, true, time.Time{}); err == nil || q.flow.handshake.retryApplied {
+							t.Fatal("invalid Retry token changed Initial epoch", err)
+						}
+						post := quicLongTestPacket(t, retry.version, QUICPacketTypeInitial, retry.scid, nil, []byte("token"), newInitialKey, 11, crypto)
+						q.processQUICDatagram(quicDatagram{data: post.data, isClient: true})
+						if !bytes.Equal(q.flow.clientRandom, random) || q.flow.largest[0][quicLevelInitial] != 11 {
+							t.Fatal("Retry changed ClientHello identity or reset Initial PN")
+						}
+						if !q.flow.early.since.Equal(earlySince) || !q.flow.pendingSince.Equal(pendingSince) {
+							t.Fatal("Retry extended early/key wait deadline")
+						}
+						// The wrapped one-byte packet number needs the pre-Retry PN.
+						// Retry changes Initial keys, never the early secret or app PN.
+						suffix := quicLongTestPacket(t, retry.version, QUICPacketType0RTT, retry.scid, nil, nil, earlyKey, 256, []byte{0x0f, 0, 3, 3, 'd', 'e', 'f'})
+						if !late {
+							bad := suffix
+							bad.data = bytes.Clone(suffix.data)
+							bad.data[len(bad.data)-1] ^= 1
+							if _, err := q.processQUICPacket(bad, true, time.Time{}); err == nil || q.flow.largest[0][quicLevelApplication] != 255 {
+								t.Fatal("bad early authentication consumed the next PN", err)
+							}
+						}
+						q.processQUICDatagram(quicDatagram{data: suffix.data, isClient: true, at: time.Unix(2, 0)})
+						// New-PN retransmission and a capture duplicate share stream bytes.
+						replay := quicLongTestPacket(t, retry.version, QUICPacketType0RTT, retry.scid, nil, nil, earlyKey, 257, []byte{0x0e, 0, 0, 3, 'a', 'b', 'c'})
+						q.processQUICDatagram(quicDatagram{data: replay.data, isClient: true})
+						q.processQUICDatagram(quicDatagram{data: prefix.data, isClient: true})
 						if len(out) != 0 {
-							t.Fatal("missing early secret did not hold early output")
+							t.Fatal("early bytes escaped before acceptance was authenticated")
 						}
-						q.keyLog.AddSecret("CLIENT_EARLY_TRAFFIC_SECRET", hex.EncodeToString(random), secret)
-						q.retryQUICPacketsWithNewKeys()
-					}
-					if len(q.flow.pending) != 0 || len(q.flow.errors) != 0 || q.flow.largest[0][quicLevelApplication] != 257 || len(out) != 2 {
-						t.Fatalf("Retry/early state: pending=%d errors=%v PN=%d outputs=%d", len(q.flow.pending), q.flow.errors, q.flow.largest[0][quicLevelApplication], len(out))
-					}
-					for i, data := range []string{"abc", "def"} {
-						p := <-out
-						if string(p.Data) != data || p.Metadata["encryption_level"] != "0rtt" || p.Metadata["early_data"] != status || p.Metadata["offset"] != uint64(i*3) || p.Metadata["end"] != (i == 1) || !p.Timestamp.Equal(time.Unix(int64(i+1), 0)) {
-							t.Fatal("Retry changed early byte/phase/offset identity", p.Metadata)
+						ee := []byte{8, 0, 0, 2, 0, 0}
+						status := "rejected"
+						if accepted {
+							ee, status = []byte{8, 0, 0, 6, 0, 4, 0, 42, 0, 0}, "accepted"
 						}
-					}
-					appKey, _ := deriveQUICKeys(bytes.Repeat([]byte{9}, 32), retry.version, quicAES128)
-					q.flow.keys[0][quicLevelApplication] = []*QUICKeys{appKey}
-					app := quicKeyPhasePacket(t, appKey, 258, 0, []byte{0x0f, 0, 0, 6, 'a', 'b', 'c', 'd', 'e', 'f'})
-					q.processQUICDatagram(quicDatagram{data: app.data, isClient: true})
-					want := 1
-					if accepted {
-						want = 0
-					}
-					if len(out) != want || len(q.flow.errors) != 0 || q.flow.largest[0][quicLevelApplication] != 258 {
-						t.Fatal("Retry changed shared app PN or acceptance deduplication", q.flow.errors)
-					}
-					if !accepted {
-						p := <-out
-						if string(p.Data) != "abcdef" || p.Metadata["offset"] != uint64(0) || p.Metadata["encryption_level"] != "1rtt" || p.Metadata["early_data"] != nil || p.Metadata["end"] != true {
-							t.Fatal("rejected early data polluted normal replay", p.Metadata)
+						if err := q.observeServerCrypto(quicLevelHandshake, 0, ee); err != nil {
+							t.Fatal(err)
 						}
-					}
-					_ = q.Close()
-					if err := q.Decrypt(); err != nil {
-						t.Fatal(err)
-					}
-					assertQUICReleased(t, q)
-				})
+						if late {
+							if len(out) != 0 {
+								t.Fatal("missing early secret did not hold early output")
+							}
+							q.keyLog.AddSecret("CLIENT_EARLY_TRAFFIC_SECRET", hex.EncodeToString(random), secret)
+							q.retryQUICPacketsWithNewKeys()
+						}
+						if len(q.flow.pending) != 0 || len(q.flow.errors) != 0 || q.flow.largest[0][quicLevelApplication] != 257 || len(out) != 2 {
+							t.Fatalf("Retry/early state: pending=%d errors=%v PN=%d outputs=%d", len(q.flow.pending), q.flow.errors, q.flow.largest[0][quicLevelApplication], len(out))
+						}
+						for i, data := range []string{"abc", "def"} {
+							p := <-out
+							if string(p.Data) != data || p.Metadata["encryption_level"] != "0rtt" || p.Metadata["early_data"] != status || p.Metadata["offset"] != uint64(i*3) || p.Metadata["end"] != (i == 1) || !p.Timestamp.Equal(time.Unix(int64(i+1), 0)) {
+								t.Fatal("Retry changed early byte/phase/offset identity", p.Metadata)
+							}
+						}
+						appKey, _ := deriveQUICKeys(bytes.Repeat([]byte{9}, secretLen), retry.version, suite)
+						q.flow.keys[0][quicLevelApplication] = []*QUICKeys{appKey}
+						app := quicKeyPhasePacket(t, appKey, 258, 0, []byte{0x0f, 0, 0, 6, 'a', 'b', 'c', 'd', 'e', 'f'})
+						q.processQUICDatagram(quicDatagram{data: app.data, isClient: true})
+						want := 1
+						if accepted {
+							want = 0
+						}
+						if len(out) != want || len(q.flow.errors) != 0 || q.flow.largest[0][quicLevelApplication] != 258 {
+							t.Fatal("Retry changed shared app PN or acceptance deduplication", q.flow.errors)
+						}
+						if !accepted {
+							p := <-out
+							if string(p.Data) != "abcdef" || p.Metadata["offset"] != uint64(0) || p.Metadata["encryption_level"] != "1rtt" || p.Metadata["early_data"] != nil || p.Metadata["end"] != true {
+								t.Fatal("rejected early data polluted normal replay", p.Metadata)
+							}
+						}
+						_ = q.Close()
+						if err := q.Decrypt(); err != nil {
+							t.Fatal(err)
+						}
+						assertQUICReleased(t, q)
+					})
+				}
 			}
 		}
 	}

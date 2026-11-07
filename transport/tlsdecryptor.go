@@ -107,11 +107,14 @@ type TLSDecryptor struct {
 	rawMetadata    map[string]any
 
 	clientRandom             []byte // Selected ClientHello (inner for authenticated ECH).
+	earlyClientRandom        []byte // Authenticated CH1 inner may differ from rejected ECH's outer application identity.
 	tls13                    [2]tls13Direction
 	earlyOffered             bool
 	earlyMu                  sync.Mutex // Serializes early-status resolution and client output.
 	earlyStatus              string
-	earlyHandshakeWithoutEnd bool // earlyMu; accepted 0-RTT requires EndOfEarlyData.
+	earlyCipherSuite         uint16 // earlyMu; selected only after early AEAD authentication.
+	earlyHandshakeWithoutEnd bool   // earlyMu; accepted 0-RTT requires EndOfEarlyData.
+	earlyEndSeen             bool   // earlyMu; rejected 0-RTT forbids EndOfEarlyData in either scheduling order.
 	earlyPending             []tlsEarlyChunk
 	earlyBytes               int
 	earlyRawOffset           uint64 // protocolMu; rejected/unknown early data has its own space.
@@ -122,6 +125,8 @@ type TLSDecryptor struct {
 	tls13Wake                chan struct{}
 	echOuterCandidate        bool
 	echOuterReported         bool // handshakeMu; report only after an outer record authenticates.
+	echRejected              bool
+	echRejectedDrain         bool // Authenticated early/outer handshake only; missing client application keys remain terminal.
 }
 
 const (
@@ -803,9 +808,12 @@ func (td *TLSDecryptor) releaseBuffers() {
 	for i := range td.tls13 {
 		td.tls13[i].handshake.Reset()
 		td.tls13[i].early = nil
+		td.tls13[i].earlyCandidates = nil
+		td.tls13[i].pendingRecord = nil
 	}
 	td.retryEarlyRecords = nil
 	td.retryEarlyBytes = 0
+	td.earlyClientRandom = nil
 	td.earlyMu.Lock()
 	td.earlyPending = nil
 	td.earlyBytes = 0
@@ -867,7 +875,9 @@ func (td *TLSDecryptor) parseHandshake() error {
 		if err != nil {
 			return err
 		}
-		if second.EarlyData || !hello.ECHOffered && (!bytes.Equal(second.Random, clientRandom) || second.ECHOffered) {
+		// ECH may copy early_data to CH2 Outer; only authenticated Inner2
+		// acceptance permits that copy. ResolveECHClientHelloRetry checks it.
+		if !hello.ECHOffered && (second.EarlyData || !bytes.Equal(second.Random, clientRandom) || second.ECHOffered) {
 			return errTLS13Handshake
 		}
 		hello = second
@@ -902,15 +912,37 @@ func (td *TLSDecryptor) parseHandshake() error {
 		}
 		return len(s.MasterSecret) != 0
 	}
+	echEarly := echOffered && (firstHello.EarlyData || len(td.retryEarlyRecords) > 0)
 	secrets, err := td.keyLog.WaitForSecrets(clientRandom, func(s *crypto.TLSSecrets) bool {
-		return applicationReady(s) || firstHello.ECHOffered && s != nil && len(s.ECHSecret) > 0 && len(s.ECHConfig) > 0
+		echReady := firstHello.ECHOffered && s != nil && len(s.ECHSecret) > 0 && len(s.ECHConfig) > 0
+		// GREASE can accompany ordinary 0-RTT. Only the actual Outer random's
+		// complete record keys permit that unconfirmed candidate; a partial
+		// ECH label pair still waits for its authenticated interpretation.
+		outerEarlyReady := echEarly && applicationReady(s) && len(s.ECHSecret) == 0 && len(s.ECHConfig) == 0 &&
+			len(s.ClientEarlyTrafficSecret) > 0 && len(s.ClientHandshakeTrafficSecret) > 0 && len(s.ServerHandshakeTrafficSecret) > 0
+		return echReady || outerEarlyReady || !echEarly && applicationReady(s)
 	}, td.closeSignal, td.options.SecretWaitTimeout())
 	if err != nil {
-		td.options.Report(td.ConnectionInfo, "keys", "missing_secret")
+		code := "missing_secret"
+		if echEarly {
+			code = "ech_unavailable"
+		}
+		td.options.Report(td.ConnectionInfo, "keys", code)
 		return fmt.Errorf("wait for TLS secrets: %w", err)
+	}
+	var earlyRandom []byte
+	if firstHello.EarlyData {
+		earlyRandom = firstHello.Random
 	}
 	if firstHello.ECHOffered {
 		var status string
+		if len(secrets.ECHSecret) > 0 && len(secrets.ECHConfig) > 0 {
+			earlyRandom, err = crypto.ECHClientEarlyRandom(firstHello, secrets)
+			if err != nil {
+				td.options.Report(td.ConnectionInfo, "handshake", "ech_unavailable")
+				return err
+			}
+		}
 		if td.helloRetry {
 			firstHello, hello, status, err = crypto.ResolveECHClientHelloRetry(firstHello, hello, retryHandshake, serverHelloHandshake, secrets)
 		} else if len(secrets.ECHSecret) > 0 && len(secrets.ECHConfig) > 0 {
@@ -923,22 +955,24 @@ func (td *TLSDecryptor) parseHandshake() error {
 		}
 		if len(secrets.ECHSecret) > 0 && len(secrets.ECHConfig) > 0 {
 			clientRandom = hello.Random
+			td.echRejected = status == "rejected"
 			td.options.Report(td.ConnectionInfo, "handshake", "ech_"+status)
-			secrets, err = td.keyLog.WaitForSecrets(clientRandom, applicationReady, td.closeSignal, td.options.SecretWaitTimeout())
+			secrets, err = td.keyLog.WaitForSecrets(clientRandom, func(s *crypto.TLSSecrets) bool {
+				return applicationReady(s) || td.echRejected && len(earlyRandom) > 0 && s != nil &&
+					len(s.ClientHandshakeTrafficSecret) > 0 && len(s.ServerHandshakeTrafficSecret) > 0 && len(s.ServerTrafficSecret) > 0
+			}, td.closeSignal, td.options.SecretWaitTimeout())
 			if err != nil {
 				td.options.Report(td.ConnectionInfo, "keys", "missing_secret")
 				return err
 			}
+			td.echRejectedDrain = td.echRejected && len(earlyRandom) > 0 && len(secrets.ClientTrafficSecret) == 0
 		} else {
 			td.echOuterCandidate = true
 		}
 	}
 	td.clientRandom = bytes.Clone(clientRandom)
-	td.earlyOffered = version == tls.VersionTLS13 && firstHello.EarlyData
-	if td.helloRetry && echOffered && (td.earlyOffered || len(td.retryEarlyRecords) > 0) {
-		td.options.Report(td.ConnectionInfo, "handshake", "unsupported_handshake")
-		return errors.New("TLS ECH with HRR and early data is not supported")
-	}
+	td.earlyClientRandom = bytes.Clone(earlyRandom)
+	td.earlyOffered = version == tls.VersionTLS13 && len(earlyRandom) != 0
 	if len(td.retryEarlyRecords) > 0 && !td.earlyOffered {
 		return errTLS13Handshake
 	}
@@ -953,7 +987,7 @@ func (td *TLSDecryptor) parseHandshake() error {
 
 	// Create decryptors based on TLS version
 	if version == tls.VersionTLS13 {
-		if secrets.ClientTrafficSecret == nil || secrets.ServerTrafficSecret == nil {
+		if secrets.ClientTrafficSecret == nil && !td.echRejectedDrain || secrets.ServerTrafficSecret == nil {
 			return fmt.Errorf("missing TLS 1.3 traffic secrets")
 		}
 
@@ -972,9 +1006,11 @@ func (td *TLSDecryptor) parseHandshake() error {
 		}
 
 		// Create application data decryptors
-		td.clientDecryptor, err = crypto.NewRecordDecryptor(version, cipherSuite, secrets.ClientTrafficSecret)
-		if err != nil {
-			return fmt.Errorf("create client decryptor: %w", err)
+		if secrets.ClientTrafficSecret != nil {
+			td.clientDecryptor, err = crypto.NewRecordDecryptor(version, cipherSuite, secrets.ClientTrafficSecret)
+			if err != nil {
+				return fmt.Errorf("create client decryptor: %w", err)
+			}
 		}
 
 		td.serverDecryptor, err = crypto.NewRecordDecryptor(version, cipherSuite, secrets.ServerTrafficSecret)
