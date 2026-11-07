@@ -1,4 +1,4 @@
-# v1.4.0 (Unreleased)
+# v1.4.0 (2026-11-07)
 
 Changes since v1.3.2; this version is being prepared and has not been released.
 
