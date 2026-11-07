@@ -84,17 +84,51 @@ func kemSecret(key *ecdh.PrivateKey, enc []byte) ([]byte, error) {
 
 type echObserver struct {
 	net.Conn
-	key           *ecdh.PrivateKey
-	config        []byte
-	keys          io.Writer
-	record, hello []byte
-	logged        bool
+	key                              *ecdh.PrivateKey
+	config                           []byte
+	keys                             io.Writer
+	record, hello                    []byte
+	logged                           bool
+	clientHellos, hrrs, secondEncLen int
+	serverRecord, serverHello        []byte
 }
 
 func (o *echObserver) Write(b []byte) (int, error) {
 	n, err := o.Conn.Write(b)
-	if err == nil && !o.logged {
+	if err == nil {
 		err = o.observe(b[:n])
+	}
+	return n, err
+}
+
+func (o *echObserver) Read(b []byte) (int, error) {
+	n, err := o.Conn.Read(b)
+	if n > 0 {
+		o.serverRecord = append(o.serverRecord, b[:n]...)
+		if len(o.serverRecord)+len(o.serverHello) > 65536 {
+			return n, errors.New("fixture server handshake exceeds bound")
+		}
+		for len(o.serverRecord) >= 5 {
+			size := 5 + int(binary.BigEndian.Uint16(o.serverRecord[3:5]))
+			if len(o.serverRecord) < size {
+				break
+			}
+			if o.serverRecord[0] == 22 {
+				o.serverHello = append(o.serverHello, o.serverRecord[5:size]...)
+			}
+			o.serverRecord = o.serverRecord[size:]
+			for len(o.serverHello) >= 4 {
+				length := 4 + int(o.serverHello[1])<<16 + int(o.serverHello[2])<<8 + int(o.serverHello[3])
+				if len(o.serverHello) < length {
+					break
+				}
+				const retryRandom = "\xcf\x21\xad\x74\xe5\x9a\x61\x11\xbe\x1d\x8c\x02\x1e\x65\xb8\x91\xc2\xa2\x11\x16\x7a\xbb\x8c\x5e\x07\x9e\x09\xe2\xc8\xa8\x33\x9c"
+				if o.serverHello[0] == 2 && length >= 38 && string(o.serverHello[6:38]) == retryRandom {
+					o.hrrs++
+				}
+				o.serverHello = o.serverHello[length:]
+			}
+		}
 	}
 	return n, err
 }
@@ -160,6 +194,15 @@ func (o *echObserver) observe(data []byte) error {
 			if kind != 0xfe0d {
 				continue
 			}
+			o.clientHellos++
+			if o.logged {
+				if len(ext) < 8 || o.clientHellos != 2 {
+					return errors.New("unexpected retry ECH extension")
+				}
+				o.secondEncLen = int(binary.BigEndian.Uint16(ext[6:8]))
+				o.record, o.hello = nil, nil
+				return nil
+			}
 			if len(ext) < 40 || !bytes.Equal(ext[:5], []byte{0, 0, 1, 0, 1}) || ext[5] != o.config[4] || binary.BigEndian.Uint16(ext[6:]) != 32 {
 				return errors.New("unexpected fixture ECH suite/config")
 			}
@@ -195,7 +238,7 @@ func exactRead(conn net.Conn, want []byte) error {
 	return nil
 }
 
-func runECH(cert tls.Certificate, keys *keyWriter, accepted bool) error {
+func runECH(cert tls.Certificate, keys *keyWriter, accepted, hrr bool) error {
 	key, config, err := echConfig(7)
 	if err != nil {
 		return err
@@ -209,12 +252,23 @@ func runECH(cert tls.Certificate, keys *keyWriter, accepted bool) error {
 			return err
 		}
 	}
+	if hrr {
+		mode, port = "ech_hrr_accepted", 44476
+		if !accepted {
+			mode, port = "ech_hrr_rejected", 44477
+		}
+	}
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
 	server := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13, CurvePreferences: []tls.CurveID{tls.X25519}, NextProtos: []string{"http/1.1"}, EncryptedClientHelloKeys: []tls.EncryptedClientHelloKey{{Config: serverConfig, PrivateKey: serverKey.Bytes(), SendAsRetry: true}}}
+	clientCurves := []tls.CurveID{tls.X25519}
+	if hrr {
+		server.CurvePreferences = []tls.CurveID{tls.CurveP256}
+		clientCurves = append(clientCurves, tls.CurveP256)
+	}
 	request, response := echHTTP(mode)
 	done := make(chan error, 1)
 	go func() {
@@ -260,7 +314,7 @@ func runECH(cert tls.Certificate, keys *keyWriter, accepted bool) error {
 	defer raw.Close()
 	_ = raw.SetDeadline(time.Now().Add(10 * time.Second))
 	observer := &echObserver{Conn: raw, key: key, config: config, keys: keys}
-	client := tls.Client(observer, &tls.Config{MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13, CurvePreferences: []tls.CurveID{tls.X25519}, ServerName: "secret.example", InsecureSkipVerify: true, NextProtos: []string{"http/1.1"}, KeyLogWriter: keys, EncryptedClientHelloConfigList: vector(config), EncryptedClientHelloRejectionVerify: func(tls.ConnectionState) error { return nil }})
+	client := tls.Client(observer, &tls.Config{MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13, CurvePreferences: clientCurves, ServerName: "secret.example", InsecureSkipVerify: true, NextProtos: []string{"http/1.1"}, KeyLogWriter: keys, EncryptedClientHelloConfigList: vector(config), EncryptedClientHelloRejectionVerify: func(tls.ConnectionState) error { return nil }})
 	defer client.Close()
 	err = client.Handshake()
 	if accepted {
@@ -292,8 +346,18 @@ func runECH(cert tls.Certificate, keys *keyWriter, accepted bool) error {
 	if !observer.logged {
 		return errors.New("missing RFC 9850 ECH keylog records")
 	}
+	wantHellos, wantHRR := 1, 0
+	if hrr {
+		wantHellos, wantHRR = 2, 1
+	}
+	if observer.clientHellos != wantHellos || observer.hrrs != wantHRR {
+		return fmt.Errorf("unexpected wire CH/HRR counts: %d/%d", observer.clientHellos, observer.hrrs)
+	}
+	if hrr && accepted && observer.secondEncLen != 0 {
+		return errors.New("accepted retry must reuse HPKE context with empty enc")
+	}
 	state := client.ConnectionState()
-	return json.NewEncoder(os.Stdout).Encode(map[string]any{"mode": mode, "port": port, "ech_accepted": accepted, "expected_rejection": !accepted, "cipher_suite": state.CipherSuite, "config_sha256": hex.EncodeToString(sha256Sum(config)), "application_messages": map[bool]int{true: 2, false: 0}[accepted]})
+	return json.NewEncoder(os.Stdout).Encode(map[string]any{"mode": mode, "port": port, "client_hellos": observer.clientHellos, "hrrs": observer.hrrs, "second_enc_length": observer.secondEncLen, "ech_accepted": accepted, "expected_rejection": !accepted, "cipher_suite": state.CipherSuite, "config_sha256": hex.EncodeToString(sha256Sum(config)), "application_messages": map[bool]int{true: 2, false: 0}[accepted]})
 }
 
 func sha256Sum(b []byte) []byte { sum := sha256.Sum256(b); return sum[:] }
@@ -302,6 +366,7 @@ func main() {
 	certPath := flag.String("cert", "", "ephemeral test certificate")
 	keyPath := flag.String("key", "", "ephemeral test certificate private key")
 	keylogPath := flag.String("keylog", "", "fresh NSS/RFC 9850 keylog path")
+	hrr := flag.Bool("hrr", false, "force HRR before accepting/rejecting ECH")
 	mode := flag.String("mode", "all", "all, accepted or rejected")
 	flag.Parse()
 	cert, err := tls.LoadX509KeyPair(*certPath, *keyPath)
@@ -321,7 +386,7 @@ func main() {
 		if *mode == "accepted" && !accepted || *mode == "rejected" && accepted {
 			continue
 		}
-		if err := runECH(cert, keys, accepted); err != nil {
+		if err := runECH(cert, keys, accepted, *hrr); err != nil {
 			panic(err)
 		}
 	}

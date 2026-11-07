@@ -21,13 +21,30 @@
 static FILE *keys;
 static pthread_mutex_t print_mu = PTHREAD_MUTEX_INITIALIZER;
 struct scenario { const char *name, *suite; int port, version, count; SSL_CTX *client, *server; int listener; };
-struct peer { struct scenario *scenario; int server, index, updates, requested, hrr, eoed; };
+struct peer { struct scenario *scenario; int server, index, updates, requested, hrr, eoed, hellos, early_hellos; };
 
 static void keylog(const SSL *ssl, const char *line) {
     (void)ssl;
     pthread_mutex_lock(&print_mu);
     CHECK(fprintf(keys, "%s\n", line) > 0); fflush(keys);
     pthread_mutex_unlock(&print_mu);
+}
+static int early_mode(const struct scenario *s) { return !strcmp(s->name, "early") || !strcmp(s->name, "hrr_early"); }
+static int hello_early(const unsigned char *b, size_t len) {
+    size_t pos = 38; CHECK(pos < len);
+    pos += 1 + b[pos]; CHECK(pos + 2 <= len);
+    size_t n = ((size_t)b[pos] << 8) | b[pos + 1]; pos += 2 + n; CHECK(pos < len);
+    pos += 1 + b[pos]; CHECK(pos + 2 <= len);
+    n = ((size_t)b[pos] << 8) | b[pos + 1]; pos += 2; CHECK(n == len - pos);
+    int early = 0;
+    while (pos < len) {
+        CHECK(pos + 4 <= len);
+        int kind = (b[pos] << 8) | b[pos + 1];
+        n = ((size_t)b[pos + 2] << 8) | b[pos + 3]; pos += 4; CHECK(n <= len - pos);
+        if (kind == 42) { CHECK(n == 0); early++; }
+        pos += n;
+    }
+    CHECK(early <= 1); return early;
 }
 static void message(int write, int version, int type, const void *buf, size_t len, SSL *ssl, void *arg) {
     (void)version; (void)arg;
@@ -44,13 +61,17 @@ static void message(int write, int version, int type, const void *buf, size_t le
         printf("{\"event\":\"key_update\",\"mode\":\"%s\",\"server\":%d,\"requested\":%d}\n", p->scenario->name, p->server, b[4]);
         pthread_mutex_unlock(&print_mu);
     }
+    if (b[0] == 1) {
+        p->hellos++; p->early_hellos += hello_early(b, len);
+        if (p->hellos == 2) CHECK(!hello_early(b, len));
+    }
     if (b[0] == 5) p->eoed++;
     if (b[0] == 2 && len >= 38 && !memcmp(b + 6, retry_random, 32)) p->hrr++;
 }
 static int allow_early(SSL *ssl, void *arg) {
     (void)arg;
     struct peer *p = SSL_get_app_data(ssl);
-    return p->index == 2; /* Seed, resumed, accepted, deliberately rejected. */
+    return !strcmp(p->scenario->name, "hrr_early") || p->index == 2; /* Seed, resumed, accepted, deliberately rejected. */
 }
 static const unsigned char grease[] = {
     0, 0,1, 0,1, 42, 0,32,
@@ -83,7 +104,7 @@ static void configure(struct scenario *s, const char *cert, const char *key) {
     SSL_CTX_set_session_cache_mode(s->server, SSL_SESS_CACHE_SERVER);
     if (s->version == TLS1_3_VERSION) CHECK(SSL_CTX_set_num_tickets(s->server, 1));
     if (!strcmp(s->name, "hrr")) CHECK(SSL_CTX_set1_groups_list(s->server, "P-256"));
-    if (!strcmp(s->name, "early")) {
+    if (early_mode(s)) {
         CHECK(SSL_CTX_set_max_early_data(s->server, 4096));
         SSL_CTX_set_allow_early_data_cb(s->server, allow_early, NULL);
     }
@@ -122,8 +143,8 @@ static void receive_bytes(SSL *ssl, const char *want, size_t len) {
 }
 static void report(SSL *ssl, struct peer *p) {
     pthread_mutex_lock(&print_mu);
-    printf("{\"event\":\"connection\",\"mode\":\"%s\",\"index\":%d,\"server\":%d,\"version\":\"%s\",\"cipher\":\"%s\",\"resumed\":%d,\"early_status\":%d,\"sent_key_updates\":%d,\"requested_updates\":%d,\"sent_hrr\":%d,\"sent_eoed\":%d}\n",
-        p->scenario->name, p->index, p->server, SSL_get_version(ssl), SSL_get_cipher_name(ssl), SSL_session_reused(ssl), SSL_get_early_data_status(ssl), p->updates, p->requested, p->hrr, p->eoed);
+    printf("{\"event\":\"connection\",\"mode\":\"%s\",\"index\":%d,\"server\":%d,\"version\":\"%s\",\"cipher\":\"%s\",\"resumed\":%d,\"early_status\":%d,\"sent_key_updates\":%d,\"requested_updates\":%d,\"sent_hrr\":%d,\"sent_eoed\":%d,\"sent_client_hellos\":%d,\"early_client_hellos\":%d}\n",
+        p->scenario->name, p->index, p->server, SSL_get_version(ssl), SSL_get_cipher_name(ssl), SSL_session_reused(ssl), SSL_get_early_data_status(ssl), p->updates, p->requested, p->hrr, p->eoed, p->hellos, p->early_hellos);
     fflush(stdout); pthread_mutex_unlock(&print_mu);
 }
 static void close_tls(SSL *ssl, int fd) { int result = SSL_shutdown(ssl); CHECK(result >= 0); if (!result) CHECK(SSL_shutdown(ssl) == 1); SSL_free(ssl); close(fd); }
@@ -154,15 +175,20 @@ static void *serve(void *arg) {
         int fd = accept(s->listener, NULL, NULL); CHECK(fd >= 0);
         struct peer p = {.scenario = s, .server = 1, .index = i};
         SSL *ssl = SSL_new(s->server); CHECK(ssl && SSL_set_fd(ssl, fd)); SSL_set_app_data(ssl, &p);
+        if (!strcmp(s->name, "hrr_early") && i > 0) CHECK(SSL_set1_groups_list(ssl, "P-256"));
         char early[4096]; size_t used = 0;
-        if (!strcmp(s->name, "early")) {
+        if (early_mode(s)) {
             size_t got; int result;
             do { result = SSL_read_early_data(ssl, early + used, sizeof(early) - used, &got); CHECK(result != SSL_READ_EARLY_DATA_ERROR); used += got; } while (result == SSL_READ_EARLY_DATA_SUCCESS);
         }
         CHECK(SSL_accept(ssl) == 1);
-        CHECK(SSL_session_reused(ssl) == (i > 0));
+        CHECK(SSL_session_reused(ssl) == (i > 0 && strcmp(s->name, "hrr_early") != 0));
         if (!strcmp(s->name, "early") && i >= 2) CHECK(SSL_get_early_data_status(ssl) == (i == 2 ? SSL_EARLY_DATA_ACCEPTED : SSL_EARLY_DATA_REJECTED));
         if (!strcmp(s->name, "hrr")) CHECK(p.hrr == 1);
+        if (!strcmp(s->name, "hrr_early")) {
+            CHECK(p.hrr == (i > 0)); CHECK(used == 0);
+            if (i > 0) CHECK(SSL_get_early_data_status(ssl) == SSL_EARLY_DATA_REJECTED);
+        }
         exchange(ssl, &p, early, used); report(ssl, &p); close_tls(ssl, fd);
     }
     return NULL;
@@ -177,13 +203,16 @@ static void run(struct scenario *s, const char *cert, const char *key) {
         CHECK(SSL_set_tlsext_host_name(ssl, "localhost"));
         if (session) CHECK(SSL_set_session(ssl, session));
         char early[512]; size_t n = 0, written;
-        if (!strcmp(s->name, "early") && i >= 2) {
+        if ((!strcmp(s->name, "early") && i >= 2) || (!strcmp(s->name, "hrr_early") && i > 0)) {
             CHECK(session && SSL_SESSION_get_max_early_data(session) >= sizeof(early));
             n = http_message(early, sizeof(early), s->name, i, 0);
             CHECK(SSL_write_early_data(ssl, early, n, &written) && written == n);
         }
-        CHECK(SSL_connect(ssl) == 1); CHECK(SSL_session_reused(ssl) == (i > 0));
-        if (n) CHECK(SSL_get_early_data_status(ssl) == (i == 2 ? SSL_EARLY_DATA_ACCEPTED : SSL_EARLY_DATA_REJECTED));
+        CHECK(SSL_connect(ssl) == 1); CHECK(SSL_session_reused(ssl) == (i > 0 && strcmp(s->name, "hrr_early") != 0));
+        if (n) CHECK(SSL_get_early_data_status(ssl) == (!strcmp(s->name, "early") && i == 2 ? SSL_EARLY_DATA_ACCEPTED : SSL_EARLY_DATA_REJECTED));
+        if (!strcmp(s->name, "hrr_early")) {
+            CHECK(p.hellos == (i > 0 ? 2 : 1)); CHECK(p.early_hellos == (i > 0)); CHECK(p.eoed == 0);
+        }
         exchange(ssl, &p, early, n); report(ssl, &p);
         SSL_SESSION_free(session); session = SSL_get1_session(ssl); CHECK(session);
         close_tls(ssl, fd);
@@ -202,6 +231,7 @@ int main(int argc, char **argv) {
         {.name="hrr", .suite="TLS_AES_128_GCM_SHA256", .port=44457, .version=TLS1_3_VERSION, .count=1},
         {.name="early", .suite="TLS_AES_128_GCM_SHA256", .port=44458, .version=TLS1_3_VERSION, .count=4},
         {.name="tls12_resume", .suite="ECDHE-RSA-AES256-GCM-SHA384", .port=44459, .version=TLS1_2_VERSION, .count=2},
+        {.name="hrr_early", .suite="TLS_AES_128_GCM_SHA256", .port=44475, .version=TLS1_3_VERSION, .count=2},
         {.name="grease", .suite="TLS_AES_128_GCM_SHA256", .port=44462, .version=TLS1_3_VERSION, .count=1}
     };
     int selected = 0;

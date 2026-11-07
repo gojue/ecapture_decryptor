@@ -219,8 +219,8 @@ The transport regression also decrypts these captures and asserts the final
 messages, their stream IDs, directions and exact bodies, plus file/stream raw
 byte equivalence. Independent Python HMAC/HKDF expectations in
 `transport/quic_decryptor_test.go` cover v1/v2 × AES-128/AES-256/ChaCha20;
-only AES-128 has real-traffic update coverage here. CID migration, Retry,
-0-RTT and the full D04.5 traffic matrix remain separate tasks.
+these two captures cover AES-128 updates. The independent aioquic matrix below
+adds real AES-256/ChaCha20 updates for both versions.
 
 SHA-256 of the committed captures:
 
@@ -305,13 +305,115 @@ with N=48 for AES-256 and N=32 otherwise; call
 `derive_key_iv_hp` produces the corresponding key/IV/HP expectations. These are
 algorithm vectors, not network capture fixtures.
 
-Boundaries: this matrix does **not** extend the real Key Update suite coverage
-above. Retry and 0-RTT use separate connections: aioquic 1.3.0 did not retransmit
-the test early request after Retry in this generator, so that combination is not
-claimed as real-capture verified. The generator is unpatched; it uses two pinned
-H3/configuration introspection hooks to force static QPACK and record negotiated
-values. Dynamic QPACK and draft-29 are outside this fixture's scope. Its TLS test
-keys and local self-signed certificate are only for reproducible test traffic.
+Boundaries: this original lifecycle matrix does **not** exercise Key Update or
+combine Retry with 0-RTT on one connection. Its mode uses unpatched aioquic with
+pinned H3/configuration introspection hooks for static QPACK and negotiated
+values. The two additional modes below use narrowly scoped fixture adapters.
+Dynamic QPACK and draft-29 remain outside this matrix's scope. Its TLS test keys
+and local self-signed certificate are only for reproducible test traffic.
+
+
+## AES-256/ChaCha20 updates and Retry with 0-RTT
+
+Two additional aioquic 1.3.0 modes use real loopback sockets and static QPACK.
+The QUIC production code and its dependencies are unchanged. Capture files contain actual
+network packets from dumpcap, not reconstructed or synthesized packets.
+
+| Capture and matching `.keys` basename | Mode | Connections / HTTP messages | UDP packets / drops |
+| --- | --- | --- | --- |
+| `http3_keyupdate_matrix_aioquic` | `--key-update-matrix` | 4 / 24 | 128 / 0 |
+| `http3_retry_early_aioquic` | `--retry-early` | 6 / 12 | 68 / 0 |
+
+The update matrix uses ports 44469 (v1 AES-256), 44470 (v1 ChaCha20), 44471
+(v2 AES-256), and 44472 (v2 ChaCha20). Each connection sends three GETs on
+streams 0, 4, and 8, with paths `/ku/vN/SUITE/g0`, `/ku/vN/SUITE/g1`, and
+`/ku/vN/SUITE/g2` (`SUITE` is `aes256` or `chacha`). Responses are exactly
+`reply PATH`. The client initiates the first update and the server the second;
+acknowledged exchanges separate updates. Both directions reach generations
+0 → 1 → 2 and wire key phases 0 → 1 → 0. Sender assertions independently derive
+successor secrets using Python standard-library HMAC/HKDF, check the unchanged
+HP context, and recover every audited emitted header with the original HP key.
+
+Pinned aioquic 1.3.0 hardcodes the v1 update label in `next_key_phase`. The update
+mode locally adapts **only v2** to `quicv2 ku`, as required by
+[RFC 9369 section 3.3.2](https://www.rfc-editor.org/rfc/rfc9369.html#section-3.3.2),
+and restores the original function afterward. Native `apply_key_phase` already
+preserves HP. This is interoperability with the disclosed fixture adapter, not
+a claim that unmodified aioquic performs conforming v2 updates.
+
+Retry uses AES-128 only, on ports 44473 (v1) and 44474 (v2). Each version has
+three connections with one GET on stream 0: `/retry/vN/seed`,
+`/retry/vN/accepted`, and `/retry/vN/rejected`. Responses again are `reply PATH`.
+The seed has no Retry and establishes a ticket. Each other connection receives
+exactly one Retry and actually sends its complete 29-byte request stream,
+offset 0 with FIN, in 0-RTT both before and after Retry. The accepted connection
+has no 1-RTT request replay. Clearing the server ticket cache rejects early data;
+the rejected connection additionally retransmits that same request on stream 0
+at 1-RTT. Peer status/body checks and qlog STREAM-frame assertions verify these
+sequences; merely enabling a Retry flag is insufficient.
+
+Native aioquic 1.3.0 `_connect` rebuilds TLS and packet spaces after Retry,
+changing ClientHello/early secrets and losing sent early STREAM ranges. A
+native comparison timed out with only the pre-Retry request in qlog. The Retry
+mode keeps native Retry integrity validation but adapts its restart to preserve
+TLS and packet spaces, derive new Initial keys from the new DCID, and requeue
+sent Initial/early ranges through native loss callbacks. Native packet builders
+still send all packets. Assertions require identical complete ClientHello bytes
+and early secret, unchanged TLS state, new DCID/token, and strictly increasing
+actual sent packet numbers, following
+[RFC 9000 section 17.2.5.3](https://www.rfc-editor.org/rfc/rfc9000.html#section-17.2.5.3).
+No secret values are included in the evidence JSON. These adaptations are local
+to this generator; neither the installed aioquic package nor SDK is patched.
+
+Reuse the pinned venv and temporary self-signed certificate preparation above,
+then run from the repository root. Both modes write keylogs, qlogs, and JSON
+fixture evidence under their output directory; keep the certificate private key
+and auxiliary logs outside Git.
+
+```sh
+for mode in key-update-matrix retry-early; do
+  if [ "$mode" = key-update-matrix ]; then
+    name=http3_keyupdate_matrix_aioquic
+    filter='udp portrange 44469-44472'
+    keyname=keyupdate-matrix.keys
+  else
+    name=http3_retry_early_aioquic
+    filter='udp portrange 44473-44474'
+    keyname=retry-early.keys
+  fi
+  mkdir "$work/$mode"
+  sudo -n dumpcap -i lo -f "$filter" -w - \
+    > "$work/$name.pcapng" 2> "$work/$mode/capture.log" &
+  capture_pid=$!
+  trap 'sudo -n kill -INT "$capture_pid" 2>/dev/null || true; wait "$capture_pid" 2>/dev/null || true' EXIT
+  sleep 1
+  "$work/venv/bin/python" test/fixtures/http3_capture/aioquic_capture.py \
+    --"$mode" --cert "$work/server.crt" --key "$work/server.key" \
+    --output "$work/$mode"
+  sleep 1
+  sudo -n kill -INT "$capture_pid"
+  wait "$capture_pid" || true
+  trap - EXIT
+  cp "$work/$mode/$keyname" "$work/$name.keys"
+done
+
+go test -race -run TestQUICStateMatrixCaptureAPIs .
+go test -race -run TestQUICStateMatrixCapturedTransitions ./transport
+```
+
+`TestQUICStateMatrixCaptureAPIs` verifies exact
+messages and raw bytes with external keys, seekable/non-seekable DSB, and both
+trailing DSB direction orders, including output before EOF. The transport test
+checks actual generation 2 in both directions, stable ClientHello random across
+Retry, and accepted/rejected early state. Retry with other suites, combined
+migration/Key Update, and draft-29 are not added by these captures.
+
+```text
+b4752bcbf7be06441ceccdb200793d29364a7285f35d572290bd6baa9aa10f5d  http3_keyupdate_matrix_aioquic.pcapng
+fda2c22f946c1adf9e5773e895aefb67da93be809bd3b1bb51879bf60c61fa18  http3_keyupdate_matrix_aioquic.keys
+34bd857c0f46c28841e04624a007147893a0ef4544d3187954e55d15ab61c1e2  http3_retry_early_aioquic.pcapng
+ab4da2a29012ec3efb2653dcabd9cce3be0aec468e4e1259756e7796bda30366  http3_retry_early_aioquic.keys
+```
 
 
 ## Dynamic QPACK and message-state fixture
