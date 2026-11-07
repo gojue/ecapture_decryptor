@@ -1,6 +1,22 @@
+# v1.4.1 (2026-11-07)
+
+## Fixed
+
+* Route QUIC Initial packets with a zero-length client CID to the correct connection, retaining bidirectional routing on the unique original tuple. See [PR #18](https://github.com/gojue/ecapture_decryptor/pull/18).
+* Preserve eCapture PID/Comm metadata from legacy and endpoint-tagged packet trailers in file and streaming decryption. Keep late metadata and loopback endpoint ownership in per-connection-generation state without changing routing keys or ConnectionID. See [PR #19](https://github.com/gojue/ecapture_decryptor/pull/19).
+* Update C `GetVersion()` to v1.4.1.
+
+## Compatibility
+
+* Existing Go function signatures, C exports and `DecryptedPacket.PID` / `PName` fields remain available. Missing, malformed or conflicting process metadata remains unknown (`PID=0, PName=""`); the synthetic `decryptor` process name is no longer emitted. Explicit caller-provided process metadata is preserved.
+
+**Full Changelog**: https://github.com/gojue/ecapture_decryptor/compare/v1.4.0...v1.4.1
+
+<hr>
+
 # v1.4.0 (2026-11-07)
 
-Changes since v1.3.2; this version is being prepared and has not been released.
+Changes since v1.3.2.
 
 ## Added
 

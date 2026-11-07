@@ -32,7 +32,7 @@ import (
 
 //export GetVersion
 func GetVersion() *C.char {
-	return C.CString("eCapture Decryptor v1.4.0 - Copyright (c) 2024-2026 CFC4N - Non-Commercial License")
+	return C.CString("eCapture Decryptor v1.4.1 - Copyright (c) 2024-2026 CFC4N - Non-Commercial License")
 }
 
 // DecryptPcapToFile decrypts a capture using an external SSL key log, a pcapng
