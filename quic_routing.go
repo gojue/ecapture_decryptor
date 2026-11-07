@@ -216,6 +216,7 @@ func (e *DecryptorEngine) quicCIDUpdate(route *quicRoute, cid []byte, ownerClien
 		if err == nil {
 			binding, ok, _ := e.matchQUICLocked(item.key, item.data, h)
 			if ok && binding.route == route {
+				binding.route.decryptor.GetAddr().Process.Merge(item.key.Process, binding.reverse)
 				e.noteQUICTupleLocked(binding, item.key)
 				ready = append(ready, transport.QUICRoutedPacket{Data: item.data, IsClient: !binding.reverse, Time: item.at, Order: item.order})
 				e.lastActivity[route.key] = time.Now()
@@ -336,6 +337,7 @@ func (e *DecryptorEngine) handleQUICPacket(key types.ConnectionKey, data []byte,
 	e.noteQUICTupleLocked(binding, key)
 	e.mu.Unlock()
 	dec := binding.route.decryptor
+	dec.GetAddr().Process.Merge(key.Process, binding.reverse)
 	if q, ok := dec.(*transport.QUICDecryptor); ok {
 		err = q.FeedQUICPacket(transport.QUICRoutedPacket{Data: data, IsClient: !binding.reverse, Time: at, Order: order})
 	} else {

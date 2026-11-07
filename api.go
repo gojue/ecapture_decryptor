@@ -374,27 +374,29 @@ func (e *DecryptorEngine) processPacket(packet gopacket.Packet) {
 	if l := packet.Layer(layers.LayerTypeTCP); l != nil {
 		tcp, _ := l.(*layers.TCP)
 		tl = transport.NewTCPAdapter(tcp)
-		e.handlePacket(ipLayer, tl, packetTime)
+		e.handlePacket(ipLayer, tl, packetTime, packetProcess(packet))
 	}
 
 	if l := packet.Layer(layers.LayerTypeUDP); l != nil {
 		udp, _ := l.(*layers.UDP)
 		tl = transport.NewUDPAdapter(udp)
-		e.handlePacket(ipLayer, tl, packetTime)
+		e.handlePacket(ipLayer, tl, packetTime, packetProcess(packet))
 	}
 }
 
 // handlePacket handles a packet
-func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.TransportLayer, packetTime time.Time) {
+func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.TransportLayer, packetTime time.Time, observations ...*types.ConnectionProcess) {
 	key := types.ConnectionKey{
-		SrcIP:       ip.GetSrcIP(),
-		DstIP:       ip.GetDstIP(),
-		SrcPort:     transportLayer.GetSrcPort(),
-		DstPort:     transportLayer.GetDstPort(),
-		Proto:       transportLayer.Protocol(),
-		Pid:         0,
-		FD:          0,
-		ProcessName: "decryptor",
+		SrcIP:   ip.GetSrcIP(),
+		DstIP:   ip.GetDstIP(),
+		SrcPort: transportLayer.GetSrcPort(),
+		DstPort: transportLayer.GetDstPort(),
+		Proto:   transportLayer.Protocol(),
+		Pid:     0,
+		FD:      0,
+	}
+	if len(observations) > 0 {
+		key.Process = observations[0]
 	}
 	if key.Proto == types.TransportProtocolUDP {
 		if e.factory.options.UDPProtocol == "dtls" {
@@ -498,6 +500,7 @@ func (e *DecryptorEngine) handlePacket(ip types.IPLayer, transportLayer types.Tr
 		}
 		return
 	}
+	ct.GetAddr().Process.Merge(key.Process, isReverse)
 	payload := transportLayer.GetPayload()
 	var chunks [][]byte
 	if tcp, ok := transportLayer.(*transport.TCPAdapter); ok {
@@ -628,6 +631,7 @@ func (e *DecryptorEngine) handleDTLSPacket(key types.ConnectionKey, data []byte,
 			e.mu.Unlock()
 		}()
 	}
+	ct.GetAddr().Process.Merge(key.Process, reversed)
 	ct.SetPacketTime(at)
 	var err error
 	if reversed {

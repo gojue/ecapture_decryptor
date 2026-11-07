@@ -3,7 +3,10 @@ package ecapture_decryptor
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"fmt"
 	"io"
+	"log"
 	"os"
 	"testing"
 	"time"
@@ -319,5 +322,182 @@ func TestDecryptPcapFileKeyLogSources(t *testing.T) {
 				t.Fatalf("decrypted %d requests and %d responses; expected at least %d of each", counts.requests, counts.responses, minimumPerDirection)
 			}
 		})
+	}
+}
+
+func processTrailer(pid uint32, name string, endpoint byte, legacy bool) []byte {
+	data := make([]byte, 9+len(name))
+	binary.BigEndian.PutUint32(data, 0xCC0C4CFC)
+	binary.BigEndian.PutUint32(data[4:], pid)
+	data[8] = byte(len(name))
+	copy(data[9:], name)
+	if !legacy {
+		data = append(data, 1, endpoint)
+	}
+	return append(data, 0, 0, 0, 0)
+}
+
+func TestProcessTrailerBoundaries(t *testing.T) {
+	// Historical Ethernet encoders pad short IP packets before the trailer.
+	for _, vlan := range []bool{false, true} {
+		header := 14
+		if vlan {
+			header += 4
+		}
+		raw := make([]byte, 60)
+		raw[12] = 8
+		if vlan {
+			raw[12], raw[13], raw[16] = 0x81, 0, 8
+		}
+		raw[header], raw[header+9] = 0x45, 17
+		binary.BigEndian.PutUint16(raw[header+2:], 28)
+		binary.BigEndian.PutUint16(raw[header+24:], 8)
+		packet := gopacket.NewPacket(append(raw, processTrailer(42, "padded", 2, true)...), layers.LayerTypeEthernet, gopacket.Default)
+		info := packetProcess(packet)
+		if info == nil {
+			t.Fatal("lost padded legacy trailer")
+		}
+		if pid, name := info.Identity("response"); pid != 42 || name != "padded" {
+			t.Fatal("lost legacy process identity")
+		}
+	}
+	for _, ipv6 := range []bool{false, true} {
+		raw := make([]byte, 74)
+		if ipv6 {
+			raw[12], raw[13], raw[14], raw[20] = 0x86, 0xdd, 0x60, 17
+			binary.BigEndian.PutUint16(raw[18:], 20)
+		} else {
+			raw[12], raw[13], raw[14], raw[23] = 8, 0, 0x45, 17
+			binary.BigEndian.PutUint16(raw[16:], 60)
+		}
+		for _, legacy := range []bool{false, true} {
+			trailer := processTrailer(4242, "client\x00", 1, legacy)
+			packet := gopacket.NewPacket(append(bytes.Clone(raw), trailer...), layers.LayerTypeEthernet, gopacket.Default)
+			info := packetProcess(packet)
+			if info == nil {
+				t.Fatal("missing valid trailer")
+			}
+			if pid, name := info.Identity("request"); pid != 4242 || name != "client" {
+				t.Fatal("lost trailer metadata")
+			}
+			for n := 0; n < 9+len("client\x00"); n++ {
+				if packetProcess(gopacket.NewPacket(append(bytes.Clone(raw), trailer[:n]...), layers.LayerTypeEthernet, gopacket.Default)) != nil {
+					t.Fatalf("accepted truncated trailer %d", n)
+				}
+			}
+			for _, bad := range [][]byte{bytes.Repeat([]byte{0}, 20), processTrailer(0, "client", 1, false), processTrailer(42, "client", 3, false), processTrailer(42, "01234567890123456", 1, false)} {
+				if packetProcess(gopacket.NewPacket(append(bytes.Clone(raw), bad...), layers.LayerTypeEthernet, gopacket.Default)) != nil {
+					t.Fatal("accepted invalid process trailer")
+				}
+			}
+		}
+	}
+}
+
+// The encrypted fixture stays unchanged; only test capture annotations are
+// synthetic. This checks real TLS/QUIC parsing, DSBs, callbacks and stable IDs.
+func TestCaptureProcessFileAndStream(t *testing.T) {
+	for _, fixture := range []struct {
+		name string
+		port layers.TCPPort
+	}{
+		{"http11_keepalive_chunked", 44435}, {"http2_multiplex", 44436}, {"http3_loopback", 44433},
+	} {
+		for _, legacy := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/legacy=%v", fixture.name, legacy), func(t *testing.T) {
+				file, err := os.Open("test/testdata/" + fixture.name + "_tcpdump_no_dsb.pcapng")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer file.Close()
+				reader, err := pcapgo.NewNgReader(file, pcapgo.DefaultNgReaderOptions)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var encoded bytes.Buffer
+				writer, err := pcapgo.NewNgWriter(&encoded, layers.LinkTypeEthernet)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for {
+					raw, ci, err := reader.ReadPacketData()
+					if err == io.EOF {
+						break
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					packet := gopacket.NewPacket(raw, layers.LayerTypeEthernet, gopacket.Default)
+					pid, name := uint32(101), "client"
+					annotate := true
+					if tcp, ok := packet.Layer(layers.LayerTypeTCP).(*layers.TCP); ok {
+						annotate = !tcp.SYN // first packet deliberately has no owner
+						if tcp.SrcPort == fixture.port && !legacy {
+							pid, name = 202, "server"
+						}
+					} else if udp, ok := packet.Layer(layers.LayerTypeUDP).(*layers.UDP); ok {
+						if uint16(udp.SrcPort) == uint16(fixture.port) && !legacy {
+							pid, name = 202, "server"
+						}
+					}
+					if annotate {
+						raw = append(raw, processTrailer(pid, name, 1, legacy)...)
+						ci.CaptureLength = len(raw)
+						ci.Length = len(raw)
+					}
+					if err := writer.WritePacket(ci, raw); err != nil {
+						t.Fatal(err)
+					}
+				}
+				keys, err := os.ReadFile("test/testdata/" + fixture.name + "_tcpdump.keys")
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Late secrets also allow process observations to arrive before output.
+				if err := writer.WriteDecryptionSecretsBlock(pcapgo.DSB_SECRETS_TYPE_TLS, keys); err != nil {
+					t.Fatal(err)
+				}
+				if err := writer.Flush(); err != nil {
+					t.Fatal(err)
+				}
+				for _, stream := range []bool{false, true} {
+					var packets []*types.DecryptedPacket
+					if stream {
+						err = DecryptPcapngStream(context.Background(), io.NopCloser(bytes.NewReader(encoded.Bytes())), func(p *types.DecryptedPacket) error { packets = append(packets, p); return nil })
+					} else {
+						output := make(chan *types.DecryptedPacket)
+						done := make(chan struct{})
+						go func() {
+							defer close(done)
+							for p := range output {
+								packets = append(packets, p)
+							}
+						}()
+						err = DecryptWithConfig(NewDecryptorConfig().WithPcapReader(bytes.NewReader(encoded.Bytes())).WithPacketChan(output).WithLogger(log.New(io.Discard, "", 0)))
+						close(output)
+						<-done
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					ids := map[string]bool{}
+					directions := map[string]int{}
+					for _, p := range packets {
+						want, name := int64(101), "client"
+						if p.Direction == "response" && !legacy {
+							want, name = 202, "server"
+						}
+						if p.PID != want || p.PName != name {
+							t.Fatalf("stream=%v direction=%s pid=%d name=%q want=%d/%s", stream, p.Direction, p.PID, p.PName, want, name)
+						}
+						ids[p.ConnectionID()] = true
+						directions[p.Direction]++
+					}
+					if len(ids) != 1 || directions["request"] == 0 || directions["response"] == 0 {
+						t.Fatalf("attribution split/dropped connection: ids=%d directions=%v", len(ids), directions)
+					}
+				}
+			})
+		}
 	}
 }
