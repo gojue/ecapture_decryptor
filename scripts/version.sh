@@ -15,32 +15,79 @@ NC='\033[0m'
 
 # Get current version from capi/main.go
 get_current_version() {
-    grep -o 'ecapture_decryptor v[0-9.]*' "$CAPI_FILE" | head -1 | sed 's/ecapture_decryptor v//'
+    local marker version
+    marker=$(grep -o 'C\.CString("eCapture Decryptor v[^[:space:]"]* -' "$CAPI_FILE") || {
+        echo "Error: Version marker missing from ${CAPI_FILE}" >&2
+        return 1
+    }
+    if [[ "$marker" == *$'\n'* ]]; then
+        echo "Error: Multiple version markers in ${CAPI_FILE}" >&2
+        return 1
+    fi
+    version=${marker#*eCapture Decryptor v}
+    version=${version% -}
+    validate_version "$version" || return 1
+    printf '%s\n' "$version"
+}
+
+# Accept a bare SemVer, not shell commands, paths, or sed replacement syntax.
+validate_version() {
+    local version="${1:-}" identifier prerelease
+    local pattern='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+    if [[ ! "$version" =~ $pattern ]]; then
+        echo "Error: Invalid version; expected MAJOR.MINOR.PATCH with optional prerelease/build metadata" >&2
+        return 1
+    fi
+    prerelease=${version%%+*}
+    if [[ "$prerelease" == *-* ]]; then
+        prerelease=${prerelease#*-}
+        local IFS='.'
+        for identifier in $prerelease; do
+            if [[ "$identifier" =~ ^0[0-9]+$ ]]; then
+                echo "Error: Numeric prerelease identifiers must not have leading zeroes" >&2
+                return 1
+            fi
+        done
+    fi
 }
 
 # Update version in capi/main.go
 update_version() {
-    local new_version="$1"
+    local new_version="${1:-}"
     local version_number="${new_version#v}"
+    local current temporary
+    validate_version "$version_number" || return 1
+    current=$(get_current_version) || return 1
 
-    echo -e "${YELLOW}Updating version to ${new_version}...${NC}"
-
-    # Backup
-    cp "$CAPI_FILE" "${CAPI_FILE}.bak"
-
-    # Update version
-    sed -i.tmp "s/ecapture_decryptor v[0-9.]*/ecapture_decryptor v${version_number}/" "$CAPI_FILE"
-    rm -f "${CAPI_FILE}.tmp"
+    echo -e "${YELLOW}Updating version to v${version_number}...${NC}"
+    if [ "$current" != "$version_number" ]; then
+        temporary=$(mktemp "${CAPI_FILE}.XXXXXX") || return 1
+        if ! cp -p "$CAPI_FILE" "$temporary" ||
+            ! sed "s/\(C\.CString(\"eCapture Decryptor v\)[^[:space:]\"]*\( -\)/\1${version_number}\2/" "$CAPI_FILE" > "$temporary" ||
+            ! cp -p "$CAPI_FILE" "${CAPI_FILE}.bak" ||
+            ! mv "$temporary" "$CAPI_FILE"; then
+            rm -f "$temporary"
+            return 1
+        fi
+    fi
 
     echo -e "${GREEN}✓ Updated ${CAPI_FILE}${NC}"
 }
 
 # Bump version
 bump_version() {
-    local bump_type="$1"
-    local current=$(get_current_version)
+    local bump_type="$1" current major minor patch
+    current=$(get_current_version) || return 1
+    if [[ "$current" == *-* || "$current" == *+* ]]; then
+        echo "Error: Cannot bump a prerelease/build-metadata version; use set explicitly" >&2
+        return 1
+    fi
 
     IFS='.' read -r major minor patch <<< "$current"
+    if [ "${#major}" -gt 18 ] || [ "${#minor}" -gt 18 ] || [ "${#patch}" -gt 18 ]; then
+        echo "Error: Version component is too large to bump safely" >&2
+        return 1
+    fi
 
     case "$bump_type" in
         major)
@@ -56,8 +103,8 @@ bump_version() {
             patch=$((patch + 1))
             ;;
         *)
-            echo -e "${RED}Error: Invalid bump type. Use: major, minor, or patch${NC}"
-            exit 1
+            echo -e "${RED}Error: Invalid bump type. Use: major, minor, or patch${NC}" >&2
+            return 1
             ;;
     esac
 
@@ -66,81 +113,80 @@ bump_version() {
 
 # Show current version
 show_version() {
-    local current=$(get_current_version)
+    local current
+    current=$(get_current_version) || return 1
     echo -e "${GREEN}Current version: v${current}${NC}"
 }
 
 # Create changelog entry
 create_changelog_entry() {
-    local version="$1"
-    local date=$(date '+%Y-%m-%d')
+    local version="v${1#v}" entry_date temporary
+    validate_version "${version#v}" || return 1
+    if [ ! -f "$CHANGELOG_FILE" ] || [ ! -r "$CHANGELOG_FILE" ]; then
+        echo "Error: Cannot read ${CHANGELOG_FILE}" >&2
+        return 1
+    fi
+    # Re-setting an existing release must not duplicate its history entry.
+    if awk -v version="$version" '$1 ~ /^#+$/ && ($2 == version || $2 == "[" version "]") { found=1 } END { exit !found }' "$CHANGELOG_FILE"; then
+        return 0
+    fi
+    entry_date=$(date '+%Y-%m-%d') || return 1
+    temporary=$(mktemp "${CHANGELOG_FILE}.XXXXXX") || return 1
 
     echo -e "${YELLOW}Creating CHANGELOG entry for ${version}...${NC}"
 
-    # Create temporary file with new entry
-    cat > /tmp/changelog_entry.md << EOF
-
-## [${version}] - ${date}
-
-### Added
--
-
-### Changed
--
-
-### Fixed
--
-
-EOF
-
-    # Insert after [Unreleased] section
-    if grep -q "\[Unreleased\]" "$CHANGELOG_FILE"; then
-        # Find line number of [Unreleased] section
-        local line_num=$(grep -n "\[Unreleased\]" "$CHANGELOG_FILE" | head -1 | cut -d: -f1)
-        # Skip to the end of [Unreleased] section (find next ## or ---)
-        local insert_line=$((line_num + 10))
-
-        # Insert new entry
-        {
-            head -n "$insert_line" "$CHANGELOG_FILE"
-            cat /tmp/changelog_entry.md
-            tail -n +$((insert_line + 1)) "$CHANGELOG_FILE"
-        } > /tmp/changelog_new.md
-
-        mv /tmp/changelog_new.md "$CHANGELOG_FILE"
-        echo -e "${GREEN}✓ Created CHANGELOG entry${NC}"
-    else
-        echo -e "${RED}Error: Could not find [Unreleased] section in CHANGELOG${NC}"
-        exit 1
+    # The repository keeps '# v...' release headings without an Unreleased
+    # section. Prepend a matching entry and preserve all existing content.
+    if ! cp -p "$CHANGELOG_FILE" "$temporary" || ! {
+        printf '# %s (%s)\n\n## Added\n-\n\n## Changed\n-\n\n## Fixed\n-\n\n<hr>\n\n' "$version" "$entry_date" &&
+        cat "$CHANGELOG_FILE"
+    } > "$temporary" || ! mv "$temporary" "$CHANGELOG_FILE"; then
+        rm -f "$temporary"
+        return 1
     fi
+    echo -e "${GREEN}✓ Created CHANGELOG entry${NC}"
 }
 
+# Other build scripts reuse these functions without running this CLI.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
+
 # Main
-case "$1" in
+case "${1:-}" in
     show|current)
         show_version
         ;;
 
     set)
-        if [ -z "$2" ]; then
+        if [ -z "${2:-}" ]; then
             echo -e "${RED}Error: Version required${NC}"
             echo "Usage: $0 set <version>"
             exit 1
         fi
-        update_version "$2"
-        create_changelog_entry "$2"
-        echo -e "${GREEN}✓ Version updated to $2${NC}"
+        if [ ! -f "$CHANGELOG_FILE" ] || [ ! -r "$CHANGELOG_FILE" ]; then
+            echo "Error: Cannot read ${CHANGELOG_FILE}" >&2
+            exit 1
+        fi
+        new_version="v${2#v}"
+        update_version "$new_version"
+        create_changelog_entry "$new_version"
+        echo -e "${GREEN}✓ Version updated to $new_version${NC}"
         echo -e "${YELLOW}Next steps:${NC}"
         echo "  1. Update CHANGELOG.md with actual changes"
-        echo "  2. Commit changes: git commit -am 'Bump version to $2'"
-        echo "  3. Create tag: git tag $2"
-        echo "  4. Push: git push origin main --tags"
+        echo "  2. Commit changes: git commit -am 'Bump version to $new_version'"
+        echo "  3. Create tag: git tag $new_version"
+        echo "  4. Push: git push origin master --tags"
         ;;
 
     bump)
-        if [ -z "$2" ]; then
+        if [ -z "${2:-}" ]; then
             echo -e "${RED}Error: Bump type required${NC}"
             echo "Usage: $0 bump <major|minor|patch>"
+            exit 1
+        fi
+        if [ ! -f "$CHANGELOG_FILE" ] || [ ! -r "$CHANGELOG_FILE" ]; then
+            echo "Error: Cannot read ${CHANGELOG_FILE}" >&2
             exit 1
         fi
         new_version=$(bump_version "$2")
@@ -151,7 +197,7 @@ case "$1" in
         echo "  1. Update CHANGELOG.md with actual changes"
         echo "  2. Commit changes: git commit -am 'Bump version to ${new_version}'"
         echo "  3. Create tag: git tag ${new_version}"
-        echo "  4. Push: git push origin main --tags"
+        echo "  4. Push: git push origin master --tags"
         ;;
 
     *)

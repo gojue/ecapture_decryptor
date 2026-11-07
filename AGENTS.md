@@ -18,7 +18,7 @@
 3. `docs/API.md`，特别是 `DecryptPcapngStreamWithOptions / WithOptions`：输出、背压、诊断、期限与资源上限契约。
 4. 对应实现与测试；环境和命令以 `go.mod`、实际 `Makefile`、`.github/workflows/ci.yml` 为准。
 
-历史文档中存在过期版本要求和示意接口；若与源码冲突，以当前实现及测试为准，不要照搬 `docs/ARCHITECTURE.md` 中的伪代码。
+文档示例只展示部分流程；若与源码冲突，以当前实现及测试为准，扩展前核对真实接口与资源契约。
 
 ## 项目作用与使用环境
 
@@ -87,7 +87,7 @@ DTLS 通过 Go `UDPProtocol="dtls"` 显式选择，空值仍为 QUIC；首批仅
 
 ## 编译环境与命令
 
-- 使用 Go **1.26.0 或兼容的更新版本**；根模块、HTTP/3 fixture 子模块和 CI 当前均以 1.26 为基准。`docs/DEVELOPMENT.md` 的 Go >=1.21 和 `scripts/build-multiplatform.sh` 的 `golang:1.21` 镜像已过时。
+- 使用 Go **1.26.0 或兼容的更新版本**；根模块、HTTP/3 fixture 子模块、CI 和手工 Docker 构建当前均以 1.26 为基准。
 - 保留 `go.mod` 中 `github.com/google/gopacket v1.1.19 => github.com/cfc4n/gopacket v1.1.20` 的 replace；当前 DSB 读取依赖该 fork，不能随手换回上游。
 - Go SDK/CLI 可关闭 CGO；C archive/shared 和 `-race` 需要可用 C 编译器与 `CGO_ENABLED=1`。macOS 使用 Xcode Command Line Tools/Clang，Linux 使用 GCC/Clang（通常由 `build-essential` 提供）。
 - Make 用于构建；Python 3 用于 `examples/test_e2e.py`。`goimports`、`golangci-lint` 用于代码检查。先检查已安装工具，不因文档任务自动安装或升级。
@@ -142,7 +142,7 @@ go test -run 'TestDecryptTCPHTTPCaptures|TestDecryptHTTP3QUICCapture|TestDecrypt
 
 关键回归入口还包括 `quic_late_dsb_test.go`、`raw_stream_test.go`、`connection_routing_test.go`、`lifecycle_test.go` 和 `transport/*_lifecycle_test.go`。E2E 默认在临时目录生成产物并自动删除；需保留输出时使用 `python3 examples/test_e2e.py --output-dir test/result`。避免运行会重写已跟踪 `examples/go_static_demo/output_go_static.json` 的单示例 test 目标。
 
-CI 在 Ubuntu/macOS 上运行 `go test -v -race -coverprofile=coverage.out -covermode=atomic ./...`、静态/动态库构建和示例 E2E，并检查 gofmt、goimports、golangci-lint。局部代码修改只格式化涉及的 Go 文件；根 `make fmt` 会写整个仓库。`make check` 的格式检查只打印差异，不能仅凭退出码断言格式正确；要确认格式工具输出为空。`make tools` 固定 goimports v0.49.0、golangci-lint v1.64.8，以 `CGO_ENABLED=0` 构建工具；SDK 的 race/C 构建仍需 CGO。
+CI 在 Ubuntu/macOS 上运行 `go test -v -race -coverprofile=coverage.out -covermode=atomic ./...`、静态/动态库构建和示例 E2E，并检查 gofmt、goimports、golangci-lint。`python3 scripts/test_release.py` 在临时副本中以 make/Docker 替身验证版本与平台分派，不构建或发布 release。局部代码修改只格式化涉及的 Go 文件；根 `make fmt` 会写整个仓库。`make check` 的格式检查只打印差异，不能仅凭退出码断言格式正确；要确认格式工具输出为空。`make tools` 固定 goimports v0.49.0、golangci-lint v1.64.8，以 `CGO_ENABLED=0` 构建工具；SDK 的 race/C 构建仍需 CGO。
 
 ## Linux VM 与真实夹具
 
@@ -157,5 +157,5 @@ CI 在 Ubuntu/macOS 上运行 `go test -v -race -coverprofile=coverage.out -cove
 ## 发布与文档维护
 
 - API/支持范围变化时只同步相关说明：`docs/API.md`、两种语言的 README 和受影响示例。
-- 普通开发不运行 `make release` / `scripts/release.sh`：它会清理构建目录并修改 `capi/main.go` 版本字符串。`scripts/version.sh` 仍匹配旧字符串 `ecapture_decryptor v...`，与当前 `GetVersion()` 的 `eCapture Decryptor v...` 不一致，发布前需核对，不能盲信脚本成功消息。
+- 普通开发不运行 `make release` / `scripts/release.sh`：它会清理构建目录并修改 `capi/main.go` 版本字符串。`scripts/version.sh show` 只读；`set` / `bump` 会更新实际 `eCapture Decryptor v...` 字符串和 CHANGELOG，带预发布/构建后缀的版本使用显式 `set`。脚本回归只在临时副本运行，不修改仓库版本。
 - 保留已有版权头及许可证文件；涉及授权说明以仓库 `LICENSE`、`LICENSE-BINARY`、`COPYRIGHT` 为依据，不自行改写条款。

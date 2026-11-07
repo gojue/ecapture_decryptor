@@ -131,25 +131,15 @@ flowchart TB
 **核心组件**:
 
 ```go
-// API 入口
-func DecryptPcapFile(keylog, pcap io.Reader, output chan) error
-func DecryptLiveTraffic(keylog, pcap io.Reader, output chan) error
-
-// 配置构建器
-type DecryptorConfig struct {
-    sslKeyLogger io.Reader
-    pcapReader   io.Reader
-    packetChan   chan *types.DecryptedPacket
-    logger       *log.Logger
-}
-
-// 工厂模式
-type DecryptorFactory struct {
-    keyLog     *crypto.KeyLogStore
-    logger     *log.Logger
-    packetChan chan *types.DecryptedPacket
-}
+// api.go 中的公开签名
+func DecryptPcapFile(keylog, pcap io.Reader, output chan *types.DecryptedPacket) error
+func DecryptLiveTraffic(keylog, pcap io.Reader, output chan *types.DecryptedPacket) error
+func NewDecryptorConfig() *DecryptorConfig
+func DecryptWithConfig(config *DecryptorConfig) error
 ```
+
+配置链式方法和流式入口见 [API 文档](API.md)。`DecryptLiveTraffic` 读取调用方
+传入的 reader，本身不打开网卡。channel 需要并发消费，由调用方在解密返回后关闭。
 
 **设计模式**:
 - **Builder 模式**: `DecryptorConfig` 使用链式调用构建配置
@@ -180,16 +170,28 @@ protocol/
 **核心接口**:
 
 ```go
-// 协议解析器接口
-type ProtocolParser interface {
-    Parse(data []byte, direction string) ([]*types.DecryptedPacket, error)
-    GetProtocolName() string
+// types/interfaces.go
+type StreamParserInterface interface {
+    FeedRequest(data []byte)
+    FeedResponse(data []byte)
+    SetPacketTime(t time.Time)
+    Flush()
 }
 
-// 注册机制
-func RegisterProtocol(name string, parser ProtocolParser)
-func GetParser(protocol string) ProtocolParser
+type ProtocolDetector interface {
+    Name() string
+    Detect(data []byte) int
+    CreateParser(addr ConnectionKey, packetChan chan *DecryptedPacket) StreamParserInterface
+}
+
+// protocol/protocol_registry.go
+func RegisterProtocol(detector types.ProtocolDetector)
+func DetectProtocol(data []byte, ci types.ConnectionKey, packetChan chan *types.DecryptedPacket) (types.StreamParserInterface, string)
 ```
+
+自动检测选择最高正分，由检测器为每条连接创建独立解析器。解析器按方向接收
+解密字节，通过 channel 输出消息。`SelectProtocol` 支持已有协议的显式选择；
+HTTP/3 由 QUIC 路径创建解析器，不能将其当成普通 TLS 字节前缀检测。
 
 **协议识别流程**:
 
@@ -201,10 +203,10 @@ func GetParser(protocol string) ProtocolParser
        ▼
 ┌──────────────────┐
 │ 协议识别          │
-│ - HTTP/1.1        │  识别特征:
-│ - HTTP/2          │  - HTTP/1.1: "GET", "POST", "HTTP/"
-│ - HTTP/3          │  - HTTP/2: SETTINGS 帧 (0x04)
-│ - WebSocket       │  - HTTP/3: SETTINGS 帧 + QPACK
+│ - HTTP/1.x        │  请求方法前缀
+│ - HTTP/2         │  客户端连接 preface
+│ - WebSocket      │  HTTP Upgrade 协商
+│ - HTTP/3         │  独立 QUIC 路径
 └──────┬───────────┘
        │
        ▼
@@ -249,15 +251,18 @@ transport/
 ```go
 // 解密器接口 (types/interfaces.go)
 type Decryptor interface {
-    Decrypt(packet gopacket.Packet) error
-    GetProtocol() string
+    Decrypt() error
+    FeedClient(data []byte) error
+    FeedServer(data []byte) error
+    SetPacketTime(t time.Time)
+    CloseClient() error
+    CloseServer() error
     Close() error
+    GetAddr() ConnectionKey
 }
 
-// 连接工厂接口
-type DecryptorFactory interface {
-    CreateDecryptor(connKey types.ConnectionKey) types.Decryptor
-}
+// factory.go 中的具体工厂方法，不是另一个接口
+func (f *DecryptorFactory) Create(key types.ConnectionKey) types.Decryptor
 ```
 
 **TLS 解密流程**:
@@ -314,8 +319,8 @@ type DecryptorFactory interface {
          ▼
 ┌─────────────────────┐
 │ 从 KeyLog 查找密钥  │
-│ - QUIC_CLIENT       │
-│ - QUIC_SERVER       │
+│ - TLS 1.3 secrets   │
+│ - 按 ClientRandom   │
 └────────┬────────────┘
          │
          ▼
@@ -357,28 +362,16 @@ crypto/
 ├── cipher_registry.go    # 密码套件注册
 ├── decryptor.go          # 通用解密器
 ├── handshake.go          # TLS 握手解析
-└── stream.go             # 流密码操作
+└── stream.go             # TLS 输入记录缓冲
 ```
 
 **密钥管理**:
 
-```go
-// KeyLogStore - SSLKEYLOG 存储
-type KeyLogStore struct {
-    clientRandom map[string]*KeyMaterial  // CLIENT_RANDOM 映射
-    quicSecrets  map[string]*QuicSecrets  // QUIC 密钥
-}
-
-// KeyMaterial - TLS 密钥材料
-type KeyMaterial struct {
-    ClientRandom     []byte
-    MasterSecret     []byte
-    ClientWriteKey   []byte
-    ServerWriteKey   []byte
-    ClientWriteIV    []byte
-    ServerWriteIV    []byte
-}
-```
+[`crypto.KeyLogStore`](../crypto/keylog.go) 按 ClientRandom 索引 `TLSSecrets`，
+由 `NewKeyLogStoreFromReader`、`LoadFromReader` 或增量 `Write` 导入 keylog。
+TLS 1.2 使用 `MasterSecret`，TLS 1.3/QUIC 使用按方向及阶段区分的 traffic secrets；
+ECH 关联材料按 OuterRandom 保存。存储有锁、导入上限和更新通知，迟到 DSB 可唤醒
+等待方，不需要伪造下一包。密钥派生后的记录/包状态由对应解密器持有。
 
 **支持的密码套件**:
 
@@ -389,6 +382,9 @@ type KeyMaterial struct {
 | TLS_CHACHA20_POLY1305_SHA256 | 1.3 | ChaCha20 | ✅ |
 | TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 | 1.2 | AES-128-GCM | ✅ |
 | TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 | 1.2 | AES-256-GCM | ✅ |
+
+这里只列部分已注册套件；注册不等于所有握手/恢复/更新组合均可用。
+实际版本和状态边界见 [API 能力矩阵](API.md)。
 
 ---
 
@@ -403,40 +399,22 @@ type KeyMaterial struct {
 
 **核心类型**:
 
-```go
-// 解密数据包
-type DecryptedPacket struct {
-    Transport  string
-    Protocol   string
-    Direction  string
-    Data       []byte
-    Timestamp  time.Time
-    Metadata   map[string]interface{}
-    SrcIP      string
-    SrcPort    uint32
-    DstIP      string
-    DstPort    uint32
-    PID        int64
-    PName      string
-    DataLength uint32
-}
+`types.DecryptedPacket` 的完整定义和构造函数见 [`types/packet.go`](../types/packet.go)。
+`Data` 为解密字节且带 `json:"-"`，直接 JSON 编码不携带正文；连接身份由
+`ConnectionID()` 取得，不应仅按可见端点字段拼接。
 
-// 连接标识
+```go
+// types/interfaces.go 中的连接标识
 type ConnectionKey struct {
     SrcIP       net.IP
-    SrcPort     uint16
     DstIP       net.IP
+    SrcPort     uint16
     DstPort     uint16
-    Protocol    uint8
-    Pid         uint32
+    Proto       string
+    Pid         int
+    FD          int
     ProcessName string
-}
-
-// 解密器接口
-type Decryptor interface {
-    Decrypt(packet gopacket.Packet) error
-    GetProtocol() string
-    Close() error
+    Generation  uint64
 }
 ```
 
@@ -497,26 +475,11 @@ type Decryptor interface {
 
 ### 连接管理
 
-```go
-// 连接跟踪映射
-conntrack := make(map[string]types.Decryptor)
-
-// 数据包到达
-for packet := range packets {
-    // 生成连接键
-    connKey := generateConnectionKey(packet)
-    
-    // 查找或创建解密器
-    decryptor, exists := conntrack[connKey]
-    if !exists {
-        decryptor = factory.CreateDecryptor(connKey)
-        conntrack[connKey] = decryptor
-    }
-    
-    // 解密数据包
-    err := decryptor.Decrypt(packet)
-}
-```
+[`api.go`](../api.go) 负责双向路由及解密器创建；TCP 先经过
+[`tcp_reassembly.go`](../tcp_reassembly.go) 的序号重组和重传去重，再按方向调用
+`FeedClient`/`FeedServer`。同 tuple 的新 SYN 使用新的 `Generation`，重复 SYN
+不创建新连接。QUIC 路由还需要 CID 状态，不能用简单的单向 tuple map 替代。
+空闲回收、关闭和连接额度释放见 [`lifecycle.go`](../lifecycle.go)。
 
 ---
 
@@ -531,69 +494,27 @@ for packet := range packets {
 
 ### 2. 开闭原则 (OCP)
 
-- 新增协议：实现 `ProtocolParser` 接口并注册
-- 新增密码套件：实现解密函数并注册
-- 无需修改现有代码
+- 新增字节流协议：实现 `types.StreamParserInterface` 及 `types.ProtocolDetector`，
+  调用 `protocol.RegisterProtocol(detector)`。
+- 新增密码套件：核对 `crypto.CipherSuiteConfig`，调用 `crypto.RegisterCipherSuite`；
+  需要新记录布局或算法时，还需实现相应解密路径。
+- 注册表复用现有创建流程；新增传输或公开选项仍需修改路由和选项校验。
 
-**示例：添加新协议**
-```go
-// 实现解析器
-type MyProtocolParser struct{}
-
-func (p *MyProtocolParser) Parse(data []byte, direction string) ([]*types.DecryptedPacket, error) {
-    // 解析逻辑
-}
-
-func (p *MyProtocolParser) GetProtocolName() string {
-    return "my-protocol"
-}
-
-// 注册
-func init() {
-    RegisterProtocol("my-protocol", &MyProtocolParser{})
-}
-```
+具体步骤见 [开发指南](DEVELOPMENT.md#添加新的协议解析器)，此处不另定义一套解析接口。
 
 ### 3. 依赖倒置原则 (DIP)
 
 - 高层模块不依赖低层模块，都依赖抽象
-- 使用接口定义契约：`Decryptor`, `ProtocolParser`
-
-```go
-// 接口定义
-type Decryptor interface {
-    Decrypt(packet gopacket.Packet) error
-}
-
-// 高层使用接口
-func ProcessPacket(d Decryptor, packet gopacket.Packet) {
-    d.Decrypt(packet)
-}
-```
+- 使用 `types.Decryptor`、`types.ProtocolDetector` 和 `types.StreamParserInterface`
+  连接引擎、解密器和应用解析器；真实签名见前文及 `types/interfaces.go`。
 
 ### 4. 接口隔离原则 (ISP)
 
 - 接口小而专注
 - 客户端不依赖不需要的接口
 
-```go
-// 好的设计：小接口
-type Decryptor interface {
-    Decrypt(packet gopacket.Packet) error
-}
-
-type ProtocolParser interface {
-    Parse(data []byte, direction string) ([]*types.DecryptedPacket, error)
-}
-
-// 避免：大而全的接口
-// type Processor interface {
-//     Decrypt(...) error
-//     Parse(...) error
-//     Export(...) error
-//     ...
-// }
-```
+检测器负责识别与创建，流解析器负责分方向输入、时间戳和 Flush；HAR/JSON 导出
+留在调用方或示例，不并入解析器接口。
 
 ---
 
@@ -674,31 +595,14 @@ QUIC 短头部数据包:
 
 ### 1. 内存池
 
-```go
-// 复用 buffer 减少 GC 压力
-var bufferPool = sync.Pool{
-    New: func() interface{} {
-        return make([]byte, 16384)
-    },
-}
-
-func decrypt(data []byte) []byte {
-    buf := bufferPool.Get().([]byte)
-    defer bufferPool.Put(buf)
-    // 使用 buf
-}
-```
+内存池不是公共接口或所有路径的保证。先用 profile 定位分配，再决定是否复用；
+已交付调用方的 `Data` 不能在其仍持有时放回池复用。缓存额度也不能由池替代。
 
 ### 2. 并发处理
 
-```go
-// 使用 goroutine 并发解密
-for packet := range packets {
-    go func(p gopacket.Packet) {
-        decryptor.Decrypt(p)
-    }(packet)
-}
-```
+引擎维护有界的连接和 worker 生命周期，同一连接保留必要的双向状态与输入顺序。
+不要为每个 packet 启动无界 goroutine。输出 channel/emit 保持背压，不能用无限
+队列或丢弃结果绕过慢消费者。
 
 ### 3. 流式处理
 
@@ -721,19 +625,10 @@ protocol/        - 协议解析测试
 
 ### 集成测试
 
-端到端测试：
-```go
-func TestDecryptPcapFile(t *testing.T) {
-    keylog := openTestKeyLog()
-    pcap := openTestPcap()
-    
-    packets := make(chan *types.DecryptedPacket, 100)
-    err := DecryptPcapFile(keylog, pcap, packets)
-    
-    assert.NoError(t, err)
-    assert.Greater(t, len(packets), 0)
-}
-```
+端到端测试必须在解密期间并发消费 channel；固定缓冲容量不能保证先解密后消费
+不会阻塞。可运行示例见 [开发指南](DEVELOPMENT.md#集成测试示例)，完整字节与连接
+断言见 [`http_tcp_integration_test.go`](../http_tcp_integration_test.go)；迟到 DSB、
+取消和 EOF 回归见 `quic_late_dsb_test.go`、`raw_stream_test.go`、`lifecycle_test.go`。
 
 ---
 
@@ -741,15 +636,15 @@ func TestDecryptPcapFile(t *testing.T) {
 
 ### 添加新协议
 
-1. 实现 `ProtocolParser` 接口
-2. 注册到 `protocol_registry.go`
-3. 添加协议识别逻辑
+1. 实现 `types.StreamParserInterface` 与 `types.ProtocolDetector`
+2. 调用 `protocol.RegisterProtocol(detector)`，为每条连接创建独立解析器
+3. 验证检测分数或显式选择、增量输入、资源上限和关闭行为
 
 ### 添加新的密码套件
 
-1. 在 `crypto/decryptor.go` 添加解密函数
-2. 在 `crypto/cipher_registry.go` 注册
-3. 更新测试用例
+1. 核对现有算法与记录布局，必要时修改 `crypto/decryptor.go`
+2. 通过 `crypto.RegisterCipherSuite` 注册完整 `CipherSuiteConfig`
+3. 验证版本匹配、独立密码向量、认证失败及真实对端互通
 
 ### 自定义输出格式
 

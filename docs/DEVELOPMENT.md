@@ -8,10 +8,14 @@
 
 | 工具 | 版本要求 | 用途 |
 |------|---------|------|
-| Go | >= 1.21 | 编译和构建 |
+| Go | >= 1.26.0 | 与根模块及 CI 的 Go 1.26 基线一致 |
 | Git | >= 2.0 | 版本控制 |
 | Make | >= 3.81 | 构建自动化 |
-| GCC/Clang | 任意 | C 示例编译 |
+| GCC/Clang | 支持当前目标平台 | C archive/shared、C 示例及 `-race` 构建 |
+| Python | 3 | 示例端到端测试 |
+
+Go SDK/CLI 可使用 `CGO_ENABLED=0`；C 库和 race 检查需要 `CGO_ENABLED=1`
+及可用 C 编译器。离线读取使用 `pcapgo`，不要求 libpcap 开发库、root 或 eBPF。
 
 ### 可选工具
 
@@ -35,6 +39,10 @@ go mod download
 make tools
 ```
 
+`make tools` 固定安装 goimports v0.49.0、golangci-lint v1.64.8，安装工具时
+使用 `CGO_ENABLED=0`；这不改变 SDK 的 race/C 构建要求。保留 `go.mod` 中
+gopacket 的 replace，pcapng DSB 读取依赖该 fork。
+
 ---
 
 ## 📂 项目结构
@@ -50,7 +58,7 @@ ecapture_decryptor/
 │   ├── cipher_registry.go   # 密码套件注册
 │   ├── decryptor.go         # 通用解密器
 │   ├── handshake.go         # TLS 握手解析
-│   └── stream.go            # 流密码操作
+│   └── stream.go            # TLS 输入记录缓冲
 │
 ├── transport/                # 传输层解密
 │   ├── adapters.go          # 适配器接口
@@ -75,7 +83,7 @@ ecapture_decryptor/
 ├── examples/                 # 示例程序
 │   ├── c_demo/              # C 语言示例
 │   ├── go_demo/             # Go 语言示例
-│   └── go_static_demo/      # Go CGO 示例
+│   └── go_static_demo/      # 直接调用 Go API 的示例，未链接 C archive
 │
 ├── docs/                     # 文档
 │   ├── API.md               # API 参考
@@ -112,7 +120,7 @@ make build-static
 # 构建动态库
 make build-shared
 
-# 构建所有
+# 按序构建两种库（共用生成头文件，不使用 make -j）
 make build
 
 # 运行测试
@@ -128,8 +136,12 @@ make lint
 ### 运行示例
 
 ```bash
-# 构建并测试示例
-cd examples && make test
+# 构建 CLI；根目录是 SDK 包，不是 main 包
+make -C examples/go_demo build
+
+# 重建 C 静态库并构建、测试全部示例
+make build-static
+make -C examples test
 ```
 
 ---
@@ -150,6 +162,9 @@ go test ./protocol/
 # 详细输出
 go test -v ./...
 
+# 并发与生命周期检查（与 CI 一致）
+CGO_ENABLED=1 go test -race ./...
+
 # 测试覆盖率
 go test -cover ./...
 go test -coverprofile=coverage.out ./...
@@ -161,51 +176,60 @@ go tool cover -html=coverage.out
 #### 单元测试示例
 
 ```go
-// crypto/keylog_test.go
-func TestKeyLogStore(t *testing.T) {
-    keylog := strings.NewReader(`
-CLIENT_RANDOM abcd1234... master_secret_data
-`)
-    
-    store, err := NewKeyLogStore(keylog)
-    assert.NoError(t, err)
-    assert.NotNil(t, store)
-    
-    // 测试密钥查找
-    key, found := store.GetKey("abcd1234...")
-    assert.True(t, found)
-    assert.NotNil(t, key)
+// crypto 包内示例，需要 bytes、encoding/hex、strings、testing。
+func TestKeyLogLookup(t *testing.T) {
+    random := bytes.Repeat([]byte{1}, 32)
+    master := bytes.Repeat([]byte{2}, 48)
+    line := "CLIENT_RANDOM " + hex.EncodeToString(random) + " " + hex.EncodeToString(master)
+    store, err := NewKeyLogStoreFromReader(strings.NewReader(line))
+    if err != nil {
+        t.Fatal(err)
+    }
+    secrets := store.GetSecrets(random)
+    if secrets == nil || !bytes.Equal(secrets.MasterSecret, master) {
+        t.Fatal("master secret lookup failed")
+    }
 }
 ```
 
 #### 集成测试示例
 
 ```go
-// api_test.go
-func TestDecryptPcapFile(t *testing.T) {
-    keylog, _ := os.Open("test/testdata/sslkey.log")
-    pcap, _ := os.Open("test/testdata/traffic.pcap")
+// 根包内示例，需要 os、testing 及本模块的 types 包。
+func TestCapturedHTTP(t *testing.T) {
+    keylog, err := os.Open("test/testdata/all_clients_sslkey.log")
+    if err != nil {
+        t.Fatal(err)
+    }
     defer keylog.Close()
+    pcap, err := os.Open("test/testdata/all_clients.pcap")
+    if err != nil {
+        t.Fatal(err)
+    }
     defer pcap.Close()
-    
-    packets := make(chan *types.DecryptedPacket, 100)
-    
+
+    packets := make(chan *types.DecryptedPacket)
+    done := make(chan error, 1)
     go func() {
-        err := DecryptPcapFile(keylog, pcap, packets)
-        assert.NoError(t, err)
+        done <- DecryptPcapFile(keylog, pcap, packets)
         close(packets)
     }()
-    
+
     count := 0
-    for packet := range packets {
+    for range packets {
         count++
-        assert.NotEmpty(t, packet.Protocol)
-        assert.NotEmpty(t, packet.Direction)
     }
-    
-    assert.Greater(t, count, 0)
+    if err := <-done; err != nil {
+        t.Fatal(err)
+    }
+    if count == 0 {
+        t.Fatal("no decrypted packets")
+    }
 }
 ```
+
+channel 必须与解密并发消费；由调用方在函数返回后关闭。实际回归还应验证
+协议、方向、连接身份和完整明文，参考 `http_tcp_integration_test.go`。
 
 ### 测试数据
 
@@ -215,7 +239,7 @@ func TestDecryptPcapFile(t *testing.T) {
 test/testdata/
 ├── all_clients.pcap           # 多客户端测试数据
 ├── all_clients_sslkey.log     # 对应的密钥日志
-├── cc.pcapng                  # 单个连接测试
+├── http10_tcpdump_no_dsb.pcapng # 独立 TLS HTTP/1.0 抓包
 └── ...
 ```
 
@@ -289,6 +313,9 @@ gofmt -s -w .
 goimports -w .
 ```
 
+以上命令会格式化整个仓库；局部修改只对涉及的文件运行 gofmt/goimports。
+`make check` 会打印格式差异并运行 lint，格式工具输出必须为空，不能只看退出码。
+
 ### 静态检查
 
 ```bash
@@ -305,84 +332,45 @@ golangci-lint run
 
 ### 添加新的协议解析器
 
-1. **创建解析器文件**
+先查看 [真实接口](../types/interfaces.go) 与
+[协议注册实现](../protocol/protocol_registry.go)。解析器按方向增量接收字节，
+通过创建时传入的 channel 输出 `*types.DecryptedPacket`，不是返回消息切片：
 
 ```go
-// protocol/protocol_grpc.go
-package protocol
-
-import "github.com/gojue/ecapture_decryptor/types"
-
-type GRPCParser struct {
-    // 状态
+// types 包的接口签名；类型位于 types/interfaces.go。
+type StreamParserInterface interface {
+    FeedRequest(data []byte)
+    FeedResponse(data []byte)
+    SetPacketTime(t time.Time)
+    Flush()
 }
 
-func NewGRPCParser() *GRPCParser {
-    return &GRPCParser{}
-}
-
-func (p *GRPCParser) Parse(data []byte, direction string) ([]*types.DecryptedPacket, error) {
-    // 解析逻辑
-    return packets, nil
-}
-
-func (p *GRPCParser) GetProtocolName() string {
-    return "grpc"
+type ProtocolDetector interface {
+    Name() string
+    Detect(data []byte) int
+    CreateParser(addr ConnectionKey, packetChan chan *DecryptedPacket) StreamParserInterface
 }
 ```
 
-2. **注册协议**
+1. 实现 `types.StreamParserInterface`，保持有界缓存、分片/合并消息处理和输出背压。
+2. 实现 `types.ProtocolDetector`，由 `CreateParser` 为每条连接创建独立解析器，
+   然后调用 `protocol.RegisterProtocol(detector)`。自动检测选择最高正分；
+   无法安全识别的协议应采用显式选择，公共选项的校验和传输路由也需配套修改。
+3. 在现有协议测试结构中验证完整字节、双向状态、截断、资源上限及关闭行为，
+   再补独立真实抓包回归。可参考 `protocol/http_stream_test.go`。
 
-```go
-// protocol/protocol_registry.go
-func init() {
-    RegisterProtocol("grpc", NewGRPCParser())
-}
-```
-
-3. **添加测试**
-
-```go
-// protocol/protocol_grpc_test.go
-func TestGRPCParser(t *testing.T) {
-    parser := NewGRPCParser()
-    data := []byte("gRPC data...")
-    
-    packets, err := parser.Parse(data, "request")
-    assert.NoError(t, err)
-    assert.Greater(t, len(packets), 0)
-}
-```
+gRPC 已在 HTTPEvents 的 HTTP/2 路径中实现；不要另建基于任意字节前缀的
+独立 gRPC 检测器。HTTP/3 由 QUIC 路径处理，不能仅靠注册 TLS 字节检测器接入。
 
 ### 添加新的密码套件
 
-1. **实现解密函数**
+注册入口是 `crypto.RegisterCipherSuite(config *crypto.CipherSuiteConfig)`，见
+[`crypto/cipher_registry.go`](../crypto/cipher_registry.go)。配置包含 ID、名称、
+TLS 版本、key/MAC/IV 长度、哈希函数，以及 AEAD 套件的 `AEADFactory`。
+先核对已有配置，AES-256-GCM 已内置，不要重复注册示例套件。
 
-```go
-// crypto/decryptor.go
-func decryptAES256GCM(key, nonce, ciphertext, aad []byte) ([]byte, error) {
-    block, err := aes.NewCipher(key)
-    if err != nil {
-        return nil, err
-    }
-    
-    gcm, err := cipher.NewGCM(block)
-    if err != nil {
-        return nil, err
-    }
-    
-    return gcm.Open(nil, nonce, ciphertext, aad)
-}
-```
-
-2. **注册密码套件**
-
-```go
-// crypto/cipher_registry.go
-func init() {
-    RegisterCipher(0x1302, "TLS_AES_256_GCM_SHA384", decryptAES256GCM)
-}
-```
+注册不会自动实现新算法、记录布局或 TLS/QUIC 状态。需要修改解密路径时，
+同时验证版本与套件匹配、独立密码向量、认证失败不输出及真实对端互通。
 
 ---
 
@@ -430,8 +418,8 @@ tcpdump -r traffic.pcap -c 5
 #### 内存泄漏
 
 ```bash
-# 生成内存 profile
-go test -memprofile=mem.prof ./...
+# 每次选择一个包，避免多包共用 profile 输出文件
+go test -memprofile=mem.prof ./protocol
 
 # 分析
 go tool pprof mem.prof
@@ -440,8 +428,8 @@ go tool pprof mem.prof
 #### CPU 性能
 
 ```bash
-# 生成 CPU profile
-go test -cpuprofile=cpu.prof ./...
+# 每次选择一个包
+go test -cpuprofile=cpu.prof ./protocol
 
 # 分析
 go tool pprof cpu.prof
@@ -467,7 +455,7 @@ git remote add upstream https://github.com/gojue/ecapture_decryptor.git
 
 ```bash
 # 创建功能分支
-git checkout -b feature/add-grpc-support
+git checkout -b feat/add-protocol
 
 # 或修复分支
 git checkout -b fix/memory-leak
@@ -477,16 +465,17 @@ git checkout -b fix/memory-leak
 
 ```bash
 # 编写代码
-vim protocol/protocol_grpc.go
+vim protocol/protocol_custom.go
 
 # 添加测试
-vim protocol/protocol_grpc_test.go
+vim protocol/protocol_custom_test.go
 
 # 运行测试
 go test ./protocol/
 
 # 格式化代码
-make fmt
+gofmt -w protocol/protocol_custom.go protocol/protocol_custom_test.go
+goimports -w protocol/protocol_custom.go protocol/protocol_custom_test.go
 
 # 静态检查
 make lint
@@ -496,12 +485,12 @@ make lint
 
 ```bash
 # 添加文件
-git add protocol/protocol_grpc.go protocol/protocol_grpc_test.go
+git add protocol/protocol_custom.go protocol/protocol_custom_test.go
 
 # 提交（遵循 conventional commits）
-git commit -m "feat(protocol): add gRPC protocol parser
+git commit -m "feat(protocol): add custom protocol parser
 
-- Implement gRPC frame parsing
+- Implement bounded incremental parsing
 - Add unit tests
 - Update documentation
 
@@ -512,7 +501,7 @@ Closes #123"
 
 ```bash
 # 推送到你的 fork
-git push origin feature/add-grpc-support
+git push origin feat/add-protocol
 
 # 在 GitHub 上创建 Pull Request
 ```
@@ -569,45 +558,20 @@ ls -la dist/
 
 ### 工作流
 
-```yaml
-# .github/workflows/test.yml
-name: Test
-on: [push, pull_request]
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.26'
-      - run: make test
-      - run: make lint
-```
+实际配置是 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)，使用 Go 1.26：
+
+- 检查 gofmt/goimports 输出，并运行 golangci-lint。
+- Ubuntu/macOS 运行 `go test -v -race -coverprofile=coverage.out -covermode=atomic ./...`。
+- 按序构建 C 静态库、动态库，再构建示例并运行 `make -C examples test`。
+
+工具安装与缓存方式以该工作流和根 Makefile 为准，不在文档中维护另一份 YAML。
 
 ### 发布工作流
 
-```yaml
-# .github/workflows/release.yml
-name: Release
-on:
-  push:
-    tags:
-      - 'v*'
-jobs:
-  release:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-      - run: make release VERSION=${{ github.ref_name }}
-      - uses: softprops/action-gh-release@v1
-        with:
-          files: dist/*.tar.gz
-```
+实际配置是 [`.github/workflows/release.yml`](../.github/workflows/release.yml)，
+由 `v*.*.*` tag 触发，构建 Linux amd64、Linux arm64 与 Darwin arm64，再上传发布包。
+Linux arm64 使用 `aarch64-linux-gnu-gcc` 交叉编译；C 库交叉构建不能只设置
+`GOOS/GOARCH`。普通开发验证不运行发布、打 tag 或推送 tag。
 
 ---
 
@@ -629,8 +593,8 @@ vim README.md
 ### 文档构建
 
 ```bash
-# 检查链接
-find docs -name "*.md" -exec grep -H "http" {} \;
+# 列出链接供检查（不验证远端可达性）
+rg -n 'https?://' docs --glob '*.md'
 
 # 生成 PDF（需要 pandoc）
 pandoc docs/API.md -o docs/API.pdf

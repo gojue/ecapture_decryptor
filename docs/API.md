@@ -66,7 +66,7 @@ close(packetChan)
 
 #### DecryptLiveTraffic
 
-解密实时流量（从网卡或实时 PCAP 流）。
+解密调用方提供的实时 PCAP/PCAPNG 数据流；函数本身不打开网卡。
 
 ```go
 func DecryptLiveTraffic(
@@ -865,7 +865,7 @@ API 返回的常见错误：
 |------|------|----------|
 | `invalid pcap format` | PCAP 文件格式错误 | 检查文件是否为有效的 PCAP/PCAPNG |
 | `no valid keys found` | SSLKEYLOG 文件无效或为空 | 检查 keylog 文件格式 |
-| `unsupported protocol` | 不支持的协议 | 当前仅支持 TLS/QUIC |
+| `unsupported protocol` | 不支持的协议或版本 | 核对 TLS、QUIC 或显式 DTLS 的支持矩阵及选项 |
 | `channel closed` | 输出通道已关闭 | 确保通道在使用期间保持打开 |
 
 **错误处理示例：**

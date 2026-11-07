@@ -103,6 +103,9 @@ jobs:
       - name: Run unit tests
         run: go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
 
+      - name: Test release scripts without building releases
+        run: python3 scripts/test_release.py
+
       - name: Upload coverage to Codecov
         if: matrix.os == 'ubuntu-latest'
         uses: codecov/codecov-action@v4

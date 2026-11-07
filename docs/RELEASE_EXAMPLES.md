@@ -1,6 +1,6 @@
 # 发布系统使用示例
 
-本文档提供完整的发布系统使用示例，帮助你快速上手。
+本文档提供发布系统使用示例。版本号和变更内容仅为示意，命令从仓库根目录执行；构建需要 Go 1.26.0 或兼容的更新版本及 C 编译器。发布前先完成本地验证；推送 `v*.*.*` 标签会触发 Release 工作流。
 
 ## 📝 场景 1: 发布小版本更新 (Bug 修复)
 
@@ -26,12 +26,13 @@ vim CHANGELOG.md
 make test
 
 # 5. 提交更改
-git add .
+git add capi/main.go CHANGELOG.md
+# 其他发布变更逐项检查后暂存
 git commit -m "Release v1.0.1 - Bug fixes"
 
 # 6. 创建并推送标签
 git tag v1.0.1
-git push origin main --tags
+git push origin master v1.0.1
 
 # 7. GitHub Actions 自动发布完成！
 # 访问: https://github.com/gojue/ecapture_decryptor/releases
@@ -53,7 +54,7 @@ vim CHANGELOG.md
 # 添加新功能描述:
 # ### Added
 # - Support for TLS 1.3 0-RTT decryption
-# - New API function `DecryptWithOptions()`
+# - Updated options for `DecryptPcapngStreamWithOptions()`
 # ### Changed
 # - Improved HTTP/2 parsing performance by 30%
 
@@ -61,9 +62,10 @@ vim CHANGELOG.md
 # 添加新功能的使用说明
 
 # 4. 运行完整测试
-make test
-make fmt
+CGO_ENABLED=1 go test -race ./...
+# 检查改动的 Go 文件是否已通过 gofmt/goimports
 make lint
+python3 scripts/test_release.py
 
 # 5. 本地测试发布（可选）
 make release VERSION=v1.1.0
@@ -75,10 +77,10 @@ ls -la lib/
 
 # 7. 提交并发布
 cd ../..
-git add .
+git add capi/main.go CHANGELOG.md README.md
 git commit -m "Release v1.1.0 - New features"
 git tag v1.1.0
-git push origin main --tags
+git push origin master v1.1.0
 ```
 
 ---
@@ -95,13 +97,11 @@ API 有重大变更，需要发布 v2.0.0。
 # 2. 详细记录破坏性变更
 vim CHANGELOG.md
 # ### ⚠️ Breaking Changes
-# - Removed deprecated `DecryptOld()` function
-# - Changed API signature of `DecryptPcapFile()`
-# - Requires Go 1.21+ (previously 1.19+)
+# - Describe the actual incompatible API changes here
+# - Build environment: Go 1.26.0 or a compatible newer version
 #
 # ### Migration Guide
-# - Replace `DecryptOld()` with `DecryptPcapFile()`
-# - Update function calls to match new signature
+# - Document replacement calls and required caller changes
 
 # 3. 更新文档
 # - 更新 README.md
@@ -110,13 +110,14 @@ vim CHANGELOG.md
 
 # 4. 充分测试
 make test
-cd examples && make test
+make -C examples test
 
 # 5. 提交并发布
-git add .
+git add capi/main.go CHANGELOG.md
+# 迁移说明和示例改动逐项检查后暂存
 git commit -m "Release v2.0.0 - Major version with breaking changes"
 git tag v2.0.0
-git push origin main --tags
+git push origin master v2.0.0
 ```
 
 ---
@@ -139,25 +140,22 @@ vim CHANGELOG.md
 make release VERSION=v1.1.0-beta.1
 
 # 4. 提交
-git add .
+git add capi/main.go CHANGELOG.md
 git commit -m "Release v1.1.0-beta.1 - Beta release"
 git tag v1.1.0-beta.1
-git push origin main --tags
+git push origin master v1.1.0-beta.1
 
-# 5. 在 GitHub Release 中标记为 Pre-release
-# 或使用 CLI:
-gh release create v1.1.0-beta.1 \
-  --title "v1.1.0-beta.1 (Beta)" \
-  --notes "Beta release for testing" \
-  --prerelease \
-  dist/*.tar.gz
+# 5. 等标签工作流创建 Release 后，标记为 Pre-release
+gh release edit v1.1.0-beta.1 --prerelease
 ```
+
+当前工作流固定 `prerelease: false`，不会自动识别预发布后缀。`set` 接受可选的 `v` 前缀及预发布/构建元数据后缀；`bump` 对带后缀的当前版本报错，转正式版时使用 `set v1.1.0`。
 
 ---
 
 ## 🔄 场景 5: 多平台同时发布
 
-需要为所有平台构建发布包。
+需要构建本机平台及 Linux amd64/arm64 发布包。Docker 必须支持运行目标架构的容器（原生或已配置模拟）；未安装 Docker 时只构建本机平台。
 
 ```bash
 # 1. 准备版本
@@ -166,15 +164,14 @@ vim CHANGELOG.md
 
 # 2. 使用多平台构建脚本
 ./scripts/build-multiplatform.sh v1.1.0
-# 这会使用 Docker 构建:
-# - darwin-amd64
-# - darwin-arm64
-# - linux-amd64
-# - linux-arm64
+# 先构建当前主机平台，再使用 Go 1.26 Docker 镜像构建:
+# - linux/amd64
+# - linux/arm64
+# 不会交叉构建另一种 macOS 架构
 
 # 3. 验证所有构建包
 ls -lh dist/*.tar.gz
-sha256sum dist/*.tar.gz
+shasum -a 256 dist/*.tar.gz
 
 # 4. 创建 Release 并上传所有包
 gh release create v1.1.0 \
@@ -183,6 +180,8 @@ gh release create v1.1.0 \
   dist/*.tar.gz \
   dist/*.sha256
 ```
+
+上面的 `gh release create` 是手动发布路径，不要与同标签的自动发布重复执行。Release 工作流的实际平台矩阵为 Linux amd64/arm64 和 Darwin arm64；不包含 Darwin amd64。
 
 ---
 
@@ -212,7 +211,7 @@ gh release create v1.1.0 \
 
 ## 📦 场景 7: 手动打包发布
 
-需要自定义发布包内容。
+需要自定义发布包内容。标准脚本只打包库、头文件、许可证、README 和校验和；本例额外加入示例源码。
 
 ```bash
 # 1. 构建库
@@ -238,13 +237,13 @@ echo "Custom build for special users" > "${RELEASE_DIR}/NOTES.txt"
 
 # 5. 生成校验和
 cd "${RELEASE_DIR}"
-find . -type f -exec sha256sum {} \; > SHA256SUMS
+find . -type f ! -name SHA256SUMS -exec shasum -a 256 {} \; > SHA256SUMS
 
 # 6. 打包
 cd ..
 tar -czf "ecapture_decryptor-${VERSION}-${PLATFORM}.tar.gz" \
   "ecapture_decryptor-${VERSION}-${PLATFORM}"
-sha256sum "ecapture_decryptor-${VERSION}-${PLATFORM}.tar.gz" \
+shasum -a 256 "ecapture_decryptor-${VERSION}-${PLATFORM}.tar.gz" \
   > "ecapture_decryptor-${VERSION}-${PLATFORM}.tar.gz.sha256"
 ```
 
@@ -252,29 +251,31 @@ sha256sum "ecapture_decryptor-${VERSION}-${PLATFORM}.tar.gz" \
 
 ## 🔍 场景 8: 验证发布包
 
-用户下载后如何验证和使用。
+用户下载后如何验证和使用。以下在 macOS ARM64 上执行；标准包不含示例源码，需要从同版本源码中另取。
 
 ```bash
 # 1. 下载发布包
-wget https://github.com/gojue/ecapture_decryptor/dist/download/v1.1.0/ecapture_decryptor-v1.1.0-darwin-arm64.tar.gz
-wget https://github.com/gojue/ecapture_decryptor/dist/download/v1.1.0/ecapture_decryptor-v1.1.0-darwin-arm64.tar.gz.sha256
+curl -fLO https://github.com/gojue/ecapture_decryptor/releases/download/v1.1.0/ecapture_decryptor-v1.1.0-darwin-arm64.tar.gz
+curl -fLO https://github.com/gojue/ecapture_decryptor/releases/download/v1.1.0/ecapture_decryptor-v1.1.0-darwin-arm64.tar.gz.sha256
 
 # 2. 验证校验和
-sha256sum -c ecapture_decryptor-v1.1.0-darwin-arm64.tar.gz.sha256
+shasum -a 256 -c ecapture_decryptor-v1.1.0-darwin-arm64.tar.gz.sha256
 
 # 3. 解压
 tar -xzf ecapture_decryptor-v1.1.0-darwin-arm64.tar.gz
 cd ecapture_decryptor-v1.1.0-darwin-arm64
 
 # 4. 验证内容
-sha256sum -c SHA256SUMS
+shasum -a 256 -c SHA256SUMS
 
 # 5. 查看文档
 cat README.md
 
-# 6. 编译示例
-gcc -o test docs/examples/offline_decryption.c \
-    -I./include -L./lib -lecapture_decryptor \
+# 6. 获取同版本的示例源码并静态链接
+curl -fL https://raw.githubusercontent.com/gojue/ecapture_decryptor/v1.1.0/examples/c_demo/offline_decryption.c \
+  -o offline_decryption.c
+cc -o test offline_decryption.c \
+    -I./include ./lib/libecapture_decryptor.a -lpthread \
     -framework CoreFoundation -framework Security
 
 # 7. 运行测试
@@ -325,8 +326,8 @@ git push origin v1.1.0
 gh run list
 gh run view <run-id>
 
-# 手动触发
-gh workflow run release.yml
+# 重跑该次运行失败的 job；工作流没有 workflow_dispatch 入口
+gh run rerun <run-id> --failed
 ```
 
 ---
@@ -338,10 +339,10 @@ gh workflow run release.yml
 open https://github.com/gojue/ecapture_decryptor/releases
 
 # 2. 验证下载链接
-curl -I https://github.com/gojue/ecapture_decryptor/dist/download/v1.1.0/...
+curl -I https://github.com/gojue/ecapture_decryptor/releases/download/v1.1.0/ecapture_decryptor-v1.1.0-darwin-arm64.tar.gz
 
 # 3. 检查统计数据
-gh api repos/gojue/ecapture_decryptor/dist/latest
+gh api repos/gojue/ecapture_decryptor/releases/latest
 
 # 4. 更新项目主页
 vim README.md

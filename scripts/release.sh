@@ -18,15 +18,26 @@ AUTHOR="CFC4N"
 RELEASE_DIR="./dist"
 
 # Check if version is provided
-if [ -z "$1" ]; then
+if [ -z "${1:-}" ]; then
     echo -e "${RED}Error: Version number required${NC}"
     echo "Usage: $0 <version>"
     echo "Example: $0 v2.0.0"
     exit 1
 fi
 
-VERSION="$1"
-VERSION_NUMBER="${VERSION#v}"  # Remove 'v' prefix if exists
+# Validate before cleaning artifacts or modifying source. Keep the package name
+# and exported C version on the same normalized version, including prereleases.
+source "$(dirname "${BASH_SOURCE[0]}")/version.sh"
+VERSION_NUMBER="${1#v}"
+validate_version "$VERSION_NUMBER"
+RELEASE_SOURCE_VERSION=$(get_current_version)
+VERSION="v${VERSION_NUMBER}"
+
+if { [ -n "${GOOS:-}" ] && [ -z "${GOARCH:-}" ]; } ||
+    { [ -z "${GOOS:-}" ] && [ -n "${GOARCH:-}" ]; }; then
+    echo "Error: Cross-compilation requires both GOOS and GOARCH" >&2
+    exit 1
+fi
 
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}Building Release: ${VERSION}${NC}"
@@ -92,6 +103,10 @@ case "$OS_NAME" in
     linux)
         SHARED_EXT="so"
         ;;
+    *)
+        echo "Error: Unsupported GOOS: ${OS_NAME}" >&2
+        exit 1
+        ;;
 esac
 
 PLATFORM="${OS_NAME}-${ARCH_NAME}"
@@ -110,8 +125,10 @@ mkdir -p "${RELEASE_PATH}"
 
 # Update version in capi/main.go
 echo -e "${GREEN}Step 2: Updating version number...${NC}"
-sed -i.bak "s/eCapture Decryptor v[0-9.]* -/eCapture Decryptor ${VERSION} -/" capi/main.go
-rm -f capi/main.go.bak
+update_version "$VERSION"
+if [ "$RELEASE_SOURCE_VERSION" != "$VERSION_NUMBER" ]; then
+    rm -f "${CAPI_FILE}.bak"
+fi
 
 # Build static library
 echo -e "${GREEN}Step 3: Building static library...${NC}"
@@ -125,10 +142,9 @@ make build-shared
 echo -e "${GREEN}Step 5: Packaging libraries...${NC}"
 mkdir -p "${RELEASE_PATH}/lib"
 mkdir -p "${RELEASE_PATH}/include"
-#mkdir -p "${RELEASE_PATH}/docs"
 
 cp lib/libecapture_decryptor.a "${RELEASE_PATH}/lib/"
-cp lib/libecapture_decryptor.${SHARED_EXT} "${RELEASE_PATH}/lib/"
+cp "lib/libecapture_decryptor.${SHARED_EXT}" "${RELEASE_PATH}/lib/"
 cp include/libecapture_decryptor.h "${RELEASE_PATH}/include/"
 
 # Copy license files
@@ -148,15 +164,18 @@ Binary library distribution for ${PLATFORM}
 - \`lib/libecapture_decryptor.a\` - Static library
 - \`lib/libecapture_decryptor.${SHARED_EXT}\` - Shared/dynamic library
 - \`include/libecapture_decryptor.h\` - C header file
-- \`docs/\` - Documentation and examples
 
 ## Quick Start
 
 ### Using Static Library
 
 \`\`\`bash
-gcc -o myapp myapp.c -I./include -L./lib -lecapture_decryptor -lpthread \\
-    -framework CoreFoundation -framework Security  # macOS only
+# Linux: select the static archive explicitly.
+gcc -o myapp myapp.c -I./include ./lib/libecapture_decryptor.a -lpthread -lresolv
+
+# macOS:
+gcc -o myapp myapp.c -I./include ./lib/libecapture_decryptor.a -lpthread \\
+    -framework CoreFoundation -framework Security
 \`\`\`
 
 ### Using Shared Library
@@ -188,36 +207,29 @@ For commercial use, contact: cfc4n.cs@gmail.com
 
 ## Documentation
 
-- Full documentation: https://github.com/${REPOSITORY}
+- Full documentation: https://github.com/${REPOSITORY}/tree/${VERSION}/docs
 - API reference: See \`include/libecapture_decryptor.h\`
-- Examples: https://github.com/${REPOSITORY}/tree/master/examples
+- C examples (source, not included in this binary package): https://github.com/${REPOSITORY}/tree/${VERSION}/examples/c_demo
 
 ## Support
 
 - Issues: https://github.com/${REPOSITORY}/issues
 - Email: cfc4n.cs@gmail.com
 EOF
-#
-## Copy examples
-echo -e "${GREEN}Step 7: Adding example code...${NC}"
-#mkdir -p "${RELEASE_PATH}/docs/examples"
-#cp -r examples/c_demo/*.c "${RELEASE_PATH}/docs/examples/" 2>/dev/null || true
-#cp -r examples/c_demo/README.md "${RELEASE_PATH}/docs/examples/" 2>/dev/null || true
-
 # Create checksum file
-echo -e "${GREEN}Step 8: Generating checksums...${NC}"
+echo -e "${GREEN}Step 7: Generating checksums...${NC}"
 cd "${RELEASE_PATH}"
 find . -type f ! -name "SHA256SUMS" -exec sha256sum {} \; > SHA256SUMS
 cd - > /dev/null
 
 # Create tarball
-echo -e "${GREEN}Step 9: Creating archive...${NC}"
+echo -e "${GREEN}Step 8: Creating archive...${NC}"
 cd "${RELEASE_DIR}"
 tar -czf "${RELEASE_NAME}.tar.gz" "${RELEASE_NAME}"
 cd - > /dev/null
 
 # Create checksum for tarball
-echo -e "${GREEN}Step 10: Generating tarball checksum...${NC}"
+echo -e "${GREEN}Step 9: Generating tarball checksum...${NC}"
 cd "${RELEASE_DIR}"
 sha256sum "${RELEASE_NAME}.tar.gz" > "${RELEASE_NAME}.tar.gz.sha256"
 cd - > /dev/null
@@ -241,9 +253,9 @@ echo -e "${YELLOW}SHA256:${NC}"
 cat "${RELEASE_DIR}/${RELEASE_NAME}.tar.gz.sha256"
 echo ""
 echo -e "${GREEN}Next steps:${NC}"
-echo "1. Test the release:"
-echo "   cd ${RELEASE_PATH}"
-echo "   gcc -o test docs/examples/offline_decryption.c -I./include -L./lib -lecapture_decryptor"
+echo "1. Test with the C examples from the matching source version:"
+echo "   https://github.com/${REPOSITORY}/tree/${VERSION}/examples/c_demo"
+echo "   See ${RELEASE_PATH}/README.md for static/shared linking commands."
 echo ""
 echo "2. Create GitHub release:"
 echo "   gh release create ${VERSION} ${RELEASE_DIR}/${RELEASE_NAME}.tar.gz"

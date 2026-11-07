@@ -1,6 +1,6 @@
 # Release Guide - 发布指南
 
-本文档说明如何发布不同版本的动态、静态链接库。
+本文档说明如何发布不同版本的动态、静态链接库。以下版本号为示例，命令从仓库根目录执行；构建需要 Go 1.26.0 或兼容的更新版本及 C 编译器。
 
 ## 📦 发布流程 Release Process
 
@@ -8,11 +8,11 @@
 
 #### 更新版本号 Update Version
 
-在 `capi/main.go` 中更新版本号：
+使用 `./scripts/version.sh set v2.1.0` 更新 `capi/main.go` 中的版本号，并填写生成的 CHANGELOG 条目。`GetVersion()` 的字符串前缀为：
 
 ```go
 func GetVersion() *C.char {
-    return C.CString("ecapture_decryptor v2.1.0 - Copyright (c) 2024-2026 CFC4N - Non-Commercial License")
+    return C.CString("eCapture Decryptor v2.1.0 - Copyright (c) 2024-2026 CFC4N - Non-Commercial License")
 }
 ```
 
@@ -60,27 +60,32 @@ func GetVersion() *C.char {
 ./scripts/build-multiplatform.sh v2.1.0
 ```
 
-支持的平台：
-- `darwin-amd64` - macOS Intel
-- `darwin-arm64` - macOS Apple Silicon
-- `linux-amd64` - Linux x86_64
-- `linux-arm64` - Linux ARM64
+脚本先构建当前主机平台，再使用 Go 1.26 Docker 镜像分别构建 `linux/amd64` 和 `linux/arm64`。Docker 必须能够运行对应架构的容器（原生运行或已配置模拟）；它不会交叉构建另一种 macOS 架构。没有 Docker 时只构建本机平台。
+
+GitHub Release 工作流当前构建 `linux-amd64`、`linux-arm64` 和 `darwin-arm64`，不包含 `darwin-amd64`。直接设置 `GOOS`/`GOARCH` 做 CGO 交叉编译时，还需匹配的目标 C 工具链；仅设置这两个变量不够。
 
 ### 3. 测试发布 Test Release
 
 ```bash
-# 解压测试
+# 在 macOS ARM64 上测试本机发布包；示例源码来自同版本仓库
 cd dist/ecapture_decryptor-v2.1.0-darwin-arm64
-gcc -o test docs/examples/offline_decryption.c -I./include -L./lib -lecapture_decryptor
+cc -o test ../../examples/c_demo/offline_decryption.c \
+  -I./include ./lib/libecapture_decryptor.a -lpthread \
+  -framework CoreFoundation -framework Security
 
 # 运行测试
 ./test path/to/test.pcap path/to/keylog.log output.json
 
 # 验证输出
 cat output.json
+cd ../..
 ```
 
+Linux 上将两个 `-framework` 参数替换为 `-lresolv`。测试程序必须在与发布包兼容的平台和架构上运行；标准发布包不含示例源码。
+
 ### 4. 创建 GitHub Release
+
+推送 `v*.*.*` 标签会触发 `.github/workflows/release.yml`，自动构建并创建 Release。以下 CLI 和网页操作用于手动发布，不要对工作流已创建的同一版本重复执行 `gh release create`。
 
 #### 使用 GitHub CLI
 
@@ -89,13 +94,15 @@ cat output.json
 gh release create v2.1.0 \
   --title "ecapture_decryptor v2.1.0" \
   --notes "Release notes here" \
-  dist/ecapture_decryptor-v2.1.0-*.tar.gz
+  dist/ecapture_decryptor-v2.1.0-*.tar.gz \
+  dist/ecapture_decryptor-v2.1.0-*.tar.gz.sha256
 
 # 或使用 notes 文件
 gh release create v2.1.0 \
   --title "ecapture_decryptor v2.1.0" \
   --notes-file RELEASE_NOTES.md \
-  dist/ecapture_decryptor-v2.1.0-*.tar.gz
+  dist/ecapture_decryptor-v2.1.0-*.tar.gz \
+  dist/ecapture_decryptor-v2.1.0-*.tar.gz.sha256
 ```
 
 #### 手动上传
@@ -122,13 +129,13 @@ gh release create v2.1.0 \
 
 ### 发布前 Pre-Release
 
-- [ ] 代码已合并到 main 分支
-- [ ] 所有测试通过 (`make test`)
+- [ ] 代码已合并到 master 分支
+- [ ] 所有测试通过 (`CGO_ENABLED=1 go test -race ./...`)
 - [ ] 更新版本号在 `capi/main.go`
 - [ ] 更新 `CHANGELOG.md`
 - [ ] 更新 `README.md` 中的版本信息
 - [ ] 检查许可证文件是否最新
-- [ ] 代码格式化 (`make fmt`)
+- [ ] 改动的 Go 文件通过 gofmt 和 goimports 检查
 - [ ] 静态检查通过 (`make lint`)
 
 ### 构建 Build
@@ -199,6 +206,10 @@ v2.1.0-beta.1    # Beta 版本
 v2.1.0-rc.1      # Release Candidate
 ```
 
+`version.sh set` 接受有或没有 `v` 前缀的 `X.Y.Z`，以及预发布后缀或构建元数据（如 `2.1.0-rc.1+build.2`）。`bump` 只处理无后缀的正式版本；从预发布版本转为正式版时，用 `set` 明确指定目标版本。
+
+Release 工作流当前固定 `prerelease: false`，不会按标签后缀自动标记预发布。工作流完成后需在 GitHub 上修改，或运行 `gh release edit v2.1.0-beta.1 --prerelease`。
+
 ---
 
 ## 📚 发布包内容 Release Package Contents
@@ -212,17 +223,14 @@ ecapture_decryptor-v2.1.0-darwin-arm64/
 │   └── libecapture_decryptor.dylib    # 动态库
 ├── include/
 │   └── libecapture_decryptor.h        # C 头文件
-├── docs/
-│   └── examples/                      # 示例代码
-│       ├── offline_decryption.c
-│       ├── stream_decryption.c
-│       └── README.md
 ├── LICENSE                            # 主许可证
 ├── LICENSE-BINARY                     # 二进制库许可证
 ├── COPYRIGHT                          # 版权声明
 ├── README.md                          # 使用说明
 └── SHA256SUMS                         # 文件校验和
 ```
+
+Linux 包中的动态库名为 `libecapture_decryptor.so`。标准包没有 `docs/` 或 `examples/`；C 示例位于同版本源码的 `examples/c_demo/`。
 
 ---
 
@@ -249,6 +257,8 @@ cd ecapture_decryptor-v2.1.0-darwin-arm64
 sha256sum -c SHA256SUMS
 ```
 
+macOS 可将 `sha256sum` 替换为 `shasum -a 256`。
+
 ---
 
 ## 🌐 不同平台的特殊说明
@@ -270,18 +280,11 @@ codesign -s "Developer ID" lib/libecapture_decryptor.dylib
 - pthread
 - resolv
 
-**SONAME 版本**:
-```bash
-# 创建版本化的共享库
-ln -s libecapture_decryptor.so.2.1.0 libecapture_decryptor.so.2
-ln -s libecapture_decryptor.so.2 libecapture_decryptor.so
-```
+当前脚本生成未带版本后缀的 `libecapture_decryptor.so`，不生成版本化 SONAME 或对应符号链接。
 
 ### Windows (如需支持)
 
-**构建要求**:
-- MinGW-w64 或 Visual Studio
-- 生成 .dll 和 .lib 文件
+当前发布脚本和 Release 工作流不包含 Windows 构建；不能将 Linux/macOS 的验证结果视为 Windows 支持。
 
 ---
 
@@ -304,6 +307,8 @@ gh api repos/gojue/ecapture_decryptor/releases/latest
 ---
 
 ## 🆘 故障排除 Troubleshooting
+
+发布脚本的隔离回归可用 `python3 scripts/test_release.py` 运行：它在临时副本中模拟构建和 Docker 调用，不执行实际发布；CI 在 Ubuntu/macOS 上运行同一检查。
 
 ### 构建失败
 
@@ -339,6 +344,7 @@ gh release upload v1.1.0 dist/ecapture_decryptor-v1.1.0-darwin-arm64.tar.gz --cl
 
 ---
 
-**最后更新**: January 5, 2026  
+**最后更新**: November 7, 2026
+
 **维护者**: CFC4N
 

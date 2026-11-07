@@ -4,13 +4,18 @@
 
 set -e
 
-VERSION="$1"
-if [ -z "$VERSION" ]; then
+if [ -z "$1" ]; then
     echo "Error: Version required"
     echo "Usage: $0 <version>"
     echo "Example: $0 v2.0.0"
     exit 1
 fi
+
+source "$(dirname "$0")/version.sh"
+VERSION_NUMBER="${1#v}"
+validate_version "$VERSION_NUMBER"
+get_current_version > /dev/null
+VERSION="v${VERSION_NUMBER}"
 
 echo "Building multi-platform releases for version: $VERSION"
 echo ""
@@ -23,10 +28,11 @@ echo ""
 # Build for Linux AMD64 using Docker
 echo "=== Building for Linux AMD64 (Docker) ==="
 if command -v docker &> /dev/null; then
-    docker run --rm -v "$PWD:/workspace" -w /workspace golang:1.21 bash -c "
-        apt-get update && apt-get install -y build-essential
-        ./scripts/release.sh $VERSION
-    "
+    docker run --rm --platform linux/amd64 -v "$PWD:/workspace" -w /workspace golang:1.26 bash -ec '
+        apt-get update
+        apt-get install -y build-essential
+        ./scripts/release.sh "$1"
+    ' bash "$VERSION"
 else
     echo "Docker not available, skipping Linux AMD64 build"
 fi
@@ -35,10 +41,11 @@ echo ""
 # Build for Linux ARM64 using Docker
 echo "=== Building for Linux ARM64 (Docker) ==="
 if command -v docker &> /dev/null; then
-    docker run --rm --platform linux/arm64 -v "$PWD:/workspace" -w /workspace golang:1.21 bash -c "
-        apt-get update && apt-get install -y build-essential
-        ./scripts/release.sh $VERSION
-    "
+    docker run --rm --platform linux/arm64 -v "$PWD:/workspace" -w /workspace golang:1.26 bash -ec '
+        apt-get update
+        apt-get install -y build-essential
+        ./scripts/release.sh "$1"
+    ' bash "$VERSION"
 else
     echo "Docker not available, skipping Linux ARM64 build"
 fi
