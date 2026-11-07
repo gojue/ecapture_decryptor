@@ -27,6 +27,7 @@ type quicRoute struct {
 	zero          [2]bool
 	aliases       []quicTuple
 	initialSource string
+	initialDCID   string
 }
 type quicBinding struct {
 	route   *quicRoute
@@ -135,6 +136,17 @@ func (e *DecryptorEngine) matchQUICLocked(key types.ConnectionKey, data []byte, 
 					matches[binding] = true
 				}
 			}
+			if len(matches) == 0 && len(h.SCID) == 0 {
+				// A zero SCID cannot link a client's later Initial to a CID in
+				// an unread server flight. On its original tuple, authenticate
+				// against the original Initial keys before selecting a route.
+				for _, route := range e.quic.routes {
+					if route.zero[0] && key.String() == route.aliases[0].forward &&
+						transport.IsQUICClientInitial(data, []byte(route.initialDCID)) {
+						matches[quicBinding{route: route}] = true
+					}
+				}
+			}
 		}
 	} else {
 		for size := 1; size <= 20 && size < len(data); size++ {
@@ -234,7 +246,21 @@ func (e *DecryptorEngine) handleQUICPacket(key types.ConnectionKey, data []byte,
 		e.quicRouteFailure(key, "ambiguous_connection_id")
 		return
 	}
-	if !found && h.Long && h.Type == transport.QUICPacketTypeInitial {
+	newInitial := !found && h.Long && h.Type == transport.QUICPacketTypeInitial
+	if newInitial && len(h.SCID) == 0 {
+		for _, route := range e.quic.routes {
+			if route.zero[0] && key.String() == route.aliases[0].forward {
+				// A client Initial can already use a CID announced in a server
+				// flight that the worker has not authenticated yet. An empty SCID
+				// cannot link it back to that connection. Only create a new route
+				// if its own DCID authenticates it; otherwise use the bounded
+				// pending queue until the worker publishes the peer CID.
+				newInitial = transport.IsQUICClientInitial(data, h.DCID)
+				break
+			}
+		}
+	}
+	if newInitial {
 		if e.active >= e.factory.options.ConnectionLimit() {
 			e.mu.Unlock()
 			if !e.limitReported {
@@ -252,7 +278,7 @@ func (e *DecryptorEngine) handleQUICPacket(key types.ConnectionKey, data []byte,
 		}
 		original := key
 		original.Generation = 0
-		route := &quicRoute{key: key.String(), decryptor: dec, initialSource: string(h.SCID), aliases: []quicTuple{{original.String(), original.Reverse().String()}}}
+		route := &quicRoute{key: key.String(), decryptor: dec, initialSource: string(h.SCID), initialDCID: string(h.DCID), aliases: []quicTuple{{original.String(), original.Reverse().String()}}}
 		route.cids = [2]map[string]bool{make(map[string]bool), make(map[string]bool)}
 		e.mu.Lock()
 		e.quic.routes[route.key] = route

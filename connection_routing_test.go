@@ -2,6 +2,8 @@ package ecapture_decryptor
 
 import (
 	"bytes"
+	"encoding/hex"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -268,7 +270,13 @@ func TestQUICZeroCIDDoesNotGuessMigrationOrAmbiguousTuple(t *testing.T) {
 			t.Fatal("zero CID migration guessed a connection")
 		}
 		// Another same-tuple connection makes the zero-CID direction ambiguous.
-		e.handleQUICPacket(key, []byte{0xc0, 0, 0, 0, 1, 1, 9, 0}, time.Time{})
+		// A distinct connection must authenticate with its own Initial DCID;
+		// an unknown peer CID alone is not evidence of a new connection.
+		initial, err := hex.DecodeString(quicZeroCIDInitialVectors[0].fresh)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.handleQUICPacket(key, initial, time.Time{})
 		if len(*created) != 2 {
 			t.Fatal("distinct Initial did not create a second route")
 		}
@@ -276,9 +284,142 @@ func TestQUICZeroCIDDoesNotGuessMigrationOrAmbiguousTuple(t *testing.T) {
 		if len(first.server) != 1 || len((*created)[1].server) != 0 {
 			t.Fatal("zero CID ambiguous tuple guessed a connection")
 		}
+		e.handleQUICPacket(key.Reverse(), []byte{0xc0, 0, 0, 0, 1, 0, 4, 1, 2, 3, 4}, time.Time{})
+		if len(first.server) != 1 || len((*created)[1].server) != 0 {
+			t.Fatal("zero CID ambiguous server Initial guessed a connection")
+		}
 		e.expireQUICPending(time.Now().Add(time.Minute), false)
 		if len(e.quic.pending) != 0 {
 			t.Fatal("unknown-CID waiting deadline not bounded")
+		}
+	})
+}
+
+// Protected Initials with SCID length zero, PN 1 and 24 PADDING bytes. The
+// second packet uses DCID "rotated!" but retains the keys for "original", as
+// required when a client adopts a server CID without Retry. These are packet
+// protection vectors, not captures or complete handshakes.
+var quicZeroCIDInitialVectors = []struct{ name, fresh, changed string }{
+	{"v1", "c200000001086f726967696e616c000040299c3c8a8bc9c9efb108a2446dce3b5e2eaf7337f02499c94e5b35e11950babf2bce7c6536bf5725d3f9", "c20000000108726f746174656421000040299c3c8a8bc9c9efb108a2446dce3b5e2eaf7337f02499c94e5b4112cbf83757e640051e3e04f6f51bd0"},
+	{"v2", "db6b3343cf086f726967696e616c0000402976901cf347a45fda20c6b4ea254dd0bb4e60493c643ec0a6df5ba9bdeb188d595029182d6d0afcdab9", "db6b3343cf08726f7461746564210000402976901cf347a45fda20c6b4ea254dd0bb4e60493c643ec0a6dfb3818559e38d92b54a1d3103ce4a34e4"},
+}
+
+func TestQUICZeroCIDInitialBeforePeerCIDPublication(t *testing.T) {
+	for _, vector := range quicZeroCIDInitialVectors {
+		for _, publishFirst := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/publish_first=%t", vector.name, publishFirst), func(t *testing.T) {
+				withRoutingDecryptor(t, types.TransportProtocolUDP, func(e *DecryptorEngine, created *[]*routingDecryptor) {
+					fresh, err := hex.DecodeString(vector.fresh)
+					if err != nil {
+						t.Fatal(err)
+					}
+					changed, err := hex.DecodeString(vector.changed)
+					if err != nil {
+						t.Fatal(err)
+					}
+					key := types.ConnectionKey{SrcIP: net.IPv4(127, 0, 0, 1), DstIP: net.IPv4(127, 0, 0, 1), SrcPort: 41000, DstPort: 443, Proto: "udp"}
+					e.handleQUICPacket(key, fresh, time.Time{})
+					e.handleQUICPacket(key, fresh, time.Time{})
+					first := (*created)[0]
+					route := e.quic.routes[first.addr.String()]
+					if publishFirst {
+						if _, err := e.quicCIDUpdate(route, []byte("rotated!"), false, false); err != nil {
+							t.Fatal(err)
+						}
+					}
+					// No worker scheduling or sleeps: publish explicitly before or
+					// after the reader has delivered both copies of the Initial.
+					e.handleQUICPacket(key, changed, time.Unix(7, 0))
+					e.handleQUICPacket(key, changed, time.Unix(8, 0))
+					response := append([]byte{0x40}, bytes.Repeat([]byte{0xff}, 24)...)
+					e.handleQUICPacket(key.Reverse(), response, time.Time{})
+					if len(*created) != 1 || len(first.server) != 1 {
+						t.Fatal("peer CID publication race created a second route or lost direction")
+					}
+					if len(first.client) != 4 || !bytes.Equal(first.client[2], changed) || !bytes.Equal(first.client[3], changed) {
+						t.Fatal("authenticated Initial lost bytes or direction")
+					}
+					ready, err := e.quicCIDUpdate(route, []byte("rotated!"), false, false)
+					if err != nil || len(ready) != 0 {
+						t.Fatal("CID publication repeated an already delivered Initial")
+					}
+					if e.quic.bytes != 0 || len(e.quic.pending) != 0 {
+						t.Fatal("pending Initial storage was not released")
+					}
+					// An unrecognized, damaged Initial must neither create a
+					// second zero-CID route nor be selected by tuple alone.
+					bad := bytes.Clone(changed)
+					copy(bad[6:14], "unknown!")
+					e.handleQUICPacket(key, bad, time.Time{})
+					if len(*created) != 1 || len(first.client) != 4 || len(e.quic.pending) != 1 {
+						t.Fatal("unauthenticated Initial bypassed bounded CID waiting")
+					}
+					e.expireQUICPending(time.Now().Add(time.Minute), false)
+					if len(e.quic.pending) != 0 || e.quic.bytes != 0 || e.connectionError() == nil {
+						t.Fatal("unknown Initial did not expire with an error")
+					}
+				})
+			})
+		}
+	}
+}
+
+func TestQUICZeroCIDTupleIsolationAndCleanup(t *testing.T) {
+	withRoutingDecryptor(t, types.TransportProtocolUDP, func(e *DecryptorEngine, created *[]*routingDecryptor) {
+		// Header-only packets exercise the router with the existing fake worker.
+		// Two zero-SCID tuples and an eight-byte SCID control carry distinct bytes.
+		initial := func(dcid, scid string) []byte {
+			p := append([]byte{0xc0, 0, 0, 0, 1, byte(len(dcid))}, dcid...)
+			return append(append(p, byte(len(scid))), scid...)
+		}
+		keys := make([]types.ConnectionKey, 3)
+		for i := range keys {
+			keys[i] = types.ConnectionKey{SrcIP: net.IPv4(127, 0, 0, 1), DstIP: net.IPv4(127, 0, 0, 1), SrcPort: uint16(41000 + i), DstPort: 443, Proto: "udp"}
+			scid := ""
+			if i == 2 {
+				scid = "client-8"
+			}
+			e.handleQUICPacket(keys[i], initial(fmt.Sprintf("dest-%03d", i), scid), time.Time{})
+		}
+		if len(*created) != 3 {
+			t.Fatal("distinct original tuples did not create isolated connections")
+		}
+		for i, key := range keys {
+			scid := ""
+			if i == 2 {
+				scid = "client-8"
+				// The nonzero SCID can link a changed Initial before peer CID
+				// publication, without relying on the original tuple fallback.
+				e.handleQUICPacket(key, initial("unseen-8", scid), time.Time{})
+			}
+			p := initial("", fmt.Sprintf("peer-%03d", i))
+			if i == 2 {
+				p = initial(scid, fmt.Sprintf("peer-%03d", i))
+			}
+			e.handleQUICPacket(key.Reverse(), p, time.Time{})
+			d := (*created)[i]
+			if len(d.server) != 1 || !bytes.Equal(d.server[0], p) {
+				t.Fatal("response bytes crossed tuple or direction")
+			}
+			want := 1
+			if i == 2 {
+				want = 2
+			}
+			if len(d.client) != want {
+				t.Fatal("mixed CID control lost client Initial")
+			}
+		}
+		e.expireIdleConnections(time.Now().Add(time.Hour), time.Second)
+		e.connections.Wait()
+		e.mu.Lock()
+		clean := e.active == 0 && len(e.conntrack) == 0 && len(e.quic.routes) == 0 && len(e.quic.cids) == 0 && len(e.quic.pending) == 0 && e.quic.bytes == 0
+		e.mu.Unlock()
+		if !clean {
+			t.Fatal("zero-CID idle cleanup retained routes or connection quota")
+		}
+		e.handleQUICPacket(keys[0], initial("dest-000", ""), time.Time{})
+		if len(*created) != 4 || (*created)[3].addr.Generation == (*created)[0].addr.Generation {
+			t.Fatal("reused tuple did not get a fresh generation after cleanup")
 		}
 	})
 }
