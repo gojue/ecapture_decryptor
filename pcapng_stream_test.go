@@ -3,6 +3,7 @@ package ecapture_decryptor
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -445,9 +446,11 @@ func TestCaptureProcessFileAndStream(t *testing.T) {
 						ci.CaptureLength = len(raw)
 						ci.Length = len(raw)
 					}
-					if err := writer.WritePacket(ci, raw); err != nil {
-						t.Fatal(err)
+					var args *types.ProcessArgs
+					if annotate && !legacy {
+						args = captureTestArgs(name)
 					}
+					writeCaptureArgsPacket(t, writer, &encoded, ci, raw, args)
 				}
 				keys, err := os.ReadFile("test/testdata/" + fixture.name + "_tcpdump.keys")
 				if err != nil {
@@ -490,6 +493,13 @@ func TestCaptureProcessFileAndStream(t *testing.T) {
 						if p.PID != want || p.PName != name {
 							t.Fatalf("stream=%v direction=%s pid=%d name=%q want=%d/%s", stream, p.Direction, p.PID, p.PName, want, name)
 						}
+						if legacy {
+							if p.ProcessArgs != nil {
+								t.Fatal("invented legacy argv")
+							}
+						} else if wantArgs := captureTestArgs(name); p.ProcessArgs == nil || !bytes.Equal(p.ProcessArgs.Data, wantArgs.Data) || p.ProcessArgs.Truncated != wantArgs.Truncated {
+							t.Fatal("argv crossed endpoints or lost bytes/truncation")
+						}
 						ids[p.ConnectionID()] = true
 						directions[p.Direction]++
 					}
@@ -498,6 +508,105 @@ func TestCaptureProcessFileAndStream(t *testing.T) {
 					}
 				}
 			})
+		}
+	}
+}
+
+func captureTestArgs(name string) *types.ProcessArgs {
+	if name == "server" {
+		return &types.ProcessArgs{Data: bytes.Repeat([]byte("s"), 256), Truncated: true}
+	}
+	return &types.ProcessArgs{Data: []byte("client\x00two words\x00\x00参数\x00\xff\x00")}
+}
+
+func writeCaptureArgsPacket(t *testing.T, writer *pcapgo.NgWriter, out *bytes.Buffer, ci gopacket.CaptureInfo, data []byte, args *types.ProcessArgs) {
+	t.Helper()
+	if err := writer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	start := out.Len()
+	if err := writer.WritePacket(ci, data); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if args == nil {
+		return
+	}
+	flag := 0
+	if args.Truncated {
+		flag = 1
+	}
+	comment := fmt.Sprintf("eCapture argv v1 %d ", flag) + base64.StdEncoding.EncodeToString(args.Data)
+	out.Truncate(out.Len() - 4)
+	options := binary.LittleEndian.AppendUint16(nil, 1)
+	options = binary.LittleEndian.AppendUint16(options, uint16(len(comment)))
+	options = append(options, comment...)
+	options = append(options, make([]byte, (-len(comment))&3)...)
+	options = append(options, 0, 0, 0, 0)
+	_, _ = out.Write(options)
+	length := uint32(out.Len() - start + 4)
+	binary.LittleEndian.PutUint32(out.Bytes()[start+4:], length)
+	_, _ = out.Write(binary.LittleEndian.AppendUint32(nil, length))
+}
+
+func TestProcessArgsOptionsValidation(t *testing.T) {
+	full := "eCapture argv v1 0 " + base64.StdEncoding.EncodeToString([]byte("tool\x00\x00"))
+	truncated := "eCapture argv v1 1 " + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("x"), 256))
+	for _, order := range []binary.ByteOrder{binary.LittleEndian, binary.BigEndian} {
+		makeBlock := func(comments ...string) []byte {
+			block := make([]byte, 32) // 28-byte header and a 1-byte padded packet
+			order.PutUint32(block, 6)
+			order.PutUint32(block[20:], 1)
+			for _, c := range comments {
+				block = order.(binary.AppendByteOrder).AppendUint16(block, 1)
+				block = order.(binary.AppendByteOrder).AppendUint16(block, uint16(len(c)))
+				block = append(block, c...)
+				block = append(block, make([]byte, (-len(c))&3)...)
+			}
+			block = append(block, make([]byte, 8)...)
+			order.PutUint32(block[4:], uint32(len(block)))
+			order.PutUint32(block[len(block)-4:], uint32(len(block)))
+			return block
+		}
+		for _, test := range []struct {
+			name      string
+			comments  []string
+			want      bool
+			truncated bool
+		}{
+			{"complete", []string{"unrelated comment", full}, true, false},
+			{"truncated", []string{truncated}, true, true},
+			{"absent", nil, false, false},
+			{"duplicate", []string{full, full}, false, false},
+			{"bad flag", []string{"eCapture argv v1 2 dG9vbAA="}, false, false},
+			{"unterminated", []string{"eCapture argv v1 0 dG9vbA=="}, false, false},
+			{"short truncated", []string{"eCapture argv v1 1 dG9vbA=="}, false, false},
+			{"oversized", []string{"eCapture argv v1 1 " + base64.StdEncoding.EncodeToString(make([]byte, 257))}, false, false},
+			{"bad base64", []string{"eCapture argv v1 0 ????"}, false, false},
+		} {
+			t.Run(fmt.Sprint(order)+"/"+test.name, func(t *testing.T) {
+				got := pcapngProcessArgs(makeBlock(test.comments...), order)
+				if (got != nil) != test.want || got != nil && got.Truncated != test.truncated {
+					t.Fatal("unexpected argv acceptance")
+				}
+			})
+		}
+		block := makeBlock(full)
+		order.PutUint32(block[20:], ^uint32(0))
+		if pcapngProcessArgs(block, order) != nil {
+			t.Fatal("accepted overflowing packet length")
+		}
+		block = makeBlock(full)
+		order.PutUint16(block[34:], 65535)
+		if pcapngProcessArgs(block, order) != nil {
+			t.Fatal("accepted overflowing option length")
+		}
+		for n := 0; n < 32; n++ {
+			if pcapngProcessArgs(block[:n], order) != nil {
+				t.Fatal("accepted short EPB")
+			}
 		}
 	}
 }

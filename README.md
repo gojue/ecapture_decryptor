@@ -37,6 +37,8 @@ eCapture Decryptor decrypts TLS and QUIC traffic captured in pcapng files. TLS s
 
 The SDK only decrypts and parses protocols — it does not impose an output format. Results are delivered as `DecryptedPacket` values that callers can process however they like (JSON, HAR, streaming, etc.).
 
+Capture-side process metadata can include PID, name, and up to 256 argv bytes with an explicit truncation flag; see the [metadata contract](docs/API.md#pid--pname-归属).
+
 # Features
 
 - 🔓 **Decrypt TLS/QUIC traffic**: supports external SSLKEYLOG files and pcapng-embedded DSB

@@ -435,6 +435,9 @@ type DecryptedPacket struct {
     
     // 进程名称
     PName string `json:"PName"`
+
+    // 采集时 argv；nil 表示未知，Data 为保留 NUL 分隔的原始字节
+    ProcessArgs *ProcessArgs `json:"processArgs,omitempty"`
     
     // 数据长度
     DataLength uint32 `json:"dataLength"`
@@ -461,6 +464,16 @@ uint8 Comm 长度及最多 16 字节 Comm，可带四字节全零 FCS 占位。
 的状态与旧代次隔离，保持双向关联和多连接路由。`ConnectionKey.Process`
 只承载这一并发安全状态，不参与 JSON 序列化。该机制不能恢复采集端
 漏掉的归属，也不保证共享 socket、多网络命名空间碰撞或不完整握手的归属。
+
+`ProcessArgs` 含 `Data []byte` 和 `Truncated bool`（JSON 字段 `data`、
+`truncated`）。文件及增量 API 读取同一包的标准 EPB comment：
+`eCapture argv v1 <0|1> <base64>`。这是 argv 的独立扩展，PID/Comm 仍来自
+上述包尾格式。`Data` 最多 256 字节，保留空参数、NUL 边界和非 UTF-8
+字节，JSON 中为 base64；`Truncated=true` 时只含前 256 字节，末尾可能
+处于某个参数中间。完整快照以 NUL 结束。缺失、重复或损坏的注释保持
+argv 未知，不影响 PID/Comm 和解密。归属选择、迟到更新和连接代次隔离
+沿用 PID/Comm 的规则；回调持有独立副本。它是发送时读取的 argv 快照，
+不是不可变的最初 exec 参数；进程改写 argv 会影响后续快照。
 
 #### 方法
 

@@ -37,6 +37,8 @@ eCapture Decryptor 解密 pcapng 文件中捕获的 TLS 与 QUIC 流量。TLS �
 
 SDK 只负责解密与协议解析，不强制输出格式。结果以 `DecryptedPacket` 结构输出，由调用方自由处理（JSON、HAR、流式输出等）。
 
+采集端进程元信息可包含 PID、名称及最多 256 字节的 argv 和截断标记，详见[元信息契约](docs/API.md#pid--pname-归属)。
+
 # 特性
 
 - 🔓 **解密 TLS/QUIC 流量**：支持外部 SSLKEYLOG 文件和 pcapng 内嵌 DSB
