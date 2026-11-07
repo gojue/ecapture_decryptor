@@ -7,6 +7,7 @@ import (
 	"crypto/hpke"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/sha512"
 	"errors"
 	"testing"
 )
@@ -157,7 +158,31 @@ func TestHelloRetryResumptionAndExtensionBounds(t *testing.T) {
 // The ciphertext producer is Go's independent RFC 9180 implementation. Only
 // the KEM shared_secret is derived here to model RFC 9850's logged material.
 func makeECHTest(t *testing.T) (*ClientHelloInfo, []byte, *TLSSecrets, []byte) {
+	first, _, _, final, secrets, random := makeECHFlight(t, false)
+	return first, final, secrets, random
+}
+
+func makeECHFlight(t *testing.T, retry bool, change ...string) (*ClientHelloInfo, *ClientHelloInfo, []byte, []byte, *TLSSecrets, []byte) {
 	t.Helper()
+	suite, newHash := byte(1), sha256.New
+	if len(change) > 0 {
+		if change[0] == "aes256" {
+			suite, newHash = 2, sha512.New384
+		}
+		if change[0] == "chacha" {
+			suite = 3
+		}
+	}
+	clientHello := func(random, session, extensions []byte) []byte {
+		message := helloTestClient(random, session, extensions)
+		message[42+len(session)] = suite
+		return message
+	}
+	serverHello := func(random, extensions []byte) []byte {
+		message := helloTestServer(random, extensions)
+		message[40] = suite
+		return message
+	}
 	sk, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -180,14 +205,14 @@ func makeECHTest(t *testing.T) (*ClientHelloInfo, []byte, *TLSSecrets, []byte) {
 	outerRandom := bytes.Repeat([]byte{0x32}, 32)
 	session := []byte{9, 8, 7}
 	innerExt := append(helloTestExtension(0xfe0d, []byte{1}), helloTestExtension(43, []byte{2, 3, 4})...)
-	encoded := append(helloTestClient(innerRandom, nil, innerExt)[4:], make([]byte, 17)...)
-	inner := helloTestClient(innerRandom, session, innerExt)
+	encoded := append(clientHello(innerRandom, nil, innerExt)[4:], make([]byte, 17)...)
+	inner := clientHello(innerRandom, session, innerExt)
 	ech := []byte{0, 0, 1, 0, 1, 7, 0, 32}
 	ech = append(ech, enc...)
 	n := len(encoded) + 16
 	ech = append(ech, byte(n>>8), byte(n))
 	ech = append(ech, make([]byte, n)...)
-	outerWire := helloTestClient(outerRandom, session, append(helloTestExtension(43, []byte{2, 3, 4}), helloTestExtension(0xfe0d, ech)...))
+	outerWire := clientHello(outerRandom, session, append(helloTestExtension(43, []byte{2, 3, 4}), helloTestExtension(0xfe0d, ech)...))
 	ciphertext, err := sender.Seal(outerWire[4:], encoded)
 	if err != nil {
 		t.Fatal(err)
@@ -222,23 +247,146 @@ func makeECHTest(t *testing.T) (*ClientHelloInfo, []byte, *TLSSecrets, []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sh := helloTestServer(bytes.Repeat([]byte{0x43}, 32), helloTestExtension(43, []byte{3, 4}))
+	acceptSecret, err := stdhkdf.Extract(newHash, innerRandom, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirm := func(label string, transcript []byte) []byte {
+		t.Helper()
+		h := newHash()
+		h.Write(transcript)
+		digest := h.Sum(nil)
+		label = "tls13 " + label
+		acceptInfo := append([]byte{0, 8, byte(len(label))}, label...)
+		acceptInfo = append(acceptInfo, byte(len(digest)))
+		acceptInfo = append(acceptInfo, digest...)
+		accept, err := stdhkdf.Expand(newHash, acceptSecret, string(acceptInfo), 8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return accept
+	}
+	var second *ClientHelloInfo
+	var hrr []byte
+	transcript := bytes.Clone(inner)
+	if retry {
+		h := newHash()
+		h.Write(inner)
+		transcript = append([]byte{254, 0, 0, byte(h.Size())}, h.Sum(nil)...)
+		ext := append(helloTestExtension(43, []byte{3, 4}), helloTestExtension(51, []byte{0, 23})...)
+		ext = append(ext, helloTestExtension(0xfe0d, make([]byte, 8))...)
+		hrr = serverHello(helloRetryRandom, ext)
+		accept := confirm("hrr ech accept confirmation", append(bytes.Clone(transcript), hrr...))
+		copy(hrr[len(hrr)-8:], accept)
+		innerExt2 := append(bytes.Clone(innerExt), helloTestExtension(44, []byte{0, 2, 0xaa, 0xbb})...)
+		random2, session2 := bytes.Clone(innerRandom), bytes.Clone(session)
+		if len(change) > 0 {
+			switch change[0] {
+			case "inner_random":
+				random2[0] ^= 1
+			case "inner_session":
+				session2[0] ^= 1
+			case "inner_early":
+				innerExt2 = append(innerExt2, helloTestExtension(42, nil)...)
+			}
+		}
+		inner2 := clientHello(random2, session2, innerExt2)
+		encoded2 := append(clientHello(random2, nil, innerExt2)[4:], make([]byte, 11)...)
+		n := len(encoded2) + 16
+		ech2 := []byte{0, 0, 1, 0, 1, 7, 0, 0, byte(n >> 8), byte(n)}
+		ech2 = append(ech2, make([]byte, n)...)
+		wire2 := clientHello(outerRandom, session2, append(helloTestExtension(43, []byte{2, 3, 4}), helloTestExtension(0xfe0d, ech2)...))
+		ciphertext, err := sender.Seal(wire2[4:], encoded2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		copy(wire2[len(wire2)-n:], ciphertext)
+		second, err = parseClientHello(wire2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		transcript = append(transcript, hrr...)
+		transcript = append(transcript, inner2...)
+	}
+	sh := serverHello(bytes.Repeat([]byte{0x43}, 32), helloTestExtension(43, []byte{3, 4}))
 	clear(sh[30:38])
-	transcript := sha256.Sum256(append(bytes.Clone(inner), sh...))
-	acceptSecret, err := stdhkdf.Extract(sha256.New, innerRandom, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	label := []byte("tls13 ech accept confirmation")
-	acceptInfo := append([]byte{0, 8, byte(len(label))}, label...)
-	acceptInfo = append(acceptInfo, 32)
-	acceptInfo = append(acceptInfo, transcript[:]...)
-	accept, err := stdhkdf.Expand(sha256.New, acceptSecret, string(acceptInfo), 8)
-	if err != nil {
-		t.Fatal(err)
-	}
+	accept := confirm("ech accept confirmation", append(transcript, sh...))
 	copy(sh[30:38], accept)
-	return outer, sh, &TLSSecrets{ECHSecret: shared, ECHConfig: config}, innerRandom
+	return outer, second, hrr, sh, &TLSSecrets{ECHSecret: shared, ECHConfig: config}, innerRandom
+}
+
+func TestECHHelloRetryTranscriptAndHPKESequence(t *testing.T) {
+	first, second, retry, final, secrets, random := makeECHFlight(t, true)
+	inner1, inner2, status, err := ResolveECHClientHelloRetry(first, second, retry, final, secrets)
+	if err != nil || status != "accepted" || !bytes.Equal(inner1.Random, random) || !bytes.Equal(inner2.Random, random) || bytes.Equal(inner1.Message, inner2.Message) {
+		t.Fatalf("accepted retry: status=%s err=%v", status, err)
+	}
+	for _, suite := range []string{"aes256", "chacha"} {
+		t.Run(suite, func(t *testing.T) {
+			first, second, retry, final, keys, random := makeECHFlight(t, true, suite)
+			_, inner, status, err := ResolveECHClientHelloRetry(first, second, retry, final, keys)
+			if err != nil || status != "accepted" || !bytes.Equal(inner.Random, random) {
+				t.Fatal("TLS suite transcript", status, err)
+			}
+		})
+	}
+	for _, change := range []string{"hrr_confirmation", "final_confirmation", "payload", "outer_aad", "enc", "config", "secret", "missing", "repeat_hrr"} {
+		t.Run(change, func(t *testing.T) {
+			a, b, h, s, keys := *first, *second, bytes.Clone(retry), bytes.Clone(final), *secrets
+			b.Message = bytes.Clone(second.Message)
+			switch change {
+			case "hrr_confirmation":
+				h[len(h)-1] ^= 1
+			case "final_confirmation":
+				s[37] ^= 1
+			case "payload":
+				b.Message[len(b.Message)-1] ^= 1
+			case "outer_aad":
+				b.Message[6] ^= 1
+			case "enc":
+				for _, e := range second.extensions {
+					if e.typ == 0xfe0d {
+						b.Message[e.start+7] = 32
+					}
+				}
+			case "config":
+				for _, e := range second.extensions {
+					if e.typ == 0xfe0d {
+						b.Message[e.start+5] ^= 1
+					}
+				}
+			case "secret":
+				keys.ECHSecret = bytes.Repeat([]byte{3}, 32)
+			case "missing":
+				keys.ECHSecret = nil
+			case "repeat_hrr":
+				s = bytes.Clone(h)
+			}
+			if _, _, _, err := ResolveECHClientHelloRetry(&a, &b, h, s, &keys); err == nil {
+				t.Fatal("altered retry accepted")
+			}
+		})
+	}
+	// Rejection/GREASE copies the first ECH extension instead of sealing CH2.
+	rejected := helloTestServer(helloRetryRandom, helloTestExtension(43, []byte{3, 4}))
+	for _, material := range []*TLSSecrets{nil, secrets} {
+		a, b, status, err := ResolveECHClientHelloRetry(first, first, rejected, final, material)
+		want := "rejected"
+		if material == nil {
+			want = "unknown"
+		}
+		if err != nil || status != want || !bytes.Equal(a.Random, first.Random) || !bytes.Equal(b.Random, first.Random) {
+			t.Fatalf("outer retry: status=%s err=%v", status, err)
+		}
+	}
+	for _, change := range []string{"inner_random", "inner_session", "inner_early"} {
+		t.Run(change, func(t *testing.T) {
+			first, second, retry, final, keys, _ := makeECHFlight(t, true, change)
+			if _, _, _, err := ResolveECHClientHelloRetry(first, second, retry, final, keys); !errors.Is(err, ErrECHInvalid) {
+				t.Fatal("authenticated CH2 changed forbidden state", err)
+			}
+		})
+	}
 }
 func TestECHAuthenticatedRandomAssociation(t *testing.T) {
 	outer, sh, secrets, innerRandom := makeECHTest(t)
@@ -311,6 +459,7 @@ func TestECHOuterExtensionReconstruction(t *testing.T) {
 func FuzzHelloParsing(f *testing.F) {
 	f.Add(helloTestClient(bytes.Repeat([]byte{1}, 32), nil, nil))
 	f.Add(helloTestServer(helloRetryRandom, helloTestExtension(43, []byte{3, 4})))
+	f.Add(append(helloTestRecord(23, []byte{0}), helloTestRecord(22, helloTestClient(bytes.Repeat([]byte{1}, 32), nil, nil))...))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) > maxHandshakeMessage {
 			return
@@ -321,5 +470,9 @@ func FuzzHelloParsing(f *testing.F) {
 		_ = ServerHelloResumed(data)
 		var a HandshakeAssembler
 		_, _ = a.Feed(data)
+		s := NewStreamBuffer()
+		_ = s.Write(data)
+		_ = s.Close()
+		_, _ = ReadClientHelloRetry(s, func([]byte) error { return nil })
 	})
 }

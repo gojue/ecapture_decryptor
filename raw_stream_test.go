@@ -1158,19 +1158,33 @@ func TestD10TLSCaptureAPIs(t *testing.T) {
 		{"ku_aes128", 1, 6}, {"ku_aes256", 1, 6}, {"ku_chacha", 1, 6},
 		{"hrr", 1, 1}, {"early", 4, 1}, {"tls12_resume", 2, 1}, {"grease", 1, 1},
 		{"ech_accepted", 1, 1}, {"ech_rejected", 0, 0},
+		{"hrr_early", 2, 1}, {"ech_hrr_accepted", 1, 1}, {"ech_hrr_rejected", 0, 0},
 	} {
 		keyPath := "test/testdata/d10_openssl.keys"
 		if strings.HasPrefix(tc.mode, "ech_") {
 			keyPath = "test/testdata/d10_ech.keys"
 		}
+		if tc.mode == "hrr_early" {
+			keyPath = "test/testdata/d10_hrr_early.keys"
+		}
+		if strings.HasPrefix(tc.mode, "ech_hrr_") {
+			keyPath = "test/testdata/d10_ech_hrr.keys"
+		}
+		echAccepted := strings.HasPrefix(tc.mode, "ech_") && strings.HasSuffix(tc.mode, "accepted")
+		echRejected := strings.HasPrefix(tc.mode, "ech_") && strings.HasSuffix(tc.mode, "rejected")
 		keys, err := os.ReadFile(keyPath)
 		if err != nil {
 			t.Fatal(err)
 		}
 		path := "test/testdata/d10_" + tc.mode + ".pcapng"
 		for _, output := range []string{"messages", "raw", "events"} {
-			for _, streaming := range []bool{false, true} {
-				t.Run(fmt.Sprintf("%s/%s/stream=%t", tc.mode, output, streaming), func(t *testing.T) {
+			modes := []string{"file", "late_keys"}
+			if tc.mode == "hrr_early" {
+				modes = append(modes, "late_handshake")
+			}
+			for _, mode := range modes {
+				streaming := mode != "file"
+				t.Run(fmt.Sprintf("%s/%s/%s", tc.mode, output, mode), func(t *testing.T) {
 					var mu sync.Mutex
 					var diagnostics []types.Diagnostic
 					options := types.DecryptOptions{RawChunks: output == "raw", HTTPEvents: output == "events", OnDiagnostic: func(d types.Diagnostic) {
@@ -1199,12 +1213,15 @@ func TestD10TLSCaptureAPIs(t *testing.T) {
 							label := string(f[0])
 							if strings.HasSuffix(label, "TRAFFIC_SECRET_0") || label == "CLIENT_RANDOM" {
 								group = 0
-							} else if strings.HasPrefix(label, "ECH_") {
+							} else if strings.HasPrefix(label, "ECH_") || tc.mode == "hrr_early" && label == "CLIENT_EARLY_TRAFFIC_SECRET" {
 								group = 2
 							}
 							groups[group] = append(groups[group], append(bytes.Clone(line), '\n')...)
 						}
-						if tc.mode == "ech_rejected" {
+						if mode == "late_handshake" {
+							groups[1], groups[2] = groups[2], groups[1]
+						}
+						if echRejected {
 							// A definitive rejection requires ECH evidence when selecting
 							// the outer random; absent evidence is only "unknown".
 							groups[0], groups[2] = groups[2], groups[0]
@@ -1219,22 +1236,41 @@ func TestD10TLSCaptureAPIs(t *testing.T) {
 								stream.write(t, tlsFixtureDSB(t, group))
 								synctest.Wait()
 								stream.assertOpen(t)
-								if tc.mode == "ech_accepted" && i < 2 && len(stream.packets) != 0 {
+								if echAccepted && i < 2 && len(stream.packets) != 0 {
 									t.Fatal("ECH traffic emitted before random association was authenticated")
 								}
 							}
 							if tc.connections != 0 && len(stream.packets) == 0 {
 								t.Fatal("TLS output delayed until EOF")
 							}
+							if output != "raw" {
+								complete := 0
+								for _, p := range stream.packets {
+									if output == "messages" || p.Metadata["kind"] == "end" {
+										complete++
+									}
+								}
+								if complete != 2*tc.connections*tc.rounds {
+									t.Fatalf("complete HTTP exchanges delayed until EOF: %d", complete)
+								}
+							}
+							before := len(stream.packets)
 							stream.write(t, tlsFixtureDSB(t, keys))
+							synctest.Wait()
+							if len(stream.packets) != before {
+								t.Fatal("duplicate DSB repeated TLS output")
+							}
 							if err := stream.writer.Close(); err != nil {
 								t.Fatal(err)
 							}
 							synctest.Wait()
 							result, packets = <-stream.done, stream.packets
+							if output != "raw" && len(packets) != before {
+								t.Fatal("HTTP output delayed until EOF")
+							}
 						})
 					}
-					if result != nil && tc.mode != "ech_rejected" {
+					if result != nil && !echRejected {
 						t.Fatal(result)
 					}
 					type exchange struct {
@@ -1245,7 +1281,7 @@ func TestD10TLSCaptureAPIs(t *testing.T) {
 					earlyRaw := map[string][]byte{}
 					for _, p := range packets {
 						if p.Metadata["encryption_level"] == "0rtt" && p.Metadata["early_data"] != "accepted" {
-							if output != "raw" || tc.mode != "early" || p.Metadata["early_data"] != "rejected" || p.Direction != "request" || p.Metadata["offset"] != uint64(len(earlyRaw[p.ConnectionID()])) {
+							if output != "raw" || (tc.mode != "early" && tc.mode != "hrr_early") || p.Metadata["early_data"] != "rejected" || p.Direction != "request" || p.Metadata["offset"] != uint64(len(earlyRaw[p.ConnectionID()])) {
 								t.Fatal("unexpected rejected early output", p.Metadata)
 							}
 							earlyRaw[p.ConnectionID()] = append(earlyRaw[p.ConnectionID()], p.Data...)
@@ -1317,8 +1353,12 @@ func TestD10TLSCaptureAPIs(t *testing.T) {
 							t.Fatalf("missing exact HTTP exchange %d: want request %q response %q; got %+v", connection, wantRequest, wantResponse, got)
 						}
 					}
-					if tc.mode == "early" && output == "raw" {
-						want, _, _ := d10HTTP(tc.mode, 3)
+					if (tc.mode == "early" || tc.mode == "hrr_early") && output == "raw" {
+						index := 3
+						if tc.mode == "hrr_early" {
+							index = 1
+						}
+						want, _, _ := d10HTTP(tc.mode, index)
 						if len(earlyRaw) != 1 {
 							t.Fatal("rejected early bytes missing or duplicated")
 						}
@@ -1331,7 +1371,9 @@ func TestD10TLSCaptureAPIs(t *testing.T) {
 					if strings.HasPrefix(tc.mode, "ech_") {
 						mu.Lock()
 						defer mu.Unlock()
-						if !slices.ContainsFunc(diagnostics, func(d types.Diagnostic) bool { return d.Stage == "handshake" && d.Code == tc.mode }) {
+						if !slices.ContainsFunc(diagnostics, func(d types.Diagnostic) bool {
+							return d.Stage == "handshake" && d.Code == strings.Replace(tc.mode, "ech_hrr_", "ech_", 1)
+						}) {
 							t.Fatal("missing fixed ECH diagnostic", diagnostics)
 						}
 					}
@@ -1342,14 +1384,20 @@ func TestD10TLSCaptureAPIs(t *testing.T) {
 }
 
 func TestD10TLSCaptureInvalidSecrets(t *testing.T) {
-	for _, name := range []string{"wrong_application", "wrong_application_only", "wrong_handshake", "missing_ech", "wrong_ech", "wrong_ech_random", "ech_outer_unconfirmed"} {
+	for _, name := range []string{"wrong_application", "wrong_application_only", "wrong_handshake", "missing_ech", "wrong_ech", "wrong_ech_random", "ech_outer_unconfirmed", "missing_ech_hrr", "wrong_ech_hrr", "wrong_ech_random_hrr", "ech_outer_unconfirmed_hrr"} {
 		t.Run(name, func(t *testing.T) {
+			hrr := strings.HasSuffix(name, "_hrr")
+			name = strings.TrimSuffix(name, "_hrr")
 			mode, keyPath := "ku_aes128", "test/testdata/d10_openssl.keys"
 			if strings.Contains(name, "ech") {
 				mode, keyPath = "ech_accepted", "test/testdata/d10_ech.keys"
 			}
 			if name == "ech_outer_unconfirmed" {
 				mode = "ech_rejected"
+			}
+			if hrr {
+				mode = strings.Replace(mode, "ech_", "ech_hrr_", 1)
+				keyPath = "test/testdata/d10_ech_hrr.keys"
 			}
 			original, err := os.ReadFile(keyPath)
 			if err != nil {

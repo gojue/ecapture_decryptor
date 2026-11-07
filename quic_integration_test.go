@@ -311,6 +311,247 @@ func TestQUICKeyUpdateCaptureAPIs(t *testing.T) {
 	}
 }
 
+func TestQUICStateMatrixCaptureAPIs(t *testing.T) {
+	for _, fixture := range []string{"keyupdate_matrix", "retry_early"} {
+		t.Run(fixture, func(t *testing.T) {
+			base := "test/testdata/http3_" + fixture + "_aioquic"
+			capture, clientKeys, serverKeys := quicDSBBlocks(t, base+".pcapng", base+".keys")
+			keys, err := os.ReadFile(base + ".keys")
+			if err != nil {
+				t.Fatal(err)
+			}
+			withDSB := bytes.Join([][]byte{capture, clientKeys, serverKeys}, nil)
+			var reference map[string]string
+			for _, raw := range []bool{false, true} {
+				var referenceRaw map[string][]byte
+				for _, mode := range []string{"external", "seek_dsb", "nonseek_dsb", "late_client_first", "late_server_first"} {
+					t.Run(fmt.Sprintf("raw=%v/%s", raw, mode), func(t *testing.T) {
+						var output []*types.DecryptedPacket
+						if strings.HasPrefix(mode, "late_") {
+							synctest.Test(t, func(t *testing.T) {
+								stream := newQUICLiveStream(t, raw)
+								stream.write(t, capture)
+								synctest.Wait()
+								if len(stream.packets) != 0 {
+									t.Fatal("output before secrets")
+								}
+								groups := [][]byte{clientKeys, serverKeys}
+								if mode == "late_server_first" {
+									groups[0], groups[1] = groups[1], groups[0]
+								}
+								for _, group := range groups {
+									stream.write(t, group)
+									synctest.Wait()
+									stream.assertOpen(t)
+								}
+								checkQUICStateMatrixOutput(t, fixture, stream.packets, raw)
+								count := len(stream.packets)
+								stream.write(t, tlsFixtureDSB(t, keys))
+								synctest.Wait()
+								if len(stream.packets) != count {
+									t.Fatal("duplicate DSB repeated output")
+								}
+								if err := stream.writer.Close(); err != nil {
+									t.Fatal(err)
+								}
+								synctest.Wait()
+								if err := <-stream.done; err != nil {
+									t.Fatal(err)
+								}
+								if len(stream.packets) != count {
+									t.Fatal("output delayed until EOF")
+								}
+								output = stream.packets
+							})
+						} else {
+							var reader io.Reader = bytes.NewReader(withDSB)
+							var external io.Reader
+							if mode == "external" {
+								reader, external = bytes.NewReader(capture), bytes.NewReader(keys)
+							} else if mode == "nonseek_dsb" {
+								reader = bytes.NewBuffer(withDSB)
+							}
+							ch, done := make(chan *types.DecryptedPacket), make(chan struct{})
+							go func() {
+								defer close(done)
+								for p := range ch {
+									output = append(output, p)
+								}
+							}()
+							err := DecryptWithConfig(NewDecryptorConfig().WithPcapReader(reader).WithSSLKeyLog(external).
+								WithPacketChan(ch).WithOptions(types.DecryptOptions{RawChunks: raw}).WithLogger(log.New(io.Discard, "", 0)))
+							close(ch)
+							<-done
+							if err != nil {
+								t.Fatal(err)
+							}
+						}
+						messages, wire := checkQUICStateMatrixOutput(t, fixture, output, raw)
+						if reference == nil {
+							reference = messages
+						} else if !reflect.DeepEqual(reference, messages) {
+							t.Fatal("message bytes, stream IDs or connection ownership differ across APIs")
+						}
+						if raw {
+							if referenceRaw == nil {
+								referenceRaw = wire
+							} else if !reflect.DeepEqual(referenceRaw, wire) {
+								t.Fatal("raw stream bytes or early offset space differ across APIs")
+							}
+						}
+					})
+				}
+			}
+		})
+	}
+}
+
+func checkQUICStateMatrixOutput(t *testing.T, fixture string, output []*types.DecryptedPacket, raw bool) (map[string]string, map[string][]byte) {
+	t.Helper()
+	messages := make(map[string][]*types.DecryptedPacket)
+	parsers := make(map[string]*protocol.HTTP3StreamParser)
+	channels := make(map[string]chan *types.DecryptedPacket)
+	wire, ended := make(map[string][]byte), make(map[string]bool)
+	early := make(map[string]string)
+	for _, p := range output {
+		conn := p.ConnectionID()
+		if p.Transport != types.TransportProtocolUDP || p.Direction != "request" && p.Direction != "response" || p.SrcIP != "127.0.0.1" || p.DstIP != "127.0.0.1" {
+			t.Fatal("connection endpoint/direction", p)
+		}
+		if !raw {
+			messages[conn] = append(messages[conn], p)
+			continue
+		}
+		id, ok := p.Metadata["stream_id"].(uint64)
+		if !ok || p.Protocol != "quic" || p.Metadata["kind"] != "stream_chunk" && p.Metadata["kind"] != "stream_end" {
+			t.Fatal("unexpected raw output", p.Metadata)
+		}
+		level, _ := p.Metadata["encryption_level"].(string)
+		status, _ := p.Metadata["early_data"].(string)
+		space := ""
+		if level == "0rtt" {
+			if fixture != "retry_early" || p.Direction != "request" || status != "accepted" && status != "rejected" || early[conn] != "" && early[conn] != status {
+				t.Fatal("early state/connection mismatch", p.Metadata)
+			}
+			early[conn] = status
+			if status == "rejected" {
+				space = "/early"
+			}
+		}
+		key := fmt.Sprintf("%s%s/%d/%s", conn, space, id, p.Direction)
+		if ended[key] || p.Metadata["offset"] != uint64(len(wire[key])) {
+			t.Fatal("duplicate or non-contiguous stream", key, p.Metadata)
+		}
+		wire[key] = append(wire[key], p.Data...)
+		ended[key] = p.Metadata["end"] == true
+		owner := conn + space
+		if parsers[owner] == nil {
+			channels[owner] = make(chan *types.DecryptedPacket, 16)
+			parsers[owner] = protocol.NewHTTP3StreamParser(types.ConnectionKey{}, channels[owner])
+		}
+		if err := parsers[owner].FeedQUICStream(id, p.Direction == "request", p.Data, ended[key], p.Timestamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for owner, parser := range parsers {
+		if err := parser.Close(); err != nil {
+			t.Fatal(err)
+		}
+		close(channels[owner])
+		for p := range channels[owner] {
+			messages[owner] = append(messages[owner], p)
+		}
+	}
+	expected := make(map[string]uint64)
+	for _, version := range []int{1, 2} {
+		if fixture == "keyupdate_matrix" {
+			for _, suite := range []string{"aes256", "chacha"} {
+				for generation := 0; generation < 3; generation++ {
+					expected[fmt.Sprintf("/ku/v%d/%s/g%d", version, suite, generation)] = uint64(generation * 4)
+				}
+			}
+		} else {
+			for _, mode := range []string{"seed", "accepted", "rejected"} {
+				expected[fmt.Sprintf("/retry/v%d/%s", version, mode)] = 0
+			}
+		}
+	}
+	result, owners, rejectedPaths := make(map[string]string), make(map[string]string), make(map[string]string)
+	connections := make(map[string]bool)
+	for owner, packets := range messages {
+		isRejected := strings.HasSuffix(owner, "/early")
+		conn := strings.TrimSuffix(owner, "/early")
+		paths := make(map[uint64]string)
+		for _, p := range packets {
+			if p.Direction == "request" {
+				paths[p.Metadata["stream_id"].(uint64)] = p.Metadata["path"].(string)
+			}
+		}
+		if isRejected && (len(packets) != 1 || early[conn] != "rejected") {
+			t.Fatal("rejected early request missing or duplicated", owner)
+		}
+		for _, p := range packets {
+			id := p.Metadata["stream_id"].(uint64)
+			path := paths[id]
+			wantID, exists := expected[path]
+			body := bytes.SplitN(p.Data, []byte("\r\n\r\n"), 2)
+			if !exists || id != wantID || p.Protocol != "http/3" || len(body) != 2 {
+				t.Fatal("unexpected message or stream identity", p.Metadata)
+			}
+			if p.Direction == "request" {
+				if p.Metadata["method"] != "GET" || p.Metadata["path"] != path || p.Metadata["authority"] != "localhost" || len(body[1]) != 0 {
+					t.Fatal("request changed", p.Metadata)
+				}
+			} else if p.Direction != "response" || p.Metadata["status"] != 200 || string(body[1]) != "reply "+path || isRejected {
+				t.Fatal("response changed", p.Metadata)
+			}
+			if isRejected {
+				if !strings.HasSuffix(path, "/rejected") {
+					t.Fatal("rejected early bytes belong to another connection", path)
+				}
+				rejectedPaths[conn] = path
+				continue
+			}
+			connections[conn] = true
+			cell := path
+			if fixture == "keyupdate_matrix" {
+				cell = path[:strings.LastIndex(path, "/")]
+			}
+			if owners[cell] != "" && owners[cell] != conn {
+				t.Fatal("connection identity changed during state transition", path)
+			}
+			owners[cell] = conn
+			key := path + "/" + p.Direction
+			if _, duplicate := result[key]; duplicate {
+				t.Fatal("duplicate complete message", key)
+			}
+			result[key] = fmt.Sprintf("%s/%d/%s", conn, id, body[1])
+			if raw && fixture == "retry_early" {
+				want := path[strings.LastIndex(path, "/")+1:]
+				if want == "seed" {
+					want = ""
+				}
+				if early[conn] != want {
+					t.Fatal("Retry acceptance metadata mismatch", path, early[conn])
+				}
+			}
+		}
+	}
+	for conn, path := range rejectedPaths {
+		if owners[path] != conn {
+			t.Fatal("rejected early and normal replay belong to different connections", path)
+		}
+	}
+	wantConnections := 4
+	if fixture == "retry_early" {
+		wantConnections = 6
+	}
+	if len(connections) != wantConnections || len(owners) != wantConnections || len(result) != len(expected)*2 {
+		t.Fatalf("connections/cells/messages=%d/%d/%d, want %d/%d/%d", len(connections), len(owners), len(result), wantConnections, wantConnections, len(expected)*2)
+	}
+	return result, wire
+}
+
 func TestQUICLifecycleCaptureAPIs(t *testing.T) {
 	const base = "test/testdata/http3_lifecycle_aioquic"
 	packets, clientKeys, serverKeys := quicDSBBlocks(t, base+".pcapng", base+".keys")

@@ -55,7 +55,7 @@ Go 文件或流式 API 可用 `types.DecryptOptions{ApplicationProtocol: "doh"}`
 
 Go API 可通过 `TLSUpgrade` 显式选择 SMTP、IMAP、POP3、LDAP、PostgreSQL、MySQL 或 HTTP/1 CONNECT 协商，并用 `https-connect` 解密一层内层 TLS。升级被拒绝后保持明文，不扫描 TLS 前缀；升级后的载荷沿用已有应用/raw 输出，缺内层密钥仍保留可解的外层字节。[协商范围、层级与上限](docs/API.md#tlsupgrade)见 API 文档。
 
-TLS 1.3 支持经认证的分方向 KeyUpdate 与 record 序号重置、跨 record 握手消息、普通 HRR 和会话恢复。early data 与 ECH 需要对应密钥，并明确区分接受状态和随机数关联边界。各套件实测证据及未支持组合见 [TLS 能力矩阵](docs/API.md#tls-版本与状态)。
+TLS 1.3 支持经认证的分方向 KeyUpdate 与 record 序号重置、跨 record 握手消息、HRR（包括拒绝 early data）、ECH 与 HRR 组合和会话恢复。early data 与 ECH 需要对应密钥，并明确区分接受状态和随机数关联边界。各套件实测证据及未支持组合见 [TLS 能力矩阵](docs/API.md#tls-版本与状态)。
 
 QUIC raw 模式保留 RFC 9221 DATAGRAM 消息边界，支持空消息及明确的 early-data 状态。Go 调用方可用 `UDPProtocol: "dtls"` 选择 DTLS 1.2 ECDHE-RSA AES-128/256-GCM 数据报，密钥为 `CLIENT_RANDOM` master secret。[输出契约及限制](docs/API.md#数据报输出)不包含 WebTransport、MASQUE 或 WebRTC 应用支持。
 
@@ -63,7 +63,7 @@ QUIC raw 模式保留 RFC 9221 DATAGRAM 消息边界，支持空消息及明确�
 
 解密 HTTP/3 需要包含客户端 Initial（其中有 ClientHello）的双向 UDP 抓包，以及匹配该连接的 TLS 1.3 SSLKEYLOG。密钥可作为外部文件传入，也可放在 pcapng 的 DSB 中。解析器按 QUIC 连接、包号和 STREAM 偏移重组数据，再按 HTTP/3 请求流输出 `http/3` 的 `DecryptedPacket`。
 
-仓库中的 [Linux HTTP/3 抓包](test/fixtures/http3_capture/README.md)与 [Linux HTTP/1.x 和 HTTP/2 抓包](test/fixtures/http_tcp_capture/README.md)由 `tcpdump` 和 eCapture 实际捕获，覆盖外部密钥、内嵌 DSB 和 DSB 文件的流式读取。新增独立回环抓包覆盖 QUIC v1/v2、AES-128-GCM 的双向多次 Key Update。SDK 从初始 application traffic secret 派生后续密钥，并保留上一代处理乱序；[边界与失败行为](docs/API.md#quic-key-update)见 API 文档。AES-256-GCM、ChaCha20-Poly1305 的更新有向量和状态测试，尚无真实抓包覆盖；draft-29 仍未通过真实抓包验证。另有 aioquic 1.3.0 独立抓包，实测 v1/v2 × 三种套件的握手与应用解密、CID 轮换/NAT rebinding、Retry、版本协商和 accepted/rejected 0-RTT；它不扩大上述 Key Update 的真实套件覆盖范围。[连接身份与 early data 契约](docs/API.md#quic-连接身份retryvn-与-0-rtt)见 API 文档。HTTP/3 支持连接级动态 QPACK、控制流、信息响应、独立 trailers、push 响应与 RESET_STREAM 取消。独立 QUIC v1/v2 抓包验证了双向动态 QPACK、迟到 encoder 指令及这些消息状态；另一组 v1/v2 抓包覆盖部分请求字节后的 accepted/rejected 0-RTT RESET 和迟到密钥；[输出契约与上限](docs/API.md#http3)见 API 文档。
+仓库中的 [Linux HTTP/3 抓包](test/fixtures/http3_capture/README.md)与 [Linux HTTP/1.x 和 HTTP/2 抓包](test/fixtures/http_tcp_capture/README.md)由 `tcpdump` 和 eCapture 实际捕获，覆盖外部密钥、内嵌 DSB 和 DSB 文件的流式读取。独立回环抓包覆盖 QUIC v1/v2 × AES-128-GCM/AES-256-GCM/ChaCha20-Poly1305，每个组合双方至少两次 Key Update。SDK 从初始 application traffic secret 派生后续密钥，并保留上一代处理乱序；[边界与失败行为](docs/API.md#quic-key-update)见 API 文档。固定版本发生器对端的 v2 更新标签需要局部修正，复现说明明确区分适配后的证据与原版互通；draft-29 仍未通过真实抓包验证。另有 aioquic 1.3.0 独立抓包，实测 v1/v2 × 三种套件的握手与应用解密、CID 轮换/NAT rebinding、Retry、版本协商和 accepted/rejected 0-RTT；另一组 v1/v2、AES-128-GCM 抓包覆盖 Retry＋accepted/rejected 0-RTT，通过已记录的测试对端适配保留 Retry 前后的握手、early key 和包号。[连接身份与 early data 契约](docs/API.md#quic-连接身份retryvn-与-0-rtt)见 API 文档。HTTP/3 支持连接级动态 QPACK、控制流、信息响应、独立 trailers、push 响应与 RESET_STREAM 取消。独立 QUIC v1/v2 抓包验证了双向动态 QPACK、迟到 encoder 指令及这些消息状态；另一组 v1/v2 抓包覆盖部分请求字节后的 accepted/rejected 0-RTT RESET 和迟到密钥；[输出契约与上限](docs/API.md#http3)见 API 文档。
 
 # 快速开始
 

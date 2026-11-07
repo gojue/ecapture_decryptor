@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Generate independent QUIC lifecycle traffic (aioquic 1.3.0).
 
-Capture real loopback UDP port 44433 separately; this program never writes pcap.
+Capture real loopback UDP separately (ports depend on mode); this program never writes pcap.
 Usage: python aioquic_capture.py --cert cert.pem --key key.pem --output DIR
 """
 # Copyright (c) 2024-2026 CFC4N (cfc4n.cs@gmail.com). All Rights Reserved.
 # See LICENSE for the applicable license.
 import argparse
 import asyncio
+import hashlib
+import hmac
 import json
 import ssl
 from pathlib import Path
@@ -18,7 +20,7 @@ from aioquic.h3.events import DataReceived, HeadersReceived, PushPromiseReceived
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import DatagramFrameReceived, HandshakeCompleted, StreamReset
 from aioquic.quic.logger import QuicLogger
-from aioquic.tls import CipherSuite
+from aioquic.tls import CipherSuite, Epoch
 
 
 class StaticH3(H3Connection):
@@ -475,6 +477,213 @@ async def run(args):
     print(json.dumps(HTTP.evidence, indent=2))
 
 
+def independent_update(secret, version):
+    """RFC 8446 HKDF label encoding, independently of aioquic's TLS helpers."""
+    digest = hashlib.sha384 if len(secret) == 48 else hashlib.sha256
+    label = b"tls13 " + (b"quicv2 ku" if version == 0x6B3343CF else b"quic ku")
+    info = len(secret).to_bytes(2, "big") + bytes([len(label)]) + label + b"\x00"
+    return hmac.new(secret, info + b"\x01", digest).digest()
+
+
+def audit_sending_keys(peer):
+    crypto = peer._quic._cryptos[Epoch.ONE_RTT].send
+    encrypt = crypto.encrypt_packet
+    original_hp, previous, generation = crypto.hp, crypto.secret, 0
+    records = []
+
+    def encrypt_checked(header, payload, packet_number):
+        nonlocal previous, generation
+        if crypto.secret != previous:
+            assert crypto.secret == independent_update(previous, crypto.version)
+            previous, generation = crypto.secret, generation + 1
+        assert crypto.hp is original_hp
+        assert (header[0] >> 2) & 1 == generation % 2
+        packet = encrypt(header, payload, packet_number)
+        pn_length = (header[0] & 3) + 1
+        restored, _ = original_hp.remove(packet, len(header) - pn_length)
+        assert restored == header
+        records.append(dict(pn=packet_number, generation=generation, phase=generation % 2))
+        return packet
+
+    crypto.encrypt_packet = encrypt_checked
+    return records
+
+
+async def run_key_update_matrix(args):
+    # aioquic 1.3.0 next_key_phase hardcodes the v1 update label. Adapt only
+    # this generator run; its apply_key_phase already retains the original HP.
+    import aioquic
+    from aioquic.quic import crypto as quic_crypto
+    assert aioquic.__version__ == "1.3.0"
+    original_next = quic_crypto.next_key_phase
+
+    def next_key_phase(current):
+        if current.version != 0x6B3343CF:
+            return original_next(current)
+        algorithm = quic_crypto.cipher_suite_hash(current.cipher_suite)
+        updated = quic_crypto.CryptoContext(key_phase=1-current.key_phase)
+        updated.setup(cipher_suite=current.cipher_suite, version=current.version,
+            secret=quic_crypto.hkdf_expand_label(algorithm, current.secret, b"quicv2 ku", b"", algorithm.digest_size))
+        return updated
+
+    quic_crypto.next_key_phase = next_key_phase
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=True)
+    qlog, evidence = QuicLogger(), []
+    try:
+        with (output / "keyupdate-matrix.keys").open("w") as secrets:
+            port = 44469
+            for number, version in [(1, 1), (2, 0x6B3343CF)]:
+                for name, suite in [("aes256", CipherSuite.AES_256_GCM_SHA384),
+                                    ("chacha", CipherSuite.CHACHA20_POLY1305_SHA256)]:
+                    start = len(EarlyResetHTTP.instances)
+                    common = dict(alpn_protocols=["h3"], supported_versions=[version], cipher_suites=[suite],
+                        secrets_log_file=secrets, quic_logger=qlog)
+                    config = QuicConfiguration(is_client=False, **common)
+                    config.load_cert_chain(args.cert, args.key)
+                    server = await serve("127.0.0.1", port, configuration=config, create_protocol=EarlyResetHTTP)
+                    try:
+                        client_config = QuicConfiguration(is_client=True, verify_mode=ssl.CERT_NONE, **common)
+                        async with connect("127.0.0.1", port, configuration=client_config, create_protocol=EarlyResetHTTP) as client:
+                            peers = [p for p in EarlyResetHTTP.instances[start:] if not p._quic.configuration.is_client]
+                            assert len(peers) == 1
+                            peer = peers[0]
+                            records = [audit_sending_keys(client), audit_sending_keys(peer)]
+                            assert client._quic._version == version
+                            assert client._quic.tls.key_schedule.cipher_suite == suite
+                            for generation in range(3):
+                                if generation:
+                                    initiator = client if generation == 1 else peer
+                                    initiator._quic.request_key_update()
+                                    await initiator.ping()
+                                stream = await client.request(f"/ku/v{number}/{name}/g{generation}")
+                                assert stream == generation * 4
+                                await client.ping()
+                                await peer.ping()
+                                assert client._quic._handshake_confirmed and peer._quic._handshake_confirmed
+                            for entries in records:
+                                assert {e["generation"] for e in entries} == {0, 1, 2}
+                                assert all(a["pn"] < b["pn"] for a, b in zip(entries, entries[1:]))
+                            evidence.append(dict(version=hex(version), suite=suite.name, port=port,
+                                client=records[0], server=records[1], v2_label_adapter=(number == 2)))
+                    finally:
+                        server.close()
+                    port += 1
+                    await asyncio.sleep(0.05)
+    finally:
+        quic_crypto.next_key_phase = original_next
+    (output / "keyupdate-matrix.qlog").write_text(json.dumps(qlog.to_dict()))
+    (output / "keyupdate-matrix-evidence.json").write_text(json.dumps(evidence, indent=2))
+    print(json.dumps(evidence, indent=2))
+
+
+class RetryEarlyHTTP(EarlyResetHTTP):
+    """Pinned aioquic 1.3.0 adapter: preserve TLS and requeue on valid Retry.
+
+    Native _connect replaces TLS/packet spaces, changes ClientHello/early keys,
+    and loses sent STREAM ranges. RFC 9000 section 17.2.5.3 requires the same
+    handshake and early keys, with fresh packet numbers and new Initial keys.
+    Native Retry integrity validation, loss callbacks and packet builders remain.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.requeued_early = 0
+        self.retry_preserved = False
+        connect_original = self._quic._connect
+
+        def connect_checked(now):
+            quic = self._quic
+            if not quic._retry_count:
+                return connect_original(now)
+            assert quic._is_client and not quic._handshake_complete
+            handshake = bytes(quic._crypto_streams[Epoch.INITIAL].sender._buffer)
+            early_secret = quic._cryptos[Epoch.ZERO_RTT].send.secret
+            packet_number, tls = quic._packet_number, quic.tls
+            assert handshake and early_secret
+            assert quic._peer_cid.cid == quic._retry_source_connection_id
+            assert quic._peer_token and quic._peer_cid.cid != quic._original_destination_connection_id
+            for version, pair in quic._cryptos_initial.items():
+                pair.setup_initial(cid=quic._peer_cid.cid, is_client=True, version=version)
+            for epoch, space in quic._spaces.items():
+                pending = tuple(space.sent_packets.values())
+                if epoch == Epoch.ONE_RTT:
+                    self.requeued_early += len(pending)
+                quic._loss._on_packets_lost(now=now, packets=pending, space=space)
+            assert bytes(quic._crypto_streams[Epoch.INITIAL].sender._buffer) == handshake
+            assert quic._cryptos[Epoch.ZERO_RTT].send.secret == early_secret
+            assert quic._packet_number == packet_number and quic.tls is tls
+            self.retry_preserved = True
+
+        self._quic._connect = connect_checked
+
+
+async def run_retry_early(args):
+    import aioquic
+    assert aioquic.__version__ == "1.3.0"
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=True)
+    qlog, evidence = QuicLogger(), []
+    suite = CipherSuite.AES_128_GCM_SHA256
+    with (output / "retry-early.keys").open("w") as secrets:
+        for number, version, port in [(1, 1, 44473), (2, 0x6B3343CF, 44474)]:
+            tickets, received = {}, []
+            common = dict(alpn_protocols=["h3"], supported_versions=[version], cipher_suites=[suite],
+                secrets_log_file=secrets, quic_logger=qlog)
+            config = QuicConfiguration(is_client=False, **common)
+            config.load_cert_chain(args.cert, args.key)
+            for mode in ["seed", "accepted", "rejected"]:
+                if mode == "rejected":
+                    tickets.clear()
+                start = len(EarlyResetHTTP.instances)
+                server = await serve("127.0.0.1", port, configuration=config, create_protocol=RetryEarlyHTTP,
+                    retry=mode != "seed", session_ticket_fetcher=tickets.get,
+                    session_ticket_handler=lambda ticket: tickets.__setitem__(ticket.ticket, ticket))
+                try:
+                    client_config = QuicConfiguration(is_client=True, verify_mode=ssl.CERT_NONE,
+                        session_ticket=received[-1] if mode != "seed" else None, **common)
+                    async with connect("127.0.0.1", port, configuration=client_config, create_protocol=RetryEarlyHTTP,
+                            session_ticket_handler=received.append, wait_connected=mode == "seed") as client:
+                        path = f"/retry/v{number}/{mode}"
+                        assert await client.request(path) == 0
+                        await asyncio.sleep(0.05)
+                        assert client.handshake.early_data_accepted == (mode == "accepted")
+                        assert client.handshake.session_resumed == (mode == "accepted")
+                        assert client._quic._version == version
+                        assert client._quic.tls.key_schedule.cipher_suite == suite
+                        peer = [p for p in EarlyResetHTTP.instances[start:] if not p._quic.configuration.is_client]
+                        assert len(peer) == 1 and peer[0].paths[0] == path.encode()
+                        events = client._quic._quic_logger.to_dict()["events"]
+                        retries = [i for i,e in enumerate(events) if e["name"] == "transport:packet_received" and
+                            e["data"]["header"]["packet_type"] == "retry"]
+                        sent = [dict(index=i, packet_type=e["data"]["header"]["packet_type"], **f)
+                            for i,e in enumerate(events) if e["name"] == "transport:packet_sent"
+                            for f in e["data"].get("frames", []) if f["frame_type"] == "stream" and f["stream_id"] == 0]
+                        packet_numbers = [e["data"]["header"]["packet_number"] for e in events
+                            if e["name"] == "transport:packet_sent"]
+                        assert all(a < b for a, b in zip(packet_numbers, packet_numbers[1:]))
+                        expected = ["1RTT"] if mode == "seed" else ["0RTT", "0RTT"]
+                        if mode == "rejected":
+                            expected.append("1RTT")
+                        assert [f["packet_type"] for f in sent] == expected
+                        assert all(f["offset"] == 0 and f["fin"] and
+                            f["length"] == (26 if mode == "seed" else 29) for f in sent)
+                        if mode == "seed":
+                            assert not retries
+                        else:
+                            assert len(retries) == 1 and client.requeued_early > 0 and client.retry_preserved
+                            assert any(f["packet_type"] == "0RTT" and f["index"] < retries[0] for f in sent)
+                            assert any(f["packet_type"] == "0RTT" and f["index"] > retries[0] for f in sent)
+                        evidence.append(dict(version=hex(version), mode=mode, path=path, suite=suite.name,
+                            early_accepted=client.handshake.early_data_accepted, retry_count=len(retries),
+                            requeued_packets=client.requeued_early, preserved_handshake=client.retry_preserved, request_frames=sent))
+                finally:
+                    server.close()
+                await asyncio.sleep(0.05)
+    (output / "retry-early.qlog").write_text(json.dumps(qlog.to_dict()))
+    (output / "retry-early-evidence.json").write_text(json.dumps(evidence, indent=2))
+    print(json.dumps(evidence, indent=2))
+
+
 class DatagramPeer(QuicConnectionProtocol):
     """Independent RFC 9221 endpoint; no HTTP or stream framing."""
     def __init__(self, *args, **kwargs):
@@ -559,7 +768,9 @@ if __name__ == "__main__":
     parser.add_argument("--version", type=int, choices=[1, 2], default=1, help="QUIC version for --dynamic (default: 1)")
     parser.add_argument("--early-reset", action="store_true", help="generate v1/v2 accepted/rejected 0-RTT RESET fixtures")
     parser.add_argument("--datagram", action="store_true", help="generate the D11 QUIC DATAGRAM fixture")
+    parser.add_argument("--key-update-matrix", action="store_true", help="generate v1/v2 AES256/ChaCha key updates")
+    parser.add_argument("--retry-early", action="store_true", help="generate actual Retry with accepted/rejected 0-RTT")
     args = parser.parse_args()
-    if sum([args.dynamic, args.datagram, args.early_reset]) > 1:
+    if sum([args.dynamic, args.datagram, args.early_reset, args.key_update_matrix, args.retry_early]) > 1:
         parser.error("choose one fixture mode")
-    asyncio.run(run_datagram(args) if args.datagram else run_early_reset(args) if args.early_reset else run_dynamic(args) if args.dynamic else run(args))
+    asyncio.run(run_retry_early(args) if args.retry_early else run_key_update_matrix(args) if args.key_update_matrix else run_datagram(args) if args.datagram else run_early_reset(args) if args.early_reset else run_dynamic(args) if args.dynamic else run(args))

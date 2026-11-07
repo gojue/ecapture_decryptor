@@ -115,6 +115,9 @@ type TLSDecryptor struct {
 	earlyPending             []tlsEarlyChunk
 	earlyBytes               int
 	earlyRawOffset           uint64 // protocolMu; rejected/unknown early data has its own space.
+	helloRetry               bool
+	retryEarlyRecords        [][]byte // Client process lock after handshake; strictly before CH2.
+	retryEarlyBytes          int
 	tls13Finalizing          atomic.Bool
 	tls13Wake                chan struct{}
 	echOuterCandidate        bool
@@ -801,6 +804,8 @@ func (td *TLSDecryptor) releaseBuffers() {
 		td.tls13[i].handshake.Reset()
 		td.tls13[i].early = nil
 	}
+	td.retryEarlyRecords = nil
+	td.retryEarlyBytes = 0
 	td.earlyMu.Lock()
 	td.earlyPending = nil
 	td.earlyBytes = 0
@@ -838,14 +843,31 @@ func (td *TLSDecryptor) parseHandshake() error {
 		td.options.Report(td.ConnectionInfo, "handshake", "invalid_server_hello")
 		return fmt.Errorf("parse server hello: %w", err)
 	}
+	firstHello := hello
+	echOffered := hello.ECHOffered
+	var retryHandshake []byte
 	if crypto.IsHelloRetryRequest(serverHelloHandshake) {
-		if hello.EarlyData || hello.ECHOffered {
-			td.options.Report(td.ConnectionInfo, "handshake", "unsupported_handshake")
-			return errors.New("TLS HRR combined with early data or ECH is not supported")
+		if version != tls.VersionTLS13 {
+			return errTLS13Handshake
 		}
+		td.helloRetry = true
+		retryHandshake = serverHelloHandshake
 		retrySuite := cipherSuite
-		second, err := crypto.ReadClientHello(td.clientIn)
-		if err != nil || !bytes.Equal(second.Random, clientRandom) || second.EarlyData || second.ECHOffered {
+		second, err := crypto.ReadClientHelloRetry(td.clientIn, func(record []byte) error {
+			if !hello.EarlyData && !hello.ECHOffered {
+				return errTLS13Handshake
+			}
+			if len(record) > tlsPendingResponseLimit-td.retryEarlyBytes || len(td.retryEarlyRecords) >= tlsPendingResponseCount {
+				return crypto.ErrHandshakeResourceLimit
+			}
+			td.retryEarlyRecords = append(td.retryEarlyRecords, record)
+			td.retryEarlyBytes += len(record)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if second.EarlyData || !hello.ECHOffered && (!bytes.Equal(second.Random, clientRandom) || second.ECHOffered) {
 			return errTLS13Handshake
 		}
 		hello = second
@@ -881,20 +903,25 @@ func (td *TLSDecryptor) parseHandshake() error {
 		return len(s.MasterSecret) != 0
 	}
 	secrets, err := td.keyLog.WaitForSecrets(clientRandom, func(s *crypto.TLSSecrets) bool {
-		return applicationReady(s) || hello.ECHOffered && s != nil && len(s.ECHSecret) > 0 && len(s.ECHConfig) > 0
+		return applicationReady(s) || firstHello.ECHOffered && s != nil && len(s.ECHSecret) > 0 && len(s.ECHConfig) > 0
 	}, td.closeSignal, td.options.SecretWaitTimeout())
 	if err != nil {
 		td.options.Report(td.ConnectionInfo, "keys", "missing_secret")
 		return fmt.Errorf("wait for TLS secrets: %w", err)
 	}
-	if hello.ECHOffered {
-		if len(secrets.ECHSecret) > 0 && len(secrets.ECHConfig) > 0 {
-			var status string
+	if firstHello.ECHOffered {
+		var status string
+		if td.helloRetry {
+			firstHello, hello, status, err = crypto.ResolveECHClientHelloRetry(firstHello, hello, retryHandshake, serverHelloHandshake, secrets)
+		} else if len(secrets.ECHSecret) > 0 && len(secrets.ECHConfig) > 0 {
 			hello, status, err = crypto.ResolveECHClientHello(hello, serverHelloHandshake, secrets)
-			if err != nil {
-				td.options.Report(td.ConnectionInfo, "handshake", "ech_unavailable")
-				return err
-			}
+			firstHello = hello
+		}
+		if err != nil {
+			td.options.Report(td.ConnectionInfo, "handshake", "ech_unavailable")
+			return err
+		}
+		if len(secrets.ECHSecret) > 0 && len(secrets.ECHConfig) > 0 {
 			clientRandom = hello.Random
 			td.options.Report(td.ConnectionInfo, "handshake", "ech_"+status)
 			secrets, err = td.keyLog.WaitForSecrets(clientRandom, applicationReady, td.closeSignal, td.options.SecretWaitTimeout())
@@ -907,7 +934,19 @@ func (td *TLSDecryptor) parseHandshake() error {
 		}
 	}
 	td.clientRandom = bytes.Clone(clientRandom)
-	td.earlyOffered = version == tls.VersionTLS13 && hello.EarlyData
+	td.earlyOffered = version == tls.VersionTLS13 && firstHello.EarlyData
+	if td.helloRetry && echOffered && (td.earlyOffered || len(td.retryEarlyRecords) > 0) {
+		td.options.Report(td.ConnectionInfo, "handshake", "unsupported_handshake")
+		return errors.New("TLS ECH with HRR and early data is not supported")
+	}
+	if len(td.retryEarlyRecords) > 0 && !td.earlyOffered {
+		return errTLS13Handshake
+	}
+	if td.helloRetry && td.earlyOffered {
+		if err := td.resolveTLSEarly("rejected"); err != nil {
+			return err
+		}
+	}
 	if crypto.ServerHelloResumed(serverHelloHandshake) {
 		td.options.Report(td.ConnectionInfo, "handshake", "session_resumed")
 	}
@@ -989,7 +1028,7 @@ func (td *TLSDecryptor) parseHandshake() error {
 		if td.serverHandshakeDecryptor != nil {
 			td.tls13[1].phase = tls13Handshake
 		}
-		if td.earlyOffered {
+		if td.earlyOffered && !td.helloRetry {
 			td.tls13[0].phase = tls13Early
 			td.tls13[1].phase = tls13Handshake
 		}

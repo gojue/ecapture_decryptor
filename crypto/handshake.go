@@ -72,7 +72,7 @@ func (a *HandshakeAssembler) Reset()        { a.pending = nil; a.err = nil }
 
 // readHandshakeMessage accepts a split four-byte header and preserves every
 // following message from its final plaintext record for subsequent processing.
-func readHandshakeMessage(s *StreamBuffer) ([]byte, error) {
+func readHandshakeMessage(s *StreamBuffer, earlyRecord ...func([]byte) error) ([]byte, error) {
 	var message []byte
 	size := 4
 	for records := 0; ; records++ {
@@ -86,7 +86,19 @@ func readHandshakeMessage(s *StreamBuffer) ([]byte, error) {
 			}
 			return nil, err
 		}
-		if len(record) < 5 || record[1] != 3 || len(record)-5 > 16384 {
+		if len(record) < 5 || record[1] != 3 {
+			return nil, errInvalidHandshake
+		}
+		if record[0] == 23 && len(message) == 0 && len(earlyRecord) == 1 {
+			if record[2] != 3 || len(record)-5 > 16384+256 {
+				return nil, errInvalidHandshake
+			}
+			if err := earlyRecord[0](record); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if len(record)-5 > 16384 {
 			return nil, errInvalidHandshake
 		}
 		if record[0] == 20 && bytes.Equal(record[5:], []byte{1}) && len(message) == 0 {
@@ -173,6 +185,19 @@ type ClientHelloInfo struct {
 // ReadClientHello reads one complete plaintext ClientHello, preserving tails.
 func ReadClientHello(s *StreamBuffer) (*ClientHelloInfo, error) {
 	message, err := readHandshakeMessage(s)
+	if err != nil {
+		return nil, err
+	}
+	return parseClientHello(message)
+}
+
+// ReadClientHelloRetry reads CH2 after HRR. The caller bounds and retains each
+// preceding encrypted early record; ciphertext inside a split CH2 is invalid.
+func ReadClientHelloRetry(s *StreamBuffer, earlyRecord func([]byte) error) (*ClientHelloInfo, error) {
+	if earlyRecord == nil {
+		return nil, errInvalidHandshake
+	}
+	message, err := readHandshakeMessage(s, earlyRecord)
 	if err != nil {
 		return nil, err
 	}
@@ -330,13 +355,30 @@ func ResolveECHClientHello(outer *ClientHelloInfo, serverMessage []byte, secrets
 	if version != VersionTLS13 {
 		return outer, "rejected", nil
 	}
+	inner, err := decryptECHHello(outer, secrets, 0)
+	if err != nil {
+		return nil, "unknown", err
+	}
+	modified := bytes.Clone(serverMessage)
+	clear(modified[30:38])
+	confirmation, err := echConfirmation(suite, inner.Random, "ech accept confirmation", false, inner.Message, modified)
+	if err != nil {
+		return nil, "unknown", err
+	}
+	if !hmac.Equal(confirmation, serverMessage[30:38]) {
+		return outer, "rejected", nil
+	}
+	return inner, "accepted", nil
+}
+
+func decryptECHHello(outer *ClientHelloInfo, secrets *TLSSecrets, sequence byte) (*ClientHelloInfo, error) {
 	if secrets == nil || len(secrets.ECHSecret) == 0 || len(secrets.ECHConfig) == 0 {
-		return nil, "unknown", ErrECHSecretsUnavailable
+		return nil, ErrECHSecretsUnavailable
 	}
 	var ech helloExtension
 	for _, e := range outer.extensions {
 		if e.typ == 0xfd00 {
-			return nil, "unknown", ErrECHInvalid
+			return nil, ErrECHInvalid
 		}
 		if e.typ == 0xfe0d {
 			ech = e
@@ -344,44 +386,46 @@ func ResolveECHClientHello(outer *ClientHelloInfo, serverMessage []byte, secrets
 	}
 	data := ech.data
 	if len(data) < 10 || data[0] != 0 {
-		return nil, "unknown", ErrECHInvalid
+		return nil, ErrECHInvalid
 	}
 	kdf, aead := binary.BigEndian.Uint16(data[1:]), binary.BigEndian.Uint16(data[3:])
 	if kdf != 1 || aead != 1 {
-		return nil, "unknown", ErrECHUnsupported
+		return nil, ErrECHUnsupported
 	}
 	enc := int(binary.BigEndian.Uint16(data[6:]))
-	if enc != 32 {
-		return nil, "unknown", ErrECHUnsupported
+	if sequence == 0 && enc != 32 || sequence == 1 && enc != 0 || sequence > 1 {
+		return nil, ErrECHUnsupported
 	}
 	p := 8 + enc
 	if p+2 > len(data) {
-		return nil, "unknown", ErrECHInvalid
+		return nil, ErrECHInvalid
 	}
 	n := int(binary.BigEndian.Uint16(data[p:]))
 	p += 2
 	if n < 16 || n != len(data)-p {
-		return nil, "unknown", ErrECHInvalid
+		return nil, ErrECHInvalid
 	}
 	if err := validateECHConfig(secrets.ECHConfig, data[5]); err != nil {
-		return nil, "unknown", err
+		return nil, err
 	}
 	protection, nonce, err := echProtection(secrets.ECHSecret, secrets.ECHConfig)
 	if err != nil {
-		return nil, "unknown", err
+		return nil, err
 	}
+	// RFC 9180: the second Seal/Open uses base_nonce XOR I2OSP(1, Nn).
+	nonce[len(nonce)-1] ^= sequence
 	// ClientHelloOuterAAD omits the handshake header and replaces only the
 	// encrypted payload with zeros; the enc, length and other fields stay bound.
 	aad := bytes.Clone(outer.Message[4:])
 	clear(aad[ech.start+p-4 : ech.start+p-4+n])
 	encoded, err := protection.Open(nil, nonce, data[p:], aad)
 	if err != nil {
-		return nil, "unknown", ErrECHAuthentication
+		return nil, ErrECHAuthentication
 	}
-	inner, err := decodeECHInner(outer, encoded)
-	if err != nil {
-		return nil, "unknown", err
-	}
+	return decodeECHInner(outer, encoded)
+}
+
+func echConfirmation(suite uint16, random []byte, label string, retry bool, messages ...[]byte) ([]byte, error) {
 	var newHash func() hash.Hash
 	switch suite {
 	case 0x1301, 0x1303:
@@ -389,27 +433,116 @@ func ResolveECHClientHello(outer *ClientHelloInfo, serverMessage []byte, secrets
 	case 0x1302:
 		newHash = sha512.New384
 	default:
-		return nil, "unknown", ErrECHUnsupported
+		return nil, ErrECHUnsupported
 	}
-	modified := bytes.Clone(serverMessage)
-	clear(modified[30:38])
 	transcript := newHash()
-	transcript.Write(inner.Message)
-	transcript.Write(modified)
+	for i, message := range messages {
+		if i == 0 && retry {
+			// HRR replaces CH1 with the synthetic message_hash handshake.
+			first := newHash()
+			first.Write(message)
+			transcript.Write([]byte{254, 0, 0, byte(first.Size())})
+			transcript.Write(first.Sum(nil))
+		} else {
+			transcript.Write(message)
+		}
+	}
 	context := transcript.Sum(nil)
-	secret := hkdf.Extract(newHash, inner.Random, nil)
-	label := []byte("tls13 ech accept confirmation")
+	secret := hkdf.Extract(newHash, random, nil)
+	label = "tls13 " + label
 	info := append([]byte{0, 8, byte(len(label))}, label...)
 	info = append(info, byte(len(context)))
 	info = append(info, context...)
 	confirmation := make([]byte, 8)
 	if _, err := io.ReadFull(hkdf.Expand(newHash, secret, info), confirmation); err != nil {
-		return nil, "unknown", ErrECHInvalid
+		return nil, ErrECHInvalid
 	}
-	if !hmac.Equal(confirmation, serverMessage[30:38]) {
-		return outer, "rejected", nil
+	return confirmation, nil
+}
+
+// ResolveECHClientHelloRetry authenticates both ECH payloads and the HRR/final
+// confirmations. It retains no state after returning. The first selected hello
+// supplies any early-data offer; the second supplies the final TLS key index.
+func ResolveECHClientHelloRetry(first, second *ClientHelloInfo, retry, final []byte, secrets *TLSSecrets) (*ClientHelloInfo, *ClientHelloInfo, string, error) {
+	if first == nil || second == nil {
+		return nil, nil, "unknown", ErrECHInvalid
 	}
-	return inner, "accepted", nil
+	first, err := parseClientHello(first.Message)
+	if err != nil {
+		return nil, nil, "unknown", err
+	}
+	second, err = parseClientHello(second.Message)
+	if err != nil || !first.ECHOffered || !second.ECHOffered || second.EarlyData {
+		return nil, nil, "unknown", ErrECHInvalid
+	}
+	version, suite, extensions, err := serverHello(retry)
+	finalVersion, finalSuite, _, finalErr := serverHello(final)
+	if err != nil || finalErr != nil || !IsHelloRetryRequest(retry) || IsHelloRetryRequest(final) || version != VersionTLS13 || finalVersion != version || finalSuite != suite {
+		return nil, nil, "unknown", ErrECHInvalid
+	}
+	var signal helloExtension
+	for _, e := range extensions {
+		if e.typ == 0xfe0d {
+			signal = e
+			if len(e.data) != 8 {
+				return nil, nil, "unknown", ErrECHInvalid
+			}
+		}
+	}
+	var firstECH, secondECH []byte
+	for _, e := range first.extensions {
+		if e.typ == 0xfe0d {
+			firstECH = e.data
+		}
+	}
+	for _, e := range second.extensions {
+		if e.typ == 0xfe0d {
+			secondECH = e.data
+		}
+	}
+	// Rejection/GREASE keeps the outer random and the complete ECH extension.
+	outerRetry := bytes.Equal(first.Random, second.Random) && bytes.Equal(first.sessionID, second.sessionID) && bytes.Equal(firstECH, secondECH)
+	if secrets == nil || len(secrets.ECHSecret) == 0 || len(secrets.ECHConfig) == 0 {
+		if outerRetry {
+			return first, second, "unknown", nil
+		}
+		return nil, nil, "unknown", ErrECHSecretsUnavailable
+	}
+	inner1, err := decryptECHHello(first, secrets, 0)
+	if err != nil {
+		return nil, nil, "unknown", err
+	}
+	modified := bytes.Clone(retry)
+	if len(signal.data) == 8 {
+		clear(modified[signal.start : signal.start+8])
+	}
+	confirm, err := echConfirmation(suite, inner1.Random, "hrr ech accept confirmation", true, inner1.Message, modified)
+	if err != nil {
+		return nil, nil, "unknown", err
+	}
+	if !hmac.Equal(confirm, signal.data) {
+		if !outerRetry {
+			return nil, nil, "unknown", ErrECHAuthentication
+		}
+		return first, second, "rejected", nil
+	}
+	if len(firstECH) < 6 || len(secondECH) < 6 || !bytes.Equal(firstECH[:6], secondECH[:6]) {
+		return nil, nil, "unknown", ErrECHInvalid
+	}
+	inner2, err := decryptECHHello(second, secrets, 1)
+	if err != nil {
+		return nil, nil, "unknown", err
+	}
+	if inner2.EarlyData || !bytes.Equal(inner1.Random, inner2.Random) || !bytes.Equal(inner1.sessionID, inner2.sessionID) {
+		return nil, nil, "unknown", ErrECHInvalid
+	}
+	modified = bytes.Clone(final)
+	clear(modified[30:38])
+	confirm, err = echConfirmation(suite, inner2.Random, "ech accept confirmation", true, inner1.Message, retry, inner2.Message, modified)
+	if err != nil || !hmac.Equal(confirm, final[30:38]) {
+		return nil, nil, "unknown", ErrECHAuthentication
+	}
+	return inner1, inner2, "accepted", nil
 }
 
 func validateECHConfig(config []byte, id byte) error {

@@ -135,7 +135,7 @@ func (td *TLSDecryptor) refreshTLS13Keys(client bool) error {
 			td.tls13[i].phase = tls13Handshake
 		}
 	}
-	if client && td.earlyOffered && td.tls13[0].early == nil && len(secrets.ClientEarlyTrafficSecret) > 0 && td.tls13[0].phase == tls13Early {
+	if client && td.earlyOffered && td.tls13[0].early == nil && len(secrets.ClientEarlyTrafficSecret) > 0 && (td.tls13[0].phase == tls13Early || len(td.retryEarlyRecords) > 0) {
 		next, err := crypto.NewRecordDecryptor(td.version, td.cipherSuite, secrets.ClientEarlyTrafficSecret)
 		if err != nil {
 			return err
@@ -162,6 +162,32 @@ func (td *TLSDecryptor) processTLS13Records(client bool) {
 	}
 	for !td.aborted.Load() {
 		s.waiting = false
+		if client && len(td.retryEarlyRecords) > 0 {
+			if s.early == nil && !td.tls13Finalizing.Load() {
+				s.waiting = true
+				return
+			}
+			for _, record := range td.retryEarlyRecords {
+				if s.early == nil {
+					td.recordFailure("keys", "missing_early_secret", errors.New("TLS pre-retry early records could not be authenticated"))
+					break
+				}
+				plaintext, typ, err := s.early.Decrypt(record)
+				if err != nil {
+					td.tls13Fail("decrypt", "authentication_failed", err)
+					return
+				}
+				if typ != 23 { // HRR rejects early data; EndOfEarlyData is forbidden.
+					td.tls13Fail("handshake", "invalid_handshake", errTLS13Handshake)
+					return
+				}
+				if err := td.queueTLS13Client(plaintext, true); err != nil {
+					td.tls13Fail("input", "resource_limit", err)
+					return
+				}
+			}
+			td.retryEarlyRecords, td.retryEarlyBytes, s.early = nil, 0, nil
+		}
 		if s.phase == tls13Handshake && *handshake == nil || s.phase == tls13Early && s.early == nil && td.tlsEarlyStatus() != "rejected" {
 			if !td.tls13Finalizing.Load() {
 				s.waiting = true
@@ -327,7 +353,7 @@ func (td *TLSDecryptor) handleTLS13Handshake(s *tls13Direction, data []byte, cli
 					return errTLS13Handshake
 				}
 				if binary.BigEndian.Uint16(ext) == 42 {
-					if accepted || n != 0 || !td.earlyOffered {
+					if accepted || n != 0 || !td.earlyOffered || td.helloRetry {
 						return errTLS13Handshake
 					}
 					accepted = true

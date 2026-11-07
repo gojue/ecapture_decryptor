@@ -207,6 +207,206 @@ func TestTLS13LateEarlyAndHandshakeKeysWakeAfterFIN(t *testing.T) {
 	})
 }
 
+func tls13RetryFlight(t *testing.T, td *TLSDecryptor, earlyRecord []byte, change string) {
+	t.Helper()
+	first, final := tlsUpgradeTestHellos(0x44)
+	second := bytes.Clone(first)
+	first = append(first, 0, 42, 0, 0)
+	binary.BigEndian.PutUint16(first[50:52], 11)
+	binary.BigEndian.PutUint16(first[3:5], uint16(len(first)-5))
+	first[8] += 4
+	if change == "ech_early" {
+		// A copied GREASE-shaped ECH offer plus visible early_data is also
+		// outside the supported two-way HRR combinations.
+		ech := append([]byte{0xfe, 0x0d, 0, 58, 0, 0, 1, 0, 1, 7, 0, 32}, make([]byte, 32)...)
+		ech = append(ech, 0, 16)
+		ech = append(ech, make([]byte, 16)...)
+		for _, target := range []*[]byte{&first, &second} {
+			*target = append(*target, ech...)
+			binary.BigEndian.PutUint16((*target)[50:52], uint16(len(*target)-52))
+			binary.BigEndian.PutUint16((*target)[3:5], uint16(len(*target)-5))
+			(*target)[8] = byte(len(*target) - 9)
+		}
+	}
+	retry := bytes.Clone(final)
+	random, _ := hex.DecodeString("cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c")
+	copy(retry[11:43], random)
+	switch change {
+	case "second_early":
+		second = bytes.Clone(first)
+	case "random":
+		second[11] ^= 1
+	case "repeat_hrr":
+		final = bytes.Clone(retry)
+	case "suite":
+		final[45] = 2
+	}
+	_ = td.FeedClient(first)
+	_ = td.FeedClient(earlyRecord)
+	if change == "before_second" {
+		_ = td.FeedServer(retry)
+		return
+	}
+	_ = td.FeedClient([]byte{20, 3, 3, 0, 1, 1})
+	// A split CH2 header must end early-data consumption at the first fragment.
+	_ = td.FeedClient([]byte{22, 3, 3, 0, 2, second[5], second[6]})
+	if change == "interleaved_early" {
+		_ = td.FeedClient(earlyRecord)
+	}
+	tail := append([]byte{22, 3, 3, 0, byte(len(second) - 7)}, second[7:]...)
+	_ = td.FeedClient(tail)
+	_ = td.FeedServer(retry)
+	_ = td.FeedServer(final)
+}
+
+func TestTLS13RetryRejectsEarlyAndWaitsForLateKeys(t *testing.T) {
+	for _, delayed := range []string{"none", "early", "handshake", "missing_early"} {
+		t.Run(delayed, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				td, out := newTLSRawTest(types.DecryptOptions{RawChunks: true, KeyWaitTimeout: time.Second})
+				app, hs, early := bytes.Repeat([]byte{0x11}, 32), bytes.Repeat([]byte{0x22}, 32), bytes.Repeat([]byte{0x33}, 32)
+				tls13RetryFlight(t, td, tls13RawTestRecord(t, early, 0, []byte("early"), 23), "")
+				for _, label := range []string{"CLIENT_TRAFFIC_SECRET_0", "SERVER_TRAFFIC_SECRET_0"} {
+					tls13StageSecret(td, label, app)
+				}
+				if delayed != "early" && delayed != "missing_early" {
+					tls13StageSecret(td, "CLIENT_EARLY_TRAFFIC_SECRET", early)
+				}
+				if delayed != "handshake" {
+					for _, label := range []string{"CLIENT_HANDSHAKE_TRAFFIC_SECRET", "SERVER_HANDSHAKE_TRAFFIC_SECRET"} {
+						tls13StageSecret(td, label, hs)
+					}
+				}
+				_ = td.FeedClient(tls13RawTestRecord(t, hs, 0, tls13Finished(), 22))
+				_ = td.FeedClient(tls13RawTestRecord(t, app, 0, []byte("normal"), 23))
+				_ = td.FeedServer(tls13RawTestRecord(t, hs, 0, append([]byte{8, 0, 0, 2, 0, 0}, tls13Finished()...), 22))
+				_ = td.FeedServer(tls13RawTestRecord(t, app, 0, []byte("response"), 23))
+				_ = td.CloseClient()
+				_ = td.CloseServer()
+				done := make(chan error, 1)
+				go func() { done <- td.Decrypt() }()
+				synctest.Wait()
+				switch delayed {
+				case "early":
+					tls13StageSecret(td, "CLIENT_EARLY_TRAFFIC_SECRET", early)
+				case "handshake":
+					for _, label := range []string{"CLIENT_HANDSHAKE_TRAFFIC_SECRET", "SERVER_HANDSHAKE_TRAFFIC_SECRET"} {
+						tls13StageSecret(td, label, hs)
+					}
+				case "missing_early":
+					time.Sleep(time.Second)
+				}
+				if err := <-done; (err != nil) != (delayed == "missing_early") {
+					t.Fatal("HRR early result", err)
+				}
+				var earlyBytes, normal, response []byte
+				for len(out) > 0 {
+					p := <-out
+					if len(p.Data) == 0 {
+						continue
+					}
+					if p.Metadata["encryption_level"] == "0rtt" {
+						if p.Metadata["early_data"] != "rejected" || p.Metadata["offset"] != uint64(len(earlyBytes)) {
+							t.Fatal(p.Metadata)
+						}
+						earlyBytes = append(earlyBytes, p.Data...)
+					} else if p.Direction == "request" {
+						if p.Metadata["offset"] != uint64(len(normal)) || p.Metadata["early_data"] != nil {
+							t.Fatal(p.Metadata)
+						}
+						normal = append(normal, p.Data...)
+					} else {
+						response = append(response, p.Data...)
+					}
+				}
+				wantEarly := "early"
+				if delayed == "missing_early" {
+					wantEarly = ""
+				}
+				if string(earlyBytes) != wantEarly || string(normal) != "normal" || string(response) != "response" || td.tlsEarlyStatus() != "rejected" {
+					t.Fatalf("early=%q normal=%q response=%q", earlyBytes, normal, response)
+				}
+				if td.retryEarlyBytes != 0 || len(td.retryEarlyRecords) != 0 {
+					t.Fatal("retained retry ciphertext")
+				}
+				assertTLSBuffersReleased(t, td)
+			})
+		})
+	}
+}
+
+func TestTLS13RetryRejectsInvalidEarlyBoundaries(t *testing.T) {
+	for _, change := range []string{"second_early", "random", "repeat_hrr", "suite", "interleaved_early", "post_retry_early", "end_of_early", "accepted", "wrong_early", "ech_early"} {
+		t.Run(change, func(t *testing.T) {
+			unsupported := false
+			td, out := newTLSRawTest(types.DecryptOptions{RawChunks: true, OnDiagnostic: func(d types.Diagnostic) {
+				unsupported = unsupported || d.Code == "unsupported_handshake"
+			}})
+			app, hs, early := bytes.Repeat([]byte{0x11}, 32), bytes.Repeat([]byte{0x22}, 32), bytes.Repeat([]byte{0x33}, 32)
+			record := tls13RawTestRecord(t, early, 0, []byte("early"), 23)
+			if change == "end_of_early" {
+				record = tls13RawTestRecord(t, early, 0, []byte{5, 0, 0, 0}, 22)
+			}
+			if change == "wrong_early" {
+				record[len(record)-1] ^= 1
+			}
+			tls13RetryFlight(t, td, record, change)
+			for _, label := range []string{"CLIENT_TRAFFIC_SECRET_0", "SERVER_TRAFFIC_SECRET_0"} {
+				tls13StageSecret(td, label, app)
+			}
+			for _, label := range []string{"CLIENT_HANDSHAKE_TRAFFIC_SECRET", "SERVER_HANDSHAKE_TRAFFIC_SECRET"} {
+				tls13StageSecret(td, label, hs)
+			}
+			tls13StageSecret(td, "CLIENT_EARLY_TRAFFIC_SECRET", early)
+			if change == "post_retry_early" {
+				_ = td.FeedClient(tls13RawTestRecord(t, early, 1, []byte("forbidden"), 23))
+			}
+			if change == "accepted" {
+				_ = td.FeedServer(tls13RawTestRecord(t, hs, 0, []byte{8, 0, 0, 6, 0, 4, 0, 42, 0, 0}, 22))
+			}
+			_ = td.Close()
+			if err := td.Decrypt(); err == nil {
+				t.Fatal("invalid HRR boundary accepted")
+			}
+			if change == "ech_early" && !unsupported {
+				t.Fatal("triple ECH/HRR/early combination did not report its explicit boundary")
+			}
+			for len(out) > 0 {
+				if p := <-out; string(p.Data) == "forbidden" {
+					t.Fatal("early key remained usable after CH2")
+				}
+			}
+			assertTLSBuffersReleased(t, td)
+		})
+	}
+}
+
+func TestTLS13RetryEarlyCiphertextLimit(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		td, _ := newTLSRawTest(types.DecryptOptions{RawChunks: true})
+		tls13RetryFlight(t, td, nil, "before_second")
+		done := make(chan error, 1)
+		go func() { done <- td.Decrypt() }()
+		synctest.Wait()
+		secret := bytes.Repeat([]byte{0x33}, 32)
+		body := make([]byte, 16384)
+		for i := 0; i < tlsPendingResponseLimit/(len(body)+22)+1; i++ {
+			record := tls13RawTestRecord(t, secret, uint64(i), body, 23)
+			if err := td.FeedClient(record); err != nil {
+				t.Fatal(err)
+			}
+			synctest.Wait()
+		}
+		if err := <-done; !errors.Is(err, crypto.ErrHandshakeResourceLimit) {
+			t.Fatal("pre-CH2 ciphertext exceeded its retained-byte limit", err)
+		}
+		if td.retryEarlyBytes != 0 || len(td.retryEarlyRecords) != 0 {
+			t.Fatal("retry failure retained ciphertext")
+		}
+		assertTLSBuffersReleased(t, td)
+	})
+}
+
 func TestTLS13UnknownEarlyAndMissingEarlySecret(t *testing.T) {
 	for _, raw := range []bool{false, true} {
 		for _, missing := range []string{"server_handshake", "early"} {
