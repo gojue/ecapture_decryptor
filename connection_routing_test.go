@@ -436,18 +436,31 @@ func TestLateProcessAttributionDoesNotSplitTCPOrCrossGenerations(t *testing.T) {
 			t.Fatal("invented first packet PID")
 		}
 		observation := &types.ConnectionProcess{}
-		observation.Observe(101, "client", 1)
+		// Keep the released API's exact method signature for existing consumers.
+		var observer interface{ Observe(uint32, string, uint32) } = observation
+		observer.Observe(101, "client", 1)
 		e.handlePacket(ip, tcp(101, false), time.Now(), observation)
+		if p := types.NewDecryptedPacket("tcp", "tls", "request", nil, time.Now(), first); p.ProcessArgs != nil {
+			t.Fatal("invented argv before the snapshot arrived")
+		}
+		observation.ObserveWithArgs(101, "client", 1, captureTestArgs("client"))
+		e.handlePacket(ip, tcp(102, false), time.Now(), observation)
 		server := &types.ConnectionProcess{}
-		server.Observe(202, "server", 1)
+		server.ObserveWithArgs(202, "server", 1, captureTestArgs("server"))
 		e.handlePacket(ip, transport.NewTCPAdapter(&layers.TCP{SrcPort: 443, DstPort: 45001, Seq: 900, ACK: true}), time.Now(), server)
 		if len(*created) != 1 || first.String() != (*created)[0].addr.String() {
 			t.Fatal("metadata changed route identity")
 		}
 		for dir, want := range map[string]int64{"request": 101, "response": 202} {
 			p := types.NewDecryptedPacket("tcp", "tls", dir, nil, time.Now(), first)
-			if p.PID != want {
+			if p.PID != want || p.ProcessArgs == nil {
 				t.Fatalf("%s ownership=%d", dir, p.PID)
+			}
+			before := bytes.Clone(p.ProcessArgs.Data)
+			p.ProcessArgs.Data[0] ^= 0xff
+			next := types.NewDecryptedPacket("tcp", "tls", dir, nil, time.Now(), first)
+			if !bytes.Equal(next.ProcessArgs.Data, before) {
+				t.Fatal("callback mutated connection argv")
 			}
 		}
 		e.handlePacket(ip, tcp(200, true), time.Now())
@@ -457,11 +470,17 @@ func TestLateProcessAttributionDoesNotSplitTCPOrCrossGenerations(t *testing.T) {
 		if pid, _ := (*created)[1].addr.Process.Identity("request"); pid != 0 {
 			t.Fatal("process leaked across reuse")
 		}
+		if p := types.NewDecryptedPacket("tcp", "tls", "request", nil, time.Now(), (*created)[1].addr); p.ProcessArgs != nil {
+			t.Fatal("argv leaked across connection reuse")
+		}
 		conflict := &types.ConnectionProcess{}
 		conflict.Observe(999, "other", 1)
 		first.Process.Merge(conflict, false)
 		if pid, _ := first.Process.Identity("request"); pid != 0 {
 			t.Fatal("ambiguous shared endpoint attributed")
+		}
+		if p := types.NewDecryptedPacket("tcp", "tls", "request", nil, time.Now(), first); p.ProcessArgs != nil {
+			t.Fatal("conflicting argv retained")
 		}
 		legacy := e.factory.Create(types.ConnectionKey{Proto: "tcp", Pid: 303, ProcessName: "explicit"})
 		packet := types.NewDecryptedPacket("tcp", "tls", "request", nil, time.Now(), legacy.GetAddr())

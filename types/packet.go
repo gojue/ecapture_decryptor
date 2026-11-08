@@ -8,10 +8,26 @@
 package types
 
 import (
+	"bytes"
 	"encoding/json"
 	"sync"
 	"time"
 )
+
+// ProcessArgs preserves argv bytes from the capture side, including NUL separators.
+// Truncated means Data contains only the first 256 bytes and may end mid-argument.
+// JSON encodes Data as base64 so even non-UTF-8 arguments survive unchanged.
+type ProcessArgs struct {
+	Data      []byte `json:"data"`
+	Truncated bool   `json:"truncated"`
+}
+
+func (a *ProcessArgs) clone() *ProcessArgs {
+	if a == nil {
+		return nil
+	}
+	return &ProcessArgs{Data: bytes.Clone(a.Data), Truncated: a.Truncated}
+}
 
 // DecryptedPacket represents a decrypted application layer packet
 type DecryptedPacket struct {
@@ -54,6 +70,9 @@ type DecryptedPacket struct {
 	// PName is the process name associated with the connection
 	PName string `json:"PName"`
 
+	// ProcessArgs is a capture-time argv snapshot. Nil means unavailable.
+	ProcessArgs *ProcessArgs `json:"processArgs,omitempty"`
+
 	// DataLength is the length of the decrypted data
 	DataLength uint32 `json:"dataLength"`
 }
@@ -77,7 +96,7 @@ func NewDecryptedPacket(tProtocol, protocol, direction string, data []byte, time
 		DataLength: uint32(len(data)),
 	}
 	if ci.Process != nil {
-		p.PID, p.PName = ci.Process.Identity(direction)
+		p.PID, p.PName, p.ProcessArgs = ci.Process.identity(direction)
 	}
 	if direction == "response" {
 		p.SrcIP, p.DstIP = p.DstIP, p.SrcIP
@@ -125,12 +144,18 @@ type ConnectionProcess struct {
 type processOwner struct {
 	pid      uint32
 	name     string
+	args     *ProcessArgs
 	conflict bool
 }
 
 // Observe adds a capture observation: endpoint 1 = source, 2 = destination,
 // 0 = legacy unspecified. Conflicting owners remain unknown for this generation.
 func (p *ConnectionProcess) Observe(pid uint32, name string, endpoint uint32) {
+	p.ObserveWithArgs(pid, name, endpoint, nil)
+}
+
+// ObserveWithArgs adds the optional argv snapshot to a process observation.
+func (p *ConnectionProcess) ObserveWithArgs(pid uint32, name string, endpoint uint32, args *ProcessArgs) {
 	if p == nil || pid == 0 || endpoint > 2 {
 		return
 	}
@@ -146,6 +171,9 @@ func (p *ConnectionProcess) Observe(pid uint32, name string, endpoint uint32) {
 	}
 	if !o.conflict {
 		o.pid, o.name = pid, name
+		if args != nil && len(args.Data) > 0 && len(args.Data) <= 256 && ((!args.Truncated && args.Data[len(args.Data)-1] == 0) || (args.Truncated && len(args.Data) == 256)) {
+			o.args = args.clone()
+		}
 	}
 }
 
@@ -168,7 +196,10 @@ func (p *ConnectionProcess) Merge(packet *ConnectionProcess, reverse bool) {
 			o.conflict = true
 		}
 		if !o.conflict && n.pid != 0 {
-			*o = n
+			o.pid, o.name = n.pid, n.name
+			if n.args != nil {
+				o.args = n.args
+			} // immutable snapshot
 		}
 	}
 }
@@ -178,6 +209,11 @@ func (p *ConnectionProcess) Merge(packet *ConnectionProcess, reverse bool) {
 // Legacy trailers cannot disambiguate two owners, so conflicting legacy data
 // remains unknown. No PID is inferred from a tuple or opaque connection ID.
 func (p *ConnectionProcess) Identity(direction string) (int64, string) {
+	pid, name, _ := p.identity(direction)
+	return pid, name
+}
+
+func (p *ConnectionProcess) identity(direction string) (int64, string, *ProcessArgs) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	src, dst := p.owners[0], p.owners[1]
@@ -185,20 +221,20 @@ func (p *ConnectionProcess) Identity(direction string) (int64, string) {
 		src, dst = dst, src
 	}
 	if src.conflict {
-		return 0, ""
+		return 0, "", nil
 	}
 	if src.pid != 0 {
-		return int64(src.pid), src.name
+		return int64(src.pid), src.name, src.args.clone()
 	}
 	if dst.conflict {
-		return 0, ""
+		return 0, "", nil
 	}
 	if dst.pid != 0 {
-		return int64(dst.pid), dst.name
+		return int64(dst.pid), dst.name, dst.args.clone()
 	}
 	old := p.owners[2]
 	if old.conflict {
-		return 0, ""
+		return 0, "", nil
 	}
-	return int64(old.pid), old.name
+	return int64(old.pid), old.name, old.args.clone()
 }

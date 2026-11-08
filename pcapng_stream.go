@@ -6,11 +6,13 @@ package ecapture_decryptor
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"sync"
 
 	"github.com/google/gopacket"
@@ -102,6 +104,7 @@ type pcapngBlockReader struct {
 	order        binary.ByteOrder
 	pending      []byte
 	onTLSSecrets func([]byte) error
+	packetArgs   *types.ProcessArgs // belongs to the most recently read packet block
 }
 
 func (r *pcapngBlockReader) Read(p []byte) (int, error) {
@@ -156,6 +159,12 @@ func (r *pcapngBlockReader) nextBlock() ([]byte, error) {
 	if r.order.Uint32(block[length-4:]) != length {
 		return nil, errors.New("pcapng block length trailer mismatch")
 	}
+	switch r.order.Uint32(header[:4]) {
+	case 6: // Enhanced Packet Block
+		r.packetArgs = pcapngProcessArgs(block, r.order)
+	case 2, 3, 0x0a0d0d0a: // obsolete/simple packet or new section
+		r.packetArgs = nil
+	}
 	if !section && r.order.Uint32(header[:4]) == 0x0000000a {
 		if length < 20 {
 			return nil, errors.New("short pcapng decryption secrets block")
@@ -176,7 +185,7 @@ func (r *pcapngBlockReader) nextBlock() ([]byte, error) {
 
 // packetProcess reads eCapture's historical big-endian Ethernet trailer. It is
 // packet data, not an EPB option; pcapgo preserves it in file and streaming APIs.
-func packetProcess(packet gopacket.Packet) *types.ConnectionProcess {
+func packetProcess(packet gopacket.Packet, argv ...*types.ProcessArgs) *types.ConnectionProcess {
 	eth, ok := packet.Layer(layers.LayerTypeEthernet).(*layers.Ethernet)
 	if !ok {
 		return nil
@@ -234,6 +243,58 @@ func packetProcess(packet gopacket.Packet) *types.ConnectionProcess {
 		return nil
 	}
 	p := &types.ConnectionProcess{}
-	p.Observe(pid, string(bytes.TrimRight(trailer[9:9+n], "\x00")), endpoint)
+	var args *types.ProcessArgs
+	if len(argv) == 1 {
+		args = argv[0]
+	}
+	p.ObserveWithArgs(pid, string(bytes.TrimRight(trailer[9:9+n], "\x00")), endpoint, args)
 	return p
+}
+
+// pcapngProcessArgs decodes standard EPB comments without touching packet bytes.
+// Missing or malformed argv never invalidates the independent PID/Comm trailer.
+func pcapngProcessArgs(block []byte, order binary.ByteOrder) *types.ProcessArgs {
+	const prefix = "eCapture argv v1 "
+	if len(block) < 32 {
+		return nil
+	}
+	length := uint64(order.Uint32(block[20:24]))
+	offset := uint64(28) + ((length + 3) &^ 3)
+	if offset > uint64(len(block)-4) {
+		return nil
+	}
+	options := block[offset : len(block)-4]
+	var result *types.ProcessArgs
+	for len(options) > 0 {
+		if len(options) < 4 {
+			return nil
+		}
+		code, n := order.Uint16(options), int(order.Uint16(options[2:]))
+		options = options[4:]
+		if code == 0 {
+			if n != 0 || len(options) != 0 {
+				return nil
+			}
+			break
+		}
+		padded := (n + 3) &^ 3
+		if padded > len(options) {
+			return nil
+		}
+		comment := string(options[:n])
+		options = options[padded:]
+		if code != 1 || !strings.HasPrefix(comment, prefix) {
+			continue
+		}
+		flag, data, ok := strings.Cut(strings.TrimPrefix(comment, prefix), " ")
+		if result != nil || !ok || (flag != "0" && flag != "1") || len(data) > 344 || strings.ContainsAny(data, "\r\n") {
+			return nil
+		}
+		args, err := base64.StdEncoding.Strict().DecodeString(data)
+		if err != nil || len(args) == 0 || len(args) > 256 || (flag == "0" && args[len(args)-1] != 0) || (flag == "1" && len(args) != 256) {
+			return nil
+		}
+		result = &types.ProcessArgs{Data: args, Truncated: flag == "1"}
+	}
+	return result
 }

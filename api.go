@@ -215,7 +215,8 @@ func (e *DecryptorEngine) processPcapng(ngReader *pcapgo.NgReader) error {
 		return e.processPcapngFileMode(ngReader)
 	} else {
 		// 流式模式：一次遍历，边读取边处理
-		return e.processPcapngStreamMode(ngReader)
+		blocks, _ := e.config.pcapReader.(*pcapngBlockReader)
+		return e.processPcapngStreamMode(ngReader, blocks)
 	}
 }
 
@@ -240,34 +241,19 @@ func (e *DecryptorEngine) processPcapngFileMode(_ *pcapgo.NgReader) error {
 	// 重新创建 reader 进行第二遍读取
 	options := pcapgo.DefaultNgReaderOptions
 	options.SkipUnknownVersion = true
-	ngReader2, err := pcapgo.NewNgReader(e.config.pcapReader, options)
+	blocks = &pcapngBlockReader{source: e.config.pcapReader}
+	ngReader2, err := pcapgo.NewNgReader(blocks, options)
 	if err != nil {
 		return err
 	}
 
-	// 第二遍：处理包
-	e.logger.Println("Second pass: processing packets...")
-	packetSource := gopacket.NewPacketSource(ngReader2, ngReader2.LinkType())
-	packetSource.NoCopy = true
-
-	packetCount := 0
-	for packet := range packetSource.Packets() {
-		packetCount++
-		if packetCount%100 == 0 {
-			e.logger.Printf("Processed %d packets so far...", packetCount)
-		}
-		e.processPacket(packet)
-	}
-	e.logger.Printf("Finished processing %d packets", packetCount)
-
-	// 等待所有解密 goroutine 完成
-	e.waitForAllConnections()
-	e.logger.Println("DecryptorEngine.Run() completed successfully")
-	return e.connectionError()
+	// Read synchronously: block metadata must be paired with its packet before
+	// another read can advance the observer to a later EPB.
+	return e.processPcapngStreamMode(ngReader2, blocks)
 }
 
 // processPcapngStreamMode 流式模式：一次遍历，边处理边提取 DSB
-func (e *DecryptorEngine) processPcapngStreamMode(ngReader *pcapgo.NgReader) (result error) {
+func (e *DecryptorEngine) processPcapngStreamMode(ngReader *pcapgo.NgReader, blocks *pcapngBlockReader) (result error) {
 	e.logger.Println("Using stream mode for pcapng processing")
 	e.logger.Println("Note: DSB blocks will be loaded incrementally as they are encountered")
 	defer func() {
@@ -292,7 +278,11 @@ func (e *DecryptorEngine) processPcapngStreamMode(ngReader *pcapgo.NgReader) (re
 		if packetCount%100 == 0 {
 			e.logger.Printf("Processed %d packets so far...", packetCount)
 		}
-		e.processPacket(packet)
+		var args *types.ProcessArgs
+		if blocks != nil {
+			args = blocks.packetArgs
+		}
+		e.processPacket(packet, args)
 	}
 
 	e.logger.Printf("Finished processing %d packets in streaming mode", packetCount)
@@ -357,7 +347,7 @@ func (e *DecryptorEngine) waitForAllConnections() {
 }
 
 // processPacket processes a single packet
-func (e *DecryptorEngine) processPacket(packet gopacket.Packet) {
+func (e *DecryptorEngine) processPacket(packet gopacket.Packet, argv ...*types.ProcessArgs) {
 	var tl types.TransportLayer
 	var ipLayer types.IPLayer
 
@@ -374,13 +364,13 @@ func (e *DecryptorEngine) processPacket(packet gopacket.Packet) {
 	if l := packet.Layer(layers.LayerTypeTCP); l != nil {
 		tcp, _ := l.(*layers.TCP)
 		tl = transport.NewTCPAdapter(tcp)
-		e.handlePacket(ipLayer, tl, packetTime, packetProcess(packet))
+		e.handlePacket(ipLayer, tl, packetTime, packetProcess(packet, argv...))
 	}
 
 	if l := packet.Layer(layers.LayerTypeUDP); l != nil {
 		udp, _ := l.(*layers.UDP)
 		tl = transport.NewUDPAdapter(udp)
-		e.handlePacket(ipLayer, tl, packetTime, packetProcess(packet))
+		e.handlePacket(ipLayer, tl, packetTime, packetProcess(packet, argv...))
 	}
 }
 
