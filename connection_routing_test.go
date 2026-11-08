@@ -489,3 +489,22 @@ func TestLateProcessAttributionDoesNotSplitTCPOrCrossGenerations(t *testing.T) {
 		}
 	})
 }
+
+func TestTLSObservationSnapshotsAndLayerIsolation(t *testing.T) {
+	ci := types.ConnectionKey{TLS: &types.ConnectionTLS{}}
+	ci.TLS.Observe(map[string]string{"ja3": "first"})
+	first := types.NewDecryptedPacket("tcp", "http/1.1", "request", nil, time.Time{}, ci)
+	ci.TLS.Observe(map[string]string{"alpn": "h2"})
+	second := types.NewDecryptedPacket("tcp", "http/2", "response", nil, time.Time{}, ci.Reverse())
+	if first.Metadata["tls"].(map[string]string)["alpn"] != "" || second.Metadata["tls"].(map[string]string)["alpn"] != "h2" {
+		t.Fatal("observations not captured as independent snapshots")
+	}
+	second.Metadata["tls"].(map[string]string)["ja3"] = "modified"
+	if ci.TLS.Snapshot()["ja3"] != "first" {
+		t.Fatal("callback mutated connection state")
+	}
+	nested := transport.NewTLSDecryptor(ci, nil, io.Discard, io.Discard, log.New(io.Discard, "", 0), nil)
+	if len(nested.ConnectionInfo.TLS.Snapshot()) != 0 || ci.TLS.Snapshot()["ja3"] != "first" {
+		t.Fatal("nested TLS layer inherited handshake observations")
+	}
+}

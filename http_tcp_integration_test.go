@@ -65,6 +65,13 @@ func TestDecryptTCPHTTPCaptures(t *testing.T) {
 				if packet.Protocol != tc.protocol {
 					continue
 				}
+				tls, ok := packet.Metadata["tls"].(map[string]string)
+				if !ok || tls["version"] != "TLS 1.3" || len(tls["ja3"]) != 32 || !strings.HasPrefix(tls["ja4"], "t13") || tls["cipher_suite"] == "" {
+					t.Fatalf("missing captured TLS handshake metadata: %v", tls)
+				}
+				if tc.protocol == "http/1.1" && (tls["ja3"] != "725543c78edf669194c11dc7a039b56e" || tls["ja4"] != "t13i131000_f57a46bbacb6_ab7e3b40a677") {
+					t.Fatal("fingerprints disagree with independent tshark fixture results")
+				}
 				logDecryptedPreview(t, packet)
 				if packet.Transport != types.TransportProtocolTCP {
 					t.Fatalf("transport=%q, want TCP", packet.Transport)

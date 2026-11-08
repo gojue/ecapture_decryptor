@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -68,6 +69,14 @@ func TestDecryptHTTP3QUICCapture(t *testing.T) {
 				if packet.Protocol != "http/3" {
 					continue
 				}
+				tls, ok := packet.Metadata["tls"].(map[string]string)
+				if !ok || len(tls["ja3"]) != 32 || !strings.HasPrefix(tls["ja4"], "q13") {
+					t.Fatalf("missing QUIC client fingerprint: %v", tls)
+				}
+				if tc.loopback && (tls["ja3"] != "aeb4a42cd7925b343b143434a712dd00" || tls["ja4"] != "q13d0313h3_55b375c5d22e_f902b76752af") {
+					t.Fatal("QUIC fingerprints disagree with independent tshark fixture results")
+				}
+
 				logDecryptedPreview(t, packet)
 				if packet.Transport != types.TransportProtocolUDP {
 					t.Fatalf("HTTP/3 packet transport = %q, want UDP", packet.Transport)
@@ -848,6 +857,12 @@ func checkHTTP3DynamicCaptureAPIs(t *testing.T, base string) {
 					}
 				}
 				messages := make(map[string][]*types.DecryptedPacket)
+				for _, p := range output {
+					tls, ok := p.Metadata["tls"].(map[string]string)
+					if !ok || len(tls["ja3"]) != 32 || !strings.HasPrefix(tls["ja4"], "q13") {
+						t.Fatal("captured output lost TLS fingerprint")
+					}
+				}
 				if raw {
 					parsers := make(map[string]*protocol.HTTP3StreamParser)
 					channels := make(map[string]chan *types.DecryptedPacket)
@@ -954,7 +969,11 @@ func checkHTTP3DynamicCaptureAPIs(t *testing.T, base string) {
 								t.Fatal("final", p.Metadata, body)
 							}
 						}
-						got[key] = semantic{p.Metadata, body}
+						metadata := maps.Clone(p.Metadata)
+						// Plaintext-only reconstruction has no TLS parser. Handshake
+						// observations are validated separately on the captured output.
+						delete(metadata, "tls")
+						got[key] = semantic{metadata, body}
 					}
 				}
 				if reference == nil {

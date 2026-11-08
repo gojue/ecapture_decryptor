@@ -168,6 +168,7 @@ func (b *QUICBuffer) Close() {
 
 // NewQUICDecryptor creates a new QUIC decryptor
 func NewQUICDecryptor(ci types.ConnectionKey, keyLog *crypto.KeyLogStore, logger *log.Logger, _ io.Writer, packetChan chan *types.DecryptedPacket) types.Decryptor {
+	ci.TLS = &types.ConnectionTLS{}
 	q := &QUICDecryptor{
 		connectionInfo: ci,
 		keyLog:         keyLog,

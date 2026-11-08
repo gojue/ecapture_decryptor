@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/gojue/ecapture_decryptor/crypto"
 	"github.com/gojue/ecapture_decryptor/protocol"
 	"github.com/gojue/ecapture_decryptor/types"
 )
@@ -387,7 +388,7 @@ func (q *QUICDecryptor) parseQUICFrames(plaintext []byte, level int, isClient bo
 }
 
 func (q *QUICDecryptor) observeClientCrypto(offset uint64, data []byte) error {
-	if len(q.flow.clientRandom) != 0 {
+	if q.flow.clientHelloDone {
 		return nil
 	}
 	parts, _, err := q.flow.clientCrypto.push(offset, data, false)
@@ -408,8 +409,20 @@ func (q *QUICDecryptor) observeClientCrypto(offset uint64, data []byte) error {
 			q.options.Report(q.connectionInfo, "handshake", "invalid_client_hello")
 			return fmt.Errorf("QUIC CRYPTO starts with TLS handshake type 0x%x, want ClientHello", hello[0])
 		}
-		q.flow.clientRandom = bytes.Clone(hello[6:38])
-		q.flow.clientHello.Reset()
+		if len(q.flow.clientRandom) == 0 {
+			q.flow.clientRandom = bytes.Clone(hello[6:38])
+		}
+		size := 4 + int(hello[1])<<16 + int(hello[2])<<8 + int(hello[3])
+		if size > maxQUICStreamBytes {
+			return errQUICStreamLimit
+		}
+		if len(hello) >= size {
+			if q.connectionInfo.TLS.Snapshot()["ja3"] == "" {
+				q.connectionInfo.TLS.Observe(crypto.ClientHelloMetadata(hello[:size], "q"))
+			}
+			q.flow.clientHelloDone = true
+			q.flow.clientHello.Reset()
+		}
 	}
 	return nil
 }
@@ -563,6 +576,7 @@ func (q *QUICDecryptor) observeServerCrypto(level int, offset uint64, data []byt
 				return errors.New("invalid QUIC ServerHello")
 			}
 			q.flow.cipherSuite = binary.BigEndian.Uint16(body[35+int(body[34]):])
+			q.connectionInfo.TLS.Observe(crypto.ServerHelloMetadata(msg[:size+4]))
 			buffer.Reset()
 			return nil
 		}
@@ -601,6 +615,7 @@ func (q *QUICDecryptor) observeServerCrypto(level int, offset uint64, data []byt
 				}
 				ext = ext[4+n:]
 			}
+			q.connectionInfo.TLS.Observe(crypto.EncryptedExtensionsMetadata(msg[:size+4]))
 			q.flow.early.status = status
 			buffer.Reset()
 			if q.flow.early.seen {

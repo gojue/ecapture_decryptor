@@ -568,3 +568,84 @@ func FuzzHelloParsing(f *testing.F) {
 		_, _ = ReadClientHelloRetry(s, func([]byte) error { return nil })
 	})
 }
+
+func TestClientHelloFingerprints(t *testing.T) {
+	// JA4's published example, with a real extension body for each parsed field.
+	suites := []uint16{0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035}
+	ids := []uint16{0x001b, 0, 0x0033, 0x0010, 0x4469, 0x0017, 0x002d, 0x000d, 5, 0x0023, 0x0012, 0x002b, 0xff01, 0x000b, 0x000a, 0x0015}
+	bodies := map[uint16][]byte{0: {0, 6, 0, 0, 3, 'a', '.', 'b'}, 16: {0, 3, 2, 'h', '2'}, 13: {0, 16, 4, 3, 8, 4, 4, 1, 5, 3, 8, 5, 5, 1, 8, 6, 6, 1}, 43: {4, 3, 4, 3, 3}, 11: {1, 0}, 10: {0, 6, 0, 29, 0, 23, 0, 24}}
+	makeHello := func(ciphers, exts []uint16) []byte {
+		body := append([]byte{3, 3}, make([]byte, 32)...)
+		body = append(body, 0, byte(len(ciphers)*2>>8), byte(len(ciphers)*2))
+		for _, v := range ciphers {
+			body = append(body, byte(v>>8), byte(v))
+		}
+		body = append(body, 1, 0)
+		var extensions []byte
+		for _, id := range exts {
+			extensions = append(extensions, helloTestExtension(id, bodies[id])...)
+		}
+		body = append(body, byte(len(extensions)>>8), byte(len(extensions)))
+		return handshakeEncoding(1, append(body, extensions...))
+	}
+	hello := makeHello(suites, ids)
+	m := ClientHelloMetadata(hello, "t")
+	if m["ja4"] != "t13d1516h2_8daaf6152771_e5627efa2ab1" || m["server_name"] != "a.b" || m["alpn"] != "" {
+		t.Fatalf("wrong fingerprint/offer semantics: %v", m)
+	}
+	grease := ClientHelloMetadata(makeHello(append([]uint16{0x0a0a}, suites...), append([]uint16{0x2a2a}, ids...)), "t")
+	if grease["ja3"] != m["ja3"] || grease["ja4"] != m["ja4"] {
+		t.Fatal("GREASE affected fingerprint")
+	}
+	reversed := append([]uint16(nil), ids...)
+	for i, j := 0, len(reversed)-1; i < j; i, j = i+1, j-1 {
+		reversed[i], reversed[j] = reversed[j], reversed[i]
+	}
+	other := ClientHelloMetadata(makeHello(suites, reversed), "t")
+	if other["ja4"] != m["ja4"] || other["ja3"] == m["ja3"] {
+		t.Fatal("JA3/JA4 extension ordering semantics wrong")
+	}
+	quic := ClientHelloMetadata(hello, "q")
+	if quic["ja4"] != "q"+m["ja4"][1:] {
+		t.Fatal("QUIC transport marker lost")
+	}
+	for n := 0; n < len(hello); n++ {
+		if ClientHelloMetadata(hello[:n], "t") != nil {
+			t.Fatalf("accepted truncated hello at %d", n)
+		}
+	}
+	for _, test := range []struct {
+		value []byte
+		want  string
+	}{{[]byte{0xab}, "ab"}, {[]byte{0x30, 0xab}, "3b"}, {[]byte{'h'}, "hh"}} {
+		bodies[16] = append([]byte{0, byte(len(test.value) + 1), byte(len(test.value))}, test.value...)
+		got := ClientHelloMetadata(makeHello(suites, ids), "t")["ja4"]
+		if len(got) < 10 || got[8:10] != test.want {
+			t.Fatalf("ALPN fingerprint tag %q", got)
+		}
+	}
+}
+
+func TestNegotiatedHandshakeMetadata(t *testing.T) {
+	ext := append(helloTestExtension(43, []byte{3, 4}), helloTestExtension(51, []byte{0, 29, 0, 1, 1})...)
+	server := helloTestServer(make([]byte, 32), ext)
+	got := ServerHelloMetadata(server)
+	if got["version"] != "TLS 1.3" || got["cipher_suite"] != "TLS_AES_128_GCM_SHA256" || got["key_exchange_group"] != "X25519" || got["alpn"] != "" {
+		t.Fatalf("bad negotiated metadata: %v", got)
+	}
+	ee := helloTestExtension(16, []byte{0, 3, 2, 'h', '2'})
+	ee = handshakeEncoding(8, append([]byte{0, byte(len(ee))}, ee...))
+	if EncryptedExtensionsMetadata(ee)["alpn"] != "h2" {
+		t.Fatal("authenticated ALPN missing")
+	}
+	for n := 0; n < len(server); n++ {
+		if ServerHelloMetadata(server[:n]) != nil {
+			t.Fatalf("accepted partial server hello %d", n)
+		}
+	}
+	for n := 0; n < len(ee); n++ {
+		if EncryptedExtensionsMetadata(ee[:n]) != nil {
+			t.Fatalf("accepted partial EE %d", n)
+		}
+	}
+}

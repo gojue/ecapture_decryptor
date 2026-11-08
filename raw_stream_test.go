@@ -2110,7 +2110,14 @@ func TestHTTP3DynamicEventCaptureAPIs(t *testing.T) {
 				if !ok {
 					t.Fatal("missing headers")
 				}
-				metadata := p.Metadata
+				tls, ok := p.Metadata["tls"].(map[string]string)
+				if !ok || len(tls["ja3"]) != 32 || !strings.HasPrefix(tls["ja4"], "q13") || tls["alpn"] != "" && tls["alpn"] != "h3" {
+					t.Fatal("invalid captured TLS snapshot")
+				}
+				metadata := maps.Clone(p.Metadata)
+				// Late handshake keys can reveal ALPN after an application event;
+				// compare application semantics, without rewriting prior snapshots.
+				delete(metadata, "tls")
 				if p.Direction == "response" && id&2 == 0 {
 					// Ordinary response authority is optional request context, not
 					// a response pseudo-header. Server keys may arrive first.

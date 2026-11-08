@@ -39,6 +39,8 @@ The SDK only decrypts and parses protocols — it does not impose an output form
 
 Capture-side process metadata can include PID, name, and up to 256 argv bytes with an explicit truncation flag; see the [metadata contract](docs/API.md#pid--pname-归属).
 
+TLS handshake observations (JA3/JA4, SNI and negotiated parameters) are available as optional per-event snapshots; see [the metadata contract](docs/API.md#tls-握手快照).
+
 # Features
 
 - 🔓 **Decrypt TLS/QUIC traffic**: supports external SSLKEYLOG files and pcapng-embedded DSB

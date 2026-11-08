@@ -436,6 +436,7 @@ func (td *TLSDecryptor) handleTLS13Handshake(s *tls13Direction, data []byte, cli
 				}
 				ext = ext[4+n:]
 			}
+			td.ConnectionInfo.TLS.Observe(crypto.EncryptedExtensionsMetadata(message))
 			s.ee = true
 			status := "rejected"
 			if accepted {
@@ -443,6 +444,10 @@ func (td *TLSDecryptor) handleTLS13Handshake(s *tls13Direction, data []byte, cli
 			}
 			if err := td.resolveTLSEarly(status); err != nil {
 				return err
+			}
+		case 15: // Metadata only, from an authenticated server CertificateVerify.
+			if !client && phase == tls13Handshake {
+				td.ConnectionInfo.TLS.Observe(crypto.CertificateVerifyMetadata(message))
 			}
 		case 20: // Finished ends the handshake epoch only after its full body.
 			config, _ := crypto.GetCipherSuite(td.cipherSuite)

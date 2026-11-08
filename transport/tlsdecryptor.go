@@ -187,6 +187,8 @@ func (td *TLSDecryptor) emitRawLocked(data []byte, direction string, end bool, e
 
 // NewTLSDecryptor 创建 TLS 解密器
 func NewTLSDecryptor(ci types.ConnectionKey, keyLog *crypto.KeyLogStore, clientOut, serverOut io.Writer, logger *log.Logger, packetChan chan *types.DecryptedPacket) *TLSDecryptor {
+	// Each nested TLS layer owns a distinct handshake state.
+	ci.TLS = &types.ConnectionTLS{}
 	td := &TLSDecryptor{
 		ConnectionInfo: ci,
 		keyLog:         keyLog,
@@ -842,6 +844,7 @@ func (td *TLSDecryptor) parseHandshake() error {
 		return fmt.Errorf("extract client random: %w", err)
 	}
 
+	td.ConnectionInfo.TLS.Observe(crypto.ClientHelloMetadata(hello.Message, "t"))
 	clientRandom := hello.Random
 	td.logger.Printf("Client Random: %s", hex.EncodeToString(clientRandom))
 
@@ -897,6 +900,7 @@ func (td *TLSDecryptor) parseHandshake() error {
 		return fmt.Errorf("unsupported cipher suite 0x%04x", cipherSuite)
 	}
 
+	td.ConnectionInfo.TLS.Observe(crypto.ServerHelloMetadata(serverHelloHandshake))
 	td.logger.Printf("TLS Version: 0x%04x, Cipher Suite: 0x%04x", version, cipherSuite)
 
 	// Get secrets from key log
