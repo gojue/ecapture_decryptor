@@ -662,6 +662,22 @@ QPACK、SETTINGS 和消息顺序错误报告 `protocol/parse_failed`，不归为
 
 单条编码消息和展开结果各限 16 MiB；每连接所有未完成 gRPC 消息的已接收 payload 共限 32 MiB，活动流仍适用 HTTP/2 限额。完整消息在 END_STREAM/EOF 前交付并释放，累计流长可超过 16 MiB。只拼接 body_chunk 才能还原 HTTP 正文，grpc_message 是额外语义视图。单元测试覆盖 unary/client/server/bidi streaming、长流和边界；独立 hyper-h2 + Python gzip 实际 TLS 流量覆盖四类调用、双向压缩、错误 trailers 和 trailers-only。基线为 [gRPC HTTP/2 协议](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md)。
 
+### TLS 握手快照
+
+TCP TLS 与 QUIC 的 `Metadata["tls"]` 是 `map[string]string`，每个回调持有独立副本。
+包括首次线上 ClientHello 的 `ja3`、`ja3_raw`（最多 8192 字符）、`ja4`、`server_name`、
+`offered_alpn`、`client_hello`，以及实际观察的 `version`、`cipher_suite`、`cipher_suite_id`、
+`alpn`、`key_exchange_group`、`signature_algorithm`。缺失字段不填充，不从应用协议推断。
+JA3/JA4 忽略 GREASE；JA4 按 [官方规范](https://github.com/FoxIO-LLC/ja4/blob/main/technical_details/JA4.md)
+排序，客户端 ALPN 与已协商 ALPN 分开。HRR 不覆盖初次指纹，ECH 标记 `initial_outer` 并使用
+线上 Outer；未使用 ECH 时为 `initial_wire`。服务端 TLS 1.3 ALPN/签名算法仅取已认证握手记录。
+TLS 1.2 尚不提取 ServerKeyExchange 的组/签名，QUIC 尚不输出 CertificateVerify 签名算法。
+没有密钥、random 或证书信任结论。DTLS 暂不输出此快照。
+
+迟到握手 secrets 可能在后续事件才补齐 ALPN；已经发出的快照不会被改写。
+TCP 连接代次与嵌套 TLS 层各自隔离，QUIC Retry 保留首次指纹。
+应用协议解析器直接消费明文时没有 TLS 上下文；不应将其元数据与完整解密输出逐字段等同。
+
 ### TLS 版本与状态
 
 TCP TLS 接受 TLS 1.2/1.3，必须有捕获到的 ClientHello、ServerHello 和对应 keylog；不会从任意密文位置猜测 record 序号，也不遍历其他连接的 secrets。cipher registry 的条目不等于所有版本/状态已经验证。此处的认证指 record AEAD/MAC（以及 ECH payload/accept_confirmation），不是完整的证书链、Finished transcript 或对端身份验证。

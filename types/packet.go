@@ -98,6 +98,9 @@ func NewDecryptedPacket(tProtocol, protocol, direction string, data []byte, time
 	if ci.Process != nil {
 		p.PID, p.PName, p.ProcessArgs = ci.Process.identity(direction)
 	}
+	if metadata := ci.TLS.Snapshot(); len(metadata) > 0 {
+		p.Metadata["tls"] = metadata
+	}
 	if direction == "response" {
 		p.SrcIP, p.DstIP = p.DstIP, p.SrcIP
 		p.SrcPort, p.DstPort = p.DstPort, p.SrcPort
@@ -237,4 +240,42 @@ func (p *ConnectionProcess) identity(direction string) (int64, string, *ProcessA
 		return 0, "", nil
 	}
 	return int64(old.pid), old.name, old.args.clone()
+}
+
+// ConnectionTLS holds non-secret handshake observations. Application callbacks
+// receive independent snapshots; later observations never mutate emitted events.
+type ConnectionTLS struct {
+	mu     sync.RWMutex
+	fields map[string]string
+}
+
+func (c *ConnectionTLS) Observe(fields map[string]string) {
+	if c == nil || len(fields) == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.fields == nil {
+		c.fields = make(map[string]string)
+	}
+	for key, value := range fields {
+		if value != "" {
+			c.fields[key] = value
+		}
+	}
+}
+func (c *ConnectionTLS) Snapshot() map[string]string {
+	if c == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.fields) == 0 {
+		return nil
+	}
+	result := make(map[string]string, len(c.fields))
+	for key, value := range c.fields {
+		result[key] = value
+	}
+	return result
 }

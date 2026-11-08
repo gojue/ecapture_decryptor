@@ -59,6 +59,8 @@ type ConnectionKey struct {
 	Generation  uint64
 	// Process holds mutable observations; it is deliberately excluded from String.
 	Process *ConnectionProcess `json:"-"`
+	// TLS is scoped to a transport generation and TLS layer, not process identity.
+	TLS *ConnectionTLS `json:"-"`
 }
 
 func (k ConnectionKey) String() string {
@@ -77,6 +79,7 @@ func (k ConnectionKey) Reverse() ConnectionKey {
 		ProcessName: k.ProcessName,
 		Generation:  k.Generation,
 		Process:     k.Process,
+		TLS:         k.TLS,
 	}
 }
 

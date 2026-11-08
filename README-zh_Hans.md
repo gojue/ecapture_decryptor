@@ -39,6 +39,8 @@ SDK 只负责解密与协议解析，不强制输出格式。结果以 `Decrypte
 
 采集端进程元信息可包含 PID、名称及最多 256 字节的 argv 和截断标记，详见[元信息契约](docs/API.md#pid--pname-归属)。
 
+TLS 握手信息（JA3/JA4、SNI 与协商参数）通过每个事件的可选独立快照输出，详见[元数据契约](docs/API.md#tls-握手快照)。
+
 # 特性
 
 - 🔓 **解密 TLS/QUIC 流量**：支持外部 SSLKEYLOG 文件和 pcapng 内嵌 DSB

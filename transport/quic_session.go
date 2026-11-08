@@ -91,6 +91,7 @@ type quicFlowState struct {
 	serverCID       []byte
 	clientCrypto    quicStreamAssembler
 	clientHello     bytes.Buffer
+	clientHelloDone bool
 	streams         map[quicStreamKey]*quicStreamAssembler
 	keys            [2][4][]*QUICKeys
 	keyPhase        [2]quicKeyPhaseState
@@ -800,6 +801,7 @@ func (q *QUICDecryptor) processQUICInitial(packet quicPacket, isClient bool, at 
 		q.clientInitialKeys, q.serverInitialKeys = client, server
 		q.flow.clientCrypto, q.flow.clientHello = quicStreamAssembler{}, bytes.Buffer{}
 		q.flow.clientRandom = nil
+		q.flow.clientHelloDone = false
 		if first || versionChange {
 			hs.originalDCID = bytes.Clone(packet.dcid)
 		}
