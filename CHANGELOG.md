@@ -1,3 +1,13 @@
+# v1.4.2 (2026-11-08)
+
+## Added
+
+* pcapng: preserve captured process arguments. See [PR #20](https://github.com/gojue/ecapture_decryptor/pull/20).
+
+**Full Changelog**: https://github.com/gojue/ecapture_decryptor/compare/v1.4.1...v1.4.2
+
+<hr>
+
 # v1.4.1 (2026-11-07)
 
 ## Fixed
