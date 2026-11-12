@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./images/ecapture-decryptor-logo.png" alt="eCapture Decryptor" width="150" />
+  <img src="./images/ecapture-decryptor-logo.png" alt="eCapture Decryptor" width="180" />
 </p>
 
 <p align="center">
