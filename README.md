@@ -1,4 +1,8 @@
 <p align="center">
+  <img src="./images/ecapture-decryptor-logo.png" alt="eCapture Decryptor" width="150" />
+</p>
+
+<p align="center">
   <strong>eCapture Decryptor</strong><br />
   A Go library that decrypts TLS/QUIC traffic from pcapng captures using SSLKEYLOG keys or pcapng-embedded TLS Decryption Secrets Blocks (DSB).
 </p>

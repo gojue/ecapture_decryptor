@@ -1,4 +1,8 @@
 <p align="center">
+  <img src="./images/ecapture-decryptor-logo.png" alt="eCapture Decryptor" width="150" />
+</p>
+
+<p align="center">
   <strong>eCapture Decryptor</strong><br />
   使用 SSLKEYLOG 密钥或 pcapng 内嵌的 TLS Decryption Secrets Block（DSB）解密 pcapng 中 TLS/QUIC 流量的 Go 语言库。
 </p>
