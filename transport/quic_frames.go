@@ -411,6 +411,7 @@ func (q *QUICDecryptor) observeClientCrypto(offset uint64, data []byte) error {
 		}
 		if len(q.flow.clientRandom) == 0 {
 			q.flow.clientRandom = bytes.Clone(hello[6:38])
+			q.keyLog.GetSecrets(q.flow.clientRandom)
 		}
 		size := 4 + int(hello[1])<<16 + int(hello[2])<<8 + int(hello[3])
 		if size > maxQUICStreamBytes {
@@ -740,6 +741,10 @@ func (q *QUICDecryptor) quicWaitExpired() error {
 		if err := q.finishQUICEarly(); err != nil {
 			return err
 		}
+	}
+	if q.identityWaitExpired() {
+		q.options.Report(q.connectionInfo, "handshake", "identity_timeout")
+		return errors.New("QUIC identity discovery deadline exceeded")
 	}
 	q.options.Report(q.connectionInfo, "keys", "key_wait_timeout")
 	return errors.New("timed out waiting for QUIC secrets")

@@ -26,14 +26,25 @@ import (
 	"github.com/google/gopacket/pcapgo"
 )
 
+// Error categories are independent: an input failure and earlier connection
+// failures can both be present. Inspect errors.Is rather than error strings.
+var (
+	ErrConnectionFailures = errors.New("one or more connections failed")
+	ErrPipelineFailure    = errors.New("decryption input pipeline failed")
+	ErrStreamCanceled     = errors.New("decryption stream canceled")
+	ErrEmitFailed         = errors.New("decryption output callback failed")
+)
+
 // DecryptorConfig 解密器配置
 type DecryptorConfig struct {
-	sslKeyLogger io.Reader
-	pcapReader   io.Reader
-	packetChan   chan *types.DecryptedPacket
-	logger       *log.Logger
-	strictPcapng bool
-	options      types.DecryptOptions
+	sslKeyLogger  io.Reader
+	pcapReader    io.Reader
+	packetChan    chan *types.DecryptedPacket
+	logger        *log.Logger
+	strictPcapng  bool
+	streamingKeys bool
+	legacyPcap    bool
+	options       types.DecryptOptions
 }
 
 // WithOptions selects raw output and optional connection diagnostics.
@@ -78,6 +89,7 @@ func DecryptLiveTraffic(keylogReader io.Reader, pcapHandle io.Reader, packetChan
 		WithPcapReader(pcapHandle).
 		WithPacketChan(packetChan)
 
+	config.streamingKeys = true
 	return DecryptWithConfig(config)
 }
 
@@ -104,13 +116,19 @@ func DecryptWithConfig(config *DecryptorConfig) error {
 		config.logger = log.New(os.Stdout, "", 0)
 	}
 
-	keyLog, err := crypto.NewKeyLogStoreFromReader(config.sslKeyLogger)
-	if err != nil {
-		return err
+	keyLog := crypto.NewKeyLogStore()
+	if config.streamingKeys {
+		keyLog = crypto.NewStreamingKeyLogStore(config.options.ConnectionIdleTimeout())
 	}
+	if config.sslKeyLogger != nil {
+		if err := keyLog.LoadFromReader(config.sslKeyLogger); err != nil {
+			return fmt.Errorf("%w: %w", ErrPipelineFailure, err)
+		}
+	}
+	config.legacyPcap = false
 	// A non-seekable pcapng source cannot be scanned twice. Observe DSB blocks
 	// while the packet reader advances, including a DSB after the last packet.
-	if _, seekable := config.pcapReader.(io.Seeker); !seekable && config.pcapReader != nil {
+	if _, seekable := config.pcapReader.(io.Seeker); (!seekable || config.streamingKeys) && config.pcapReader != nil {
 		buffered := bufio.NewReader(config.pcapReader)
 		config.pcapReader = buffered
 		if magic, err := buffered.Peek(4); err == nil && bytes.Equal(magic, []byte{0x0a, 0x0d, 0x0d, 0x0a}) {
@@ -118,6 +136,10 @@ func DecryptWithConfig(config *DecryptorConfig) error {
 				_, err := keyLog.Write(payload)
 				return err
 			}}
+		} else {
+			// Peek has consumed bytes from the underlying reader. Read legacy pcap
+			// directly through this buffer instead of first probing it as pcapng.
+			config.legacyPcap = true
 		}
 	}
 
@@ -169,20 +191,35 @@ func (e *DecryptorEngine) recordConnectionError(err error) {
 func (e *DecryptorEngine) connectionError() error {
 	e.errMu.Lock()
 	defer e.errMu.Unlock()
-	return errors.Join(e.connectionErrs...)
+	if len(e.connectionErrs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", ErrConnectionFailures, errors.Join(e.connectionErrs...))
 }
 
 // Run 运行解密引擎
-func (e *DecryptorEngine) Run() error {
+func (e *DecryptorEngine) Run() (result error) {
+	defer func() {
+		if result != nil {
+			result = fmt.Errorf("%w: %w", ErrPipelineFailure, result)
+		}
+		result = errors.Join(result, e.connectionError())
+	}()
 	e.logger.Println("DecryptorEngine.Run() started")
 	stopReaper := e.startIdleReaper()
 	defer stopReaper()
+	if e.config.legacyPcap {
+		return e.processLegacyPcap()
+	}
 
 	// 首先尝试使用 pcapng reader（它也支持提取解密密钥）
 	e.logger.Println("Attempting to open as pcapng format...")
 	options := pcapgo.DefaultNgReaderOptions
 	options.SkipUnknownVersion = true
 	ngReader, err := pcapgo.NewNgReader(e.config.pcapReader, options)
+	if errors.Is(err, crypto.ErrKeyLogResourceLimit) {
+		return err
+	}
 	if err != nil || ngReader == nil {
 		if e.config.strictPcapng {
 			if err == nil {
@@ -253,13 +290,10 @@ func (e *DecryptorEngine) processPcapngFileMode(_ *pcapgo.NgReader) error {
 }
 
 // processPcapngStreamMode 流式模式：一次遍历，边处理边提取 DSB
-func (e *DecryptorEngine) processPcapngStreamMode(ngReader *pcapgo.NgReader, blocks *pcapngBlockReader) (result error) {
+func (e *DecryptorEngine) processPcapngStreamMode(ngReader *pcapgo.NgReader, blocks *pcapngBlockReader) error {
 	e.logger.Println("Using stream mode for pcapng processing")
 	e.logger.Println("Note: DSB blocks will be loaded incrementally as they are encountered")
-	defer func() {
-		e.waitForAllConnections()
-		result = errors.Join(result, e.connectionError())
-	}()
+	defer e.waitForAllConnections()
 
 	e.logger.Println("Processing packets in streaming mode...")
 	packetCount := 0
@@ -314,12 +348,19 @@ func (e *DecryptorEngine) processLegacyPcap() error {
 
 	e.logger.Printf("Successfully opened legacy pcap format, link type: %v", pcapReader.LinkType())
 
-	packetSource := gopacket.NewPacketSource(pcapReader, pcapReader.LinkType())
-	packetSource.NoCopy = true
-
+	defer e.waitForAllConnections()
 	e.logger.Println("Processing packets from legacy pcap...")
 	packetCount := 0
-	for packet := range packetSource.Packets() {
+	for {
+		data, ci, err := pcapReader.ReadPacketData()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		packet := gopacket.NewPacket(data, pcapReader.LinkType(), gopacket.Default)
+		packet.Metadata().Timestamp = ci.Timestamp
 		packetCount++
 		if packetCount%100 == 0 {
 			e.logger.Printf("Processed %d packets so far...", packetCount)
@@ -328,10 +369,8 @@ func (e *DecryptorEngine) processLegacyPcap() error {
 	}
 	e.logger.Printf("Finished processing %d packets from legacy pcap", packetCount)
 
-	// 等待所有解密 goroutine 完成
-	e.waitForAllConnections()
 	e.logger.Println("DecryptorEngine.Run() completed successfully")
-	return e.connectionError()
+	return nil
 }
 
 // waitForAllConnections 等待所有连接处理完成，带超时保护

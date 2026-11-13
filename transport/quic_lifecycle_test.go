@@ -7,11 +7,13 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/gojue/ecapture_decryptor/crypto"
 	"github.com/gojue/ecapture_decryptor/types"
 )
 
@@ -58,6 +60,7 @@ func TestQUICKeyWaitDeadline(t *testing.T) {
 				})
 				q.version = quicVersion1
 				q.flow.clientRandom = bytes.Repeat([]byte{0x44}, 32)
+				q.flow.clientHelloDone = true // This test starts after a complete ClientHello.
 				randomHex := hex.EncodeToString(q.flow.clientRandom)
 				clientSecret, serverSecret := bytes.Repeat([]byte{0x11}, 32), bytes.Repeat([]byte{0x22}, 32)
 				client, server := quicLifecyclePacket(t, clientSecret), quicLifecyclePacket(t, serverSecret)
@@ -98,8 +101,12 @@ func TestQUICKeyWaitDeadline(t *testing.T) {
 					default:
 						t.Fatal("missing or partial keys did not terminate at the original deadline")
 					}
+					stage, code := "keys", "key_wait_timeout"
+					if mode == "missing" {
+						stage, code = "handshake", "identity_timeout"
+					}
 					if time.Since(started) != 10*time.Second || len(diagnostics) != 1 ||
-						diagnostics[0].Stage != "keys" || diagnostics[0].Code != "key_wait_timeout" {
+						diagnostics[0].Stage != stage || diagnostics[0].Code != code {
 						t.Fatalf("timeout timing/diagnostics: elapsed=%s diagnostics=%+v", time.Since(started), diagnostics)
 					}
 				} else {
@@ -575,4 +582,189 @@ func TestQUICQPACKWaitDeadline(t *testing.T) {
 		}
 		assertQUICReleased(t, q)
 	})
+}
+
+func TestQUICIdentityDeadlineDoesNotRenew(t *testing.T) {
+	for _, mode := range []string{"partial_hello", "retry", "version_negotiation"} {
+		t.Run(mode, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var diagnostics []types.Diagnostic
+				q, _ := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true, KeyWaitTimeout: 10 * time.Second,
+					OnDiagnostic: func(d types.Diagnostic) { diagnostics = append(diagnostics, d) },
+				})
+				store := crypto.NewStreamingKeyLogStore(time.Minute)
+				q.keyLog = store.NewConnectionScope()
+				// A completed connection's secret is protected by this pending
+				// worker until its absolute identity deadline, even with no keys
+				// or encrypted application packets waiting in the QUIC queue.
+				if _, err := fmt.Fprintln(store, "CLIENT_RANDOM aa 01"); err != nil {
+					t.Fatal(err)
+				}
+				previous := store.NewConnectionScope()
+				previous.GetSecrets([]byte{0xaa})
+				previous.ReleaseKeyReferences()
+				original := mustDecodeHex(t, "8394c8f03e515708")
+				version := uint32(quicVersion1)
+				if mode == "version_negotiation" {
+					version = quicVersion2
+				}
+				key, _ := quicInitialKeys(version, original)
+				initial := quicLongTestPacket(t, version, QUICPacketTypeInitial, original, nil, nil, key, 0, []byte{6, 0, 3, 1, 0, 0})
+				if err := q.FeedClient(initial.data); err != nil {
+					t.Fatal(err)
+				}
+				done := make(chan error, 1)
+				go func() { done <- q.Decrypt() }()
+				defer func() { _ = q.Close(); synctest.Wait() }()
+				synctest.Wait()
+				if q.flow.clientCrypto.next != 3 || !q.flow.pendingSince.IsZero() || store.GetSecrets([]byte{0xaa}) == nil {
+					t.Fatal("partial Initial did not retain discovery protection without a key wait")
+				}
+				time.Sleep(9 * time.Second)
+				switch mode {
+				case "retry":
+					retry := mustDecodeHex(t, "ff000000010008f067a5502a4262b5746f6b656e04a265ba2eff4d829058fb3f0f2496ba")
+					if err := q.FeedServer(retry); err != nil {
+						t.Fatal(err)
+					}
+					synctest.Wait()
+					if q.flow.handshake.retry == nil {
+						t.Fatal("Retry was not observed")
+					}
+				case "version_negotiation":
+					vn := append([]byte{0x80, 0, 0, 0, 0, 0, byte(len(original))}, original...)
+					vn = append(vn, 0, 0, 0, 1)
+					if err := q.FeedServer(vn); err != nil {
+						t.Fatal(err)
+					}
+					key, _ = quicInitialKeys(quicVersion1, original)
+					selected := quicLongTestPacket(t, quicVersion1, QUICPacketTypeInitial, original, nil, nil, key, 0, []byte{6, 0, 3, 1, 0, 0})
+					if err := q.FeedClient(selected.data); err != nil {
+						t.Fatal(err)
+					}
+					synctest.Wait()
+					if q.version != quicVersion1 {
+						t.Fatal("version switch was not authenticated")
+					}
+				default:
+					if err := q.FeedClient(initial.data); err != nil {
+						t.Fatal(err)
+					}
+				}
+				// Duplicate unrelated DSBs also wake the worker but do not renew discovery.
+				for i := 0; i < 2; i++ {
+					if _, err := fmt.Fprintln(store, "CLIENT_RANDOM bb 02"); err != nil {
+						t.Fatal(err)
+					}
+				}
+				synctest.Wait()
+				select {
+				case err := <-done:
+					t.Fatalf("exited before original deadline: %v", err)
+				default:
+				}
+				time.Sleep(time.Second)
+				synctest.Wait()
+				if err := <-done; err == nil {
+					t.Fatal("unidentified connection succeeded")
+				}
+				if len(diagnostics) != 1 || diagnostics[0].Stage != "handshake" || diagnostics[0].Code != "identity_timeout" {
+					t.Fatal(diagnostics)
+				}
+				if store.GetSecrets([]byte{0xaa}) != nil {
+					t.Fatal("expired discovery worker retained completed connection key")
+				}
+				assertQUICReleased(t, q)
+			})
+		})
+	}
+}
+
+func TestQUICIdentityConfirmedWithoutServerInitial(t *testing.T) {
+	for _, level := range []string{"handshake", "application", "identity_limit"} {
+		t.Run(level, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var diagnostics []types.Diagnostic
+				q, _ := newQUICOutputTest(t, types.DecryptOptions{RawChunks: true, KeyWaitTimeout: 10 * time.Second,
+					OnDiagnostic: func(d types.Diagnostic) { diagnostics = append(diagnostics, d) },
+				})
+				store := crypto.NewStreamingKeyLogStore(time.Minute)
+				q.keyLog = store.NewConnectionScope()
+				if level == "identity_limit" {
+					// Exercise the bounded scope's failure handshake at the actual
+					// authenticated-packet transition, not just its return value.
+					for i := 0; i < 9; i++ {
+						q.keyLog.GetSecrets([]byte{byte(i)})
+					}
+				}
+				client, _ := tlsUpgradeTestHellos(0x44)
+				frame := append([]byte{6, 0, byte(len(client) - 5)}, client[5:]...)
+				dcid := []byte("original")
+				initialKey, _ := quicInitialKeys(quicVersion1, dcid)
+				initial := quicLongTestPacket(t, quicVersion1, QUICPacketTypeInitial, dcid, nil, nil, initialKey, 0, frame)
+				if err := q.FeedClient(initial.data); err != nil {
+					t.Fatal(err)
+				}
+				done := make(chan error, 1)
+				go func() { done <- q.Decrypt() }()
+				defer func() { _ = q.Close(); synctest.Wait() }()
+				synctest.Wait()
+				if !q.flow.clientHelloDone || q.identityResolved {
+					t.Fatal("ClientHello did not enter unconfirmed identity state")
+				}
+				time.Sleep(9 * time.Second)
+				random, secret := bytes.Repeat([]byte{0x44}, 32), bytes.Repeat([]byte{0x11}, 32)
+				label := "SERVER_HANDSHAKE_TRAFFIC_SECRET"
+				if level == "application" {
+					label = "SERVER_TRAFFIC_SECRET_0"
+				}
+				if _, err := fmt.Fprintf(store, "%s %x %x\n", label, random, secret); err != nil {
+					t.Fatal(err)
+				}
+				key, err := deriveQUICKeys(secret, quicVersion1, quicAES128)
+				if err != nil {
+					t.Fatal(err)
+				}
+				packet := quicLongTestPacket(t, quicVersion1, QUICPacketTypeHandshake, nil, nil, nil, key, 0, []byte{1, 0, 0}).data
+				if level == "application" {
+					packet = quicKeyPhasePacket(t, key, 0, 0, []byte{1, 0, 0}).data
+				}
+				if err := q.FeedServer(packet); err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+				if level == "identity_limit" {
+					if err := <-done; err == nil {
+						t.Fatal("identity overflow succeeded")
+					}
+					if len(diagnostics) != 1 || diagnostics[0].Stage != "keys" || diagnostics[0].Code != "resource_limit" {
+						t.Fatal(diagnostics)
+					}
+				} else {
+					if !q.identityResolved {
+						t.Fatal("authenticated packet did not resolve identity without server Initial")
+					}
+					time.Sleep(2 * time.Minute)
+					synctest.Wait()
+					store.ReapUnusedKeys()
+					if store.GetSecrets(random) == nil {
+						t.Fatal("live identified connection lost its key after orphan retention expired")
+					}
+					select {
+					case err := <-done:
+						t.Fatalf("resolved identity still timed out: %v", err)
+					default:
+					}
+					_ = q.Close()
+					if err := <-done; err != nil {
+						t.Fatal(err)
+					}
+					if store.GetSecrets(random) != nil || len(diagnostics) != 0 {
+						t.Fatal("successful connection retained keys or reported failure")
+					}
+				}
+				assertQUICReleased(t, q)
+			})
+		})
+	}
 }

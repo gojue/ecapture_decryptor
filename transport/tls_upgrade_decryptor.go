@@ -35,6 +35,7 @@ type tlsUpgradeDecryptor struct {
 
 func newTLSUpgradeDecryptor(base *TLSDecryptor, options types.DecryptOptions) *tlsUpgradeDecryptor {
 	u := &tlsUpgradeDecryptor{base: base, options: options, ready: make(chan struct{}), inputDone: make(chan struct{}), negotiated: make(chan struct{})}
+	base.deferKeyDiscovery = true // Reserve undiscovered inner identities until negotiation ends.
 	name := options.TLSUpgrade
 	if name == "https-connect" {
 		name = "connect"
@@ -108,6 +109,7 @@ func (u *tlsUpgradeDecryptor) feedPlaintext(data []byte, client bool, at time.Ti
 		return err
 	}
 	if u.gate.Finished() && !u.gate.Upgraded() {
+		u.base.keyLog.ResolveKeyReferences()
 		u.finishNegotiation() // A refusal is plaintext, not a TLS failure.
 	}
 	for _, chunk := range chunks {
@@ -176,6 +178,7 @@ func (u *tlsUpgradeDecryptor) startInner() {
 	options := u.options
 	options.TLSUpgrade = ""
 	inner.SetOptions(options)
+	u.base.keyLog.ResolveKeyReferences() // Inner scope now protects its pending discovery.
 	inner.handshakeReady = u.finishNegotiation
 	if u.reset {
 		inner.ObserveTCPReset()
@@ -253,6 +256,7 @@ func (u *tlsUpgradeDecryptor) observeReset() {
 }
 
 func (u *tlsUpgradeDecryptor) Decrypt() error {
+	defer u.base.keyLog.ReleaseKeyReferences()
 	defer u.Close()
 	workerDone := make(chan struct{})
 	timer := time.NewTimer(u.options.SecretWaitTimeout())

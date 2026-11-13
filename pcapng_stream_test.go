@@ -3,19 +3,29 @@ package ecapture_decryptor
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
+	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/gojue/ecapture_decryptor/crypto"
 	"github.com/gojue/ecapture_decryptor/types"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
+	"golang.org/x/crypto/hkdf"
 )
 
 type shortReader struct{ io.Reader }
@@ -119,7 +129,7 @@ func TestDecryptPcapngStreamCancellation(t *testing.T) {
 	cancel()
 	select {
 	case err := <-done:
-		if err == nil {
+		if !errors.Is(err, context.Canceled) || !errors.Is(err, ErrStreamCanceled) {
 			t.Fatal("cancellation was not returned")
 		}
 	case <-time.After(2 * time.Second):
@@ -606,6 +616,365 @@ func TestProcessArgsOptionsValidation(t *testing.T) {
 		for n := 0; n < 32; n++ {
 			if pcapngProcessArgs(block[:n], order) != nil {
 				t.Fatal("accepted short EPB")
+			}
+		}
+	}
+}
+
+// keyLogStreamHellos and keyLogStreamRecord create deterministic, synthetic TLS
+// traffic for lifecycle tests; they are not replacements for captured fixtures.
+func keyLogStreamHellos(random []byte) ([]byte, []byte) {
+	client := append([]byte{3, 3}, random...)
+	client = append(client, 0, 0, 2, 0x13, 1, 1, 0, 0, 7, 0, 43, 0, 3, 2, 3, 4)
+	server := append([]byte{3, 3}, bytes.Repeat([]byte{0x55}, 32)...)
+	server = append(server, 0, 0x13, 1, 0, 0, 6, 0, 43, 0, 2, 3, 4)
+	return append([]byte{22, 3, 3, 0, byte(4 + len(client)), 1, 0, 0, byte(len(client))}, client...),
+		append([]byte{22, 3, 3, 0, byte(4 + len(server)), 2, 0, 0, byte(len(server))}, server...)
+}
+
+func keyLogStreamRecord(t *testing.T, secret []byte, sequence uint64) []byte {
+	t.Helper()
+	expand := func(label string, n int) []byte {
+		label = "tls13 " + label
+		info := append([]byte{0, byte(n), byte(len(label))}, label...)
+		info = append(info, 0)
+		out := make([]byte, n)
+		if _, err := io.ReadFull(hkdf.Expand(sha256.New, secret, info), out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	block, err := aes.NewCipher(expand("key", 16))
+	if err != nil {
+		t.Fatal(err)
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := expand("iv", 12)
+	binary.BigEndian.PutUint64(nonce[4:], binary.BigEndian.Uint64(nonce[4:])^sequence)
+	plain := []byte("lifecycle payload\x17")
+	header := []byte{23, 3, 3, 0, byte(len(plain) + aead.Overhead())}
+	return append(header, aead.Seal(nil, nonce, plain, header)...)
+}
+
+func keyLogStreamPacket(t *testing.T, writer *pcapgo.NgWriter, port uint16, reverse, syn, fin bool, seq uint32, payload []byte) {
+	t.Helper()
+	ip := &layers.IPv4{Version: 4, IHL: 5, TTL: 64, Protocol: layers.IPProtocolTCP, SrcIP: net.IPv4(192, 0, 2, 1), DstIP: net.IPv4(192, 0, 2, 2)}
+	tcp := &layers.TCP{SrcPort: layers.TCPPort(port), DstPort: 443, Seq: seq, SYN: syn, FIN: fin, ACK: !syn || reverse, Window: 65535}
+	if reverse {
+		ip.SrcIP, ip.DstIP = ip.DstIP, ip.SrcIP
+		tcp.SrcPort, tcp.DstPort = tcp.DstPort, tcp.SrcPort
+	}
+	if err := tcp.SetNetworkLayerForChecksum(ip); err != nil {
+		t.Fatal(err)
+	}
+	buf := gopacket.NewSerializeBuffer()
+	if err := gopacket.SerializeLayers(buf, gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}, ip, tcp, gopacket.Payload(payload)); err != nil {
+		t.Fatal(err)
+	}
+	packet := buf.Bytes()
+	if err := writer.WritePacket(gopacket.CaptureInfo{Timestamp: time.Unix(1, 0), CaptureLength: len(packet), Length: len(packet)}, packet); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPcapngStreamKeyLogSequentialConnectionsBeyondCapacity(t *testing.T) {
+	for _, rotating := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rotating_pending=%v", rotating), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				reader, pipe := io.Pipe()
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				defer reader.Close()
+				defer pipe.Close()
+				done := make(chan error, 1)
+				chunks, ends := 0, 0
+				var diagnosticMu sync.Mutex
+				timeouts := 0
+				go func() {
+					done <- DecryptPcapngStreamWithOptions(ctx, reader, func(p *types.DecryptedPacket) error {
+						switch p.Metadata["kind"] {
+						case "stream_chunk":
+							if string(p.Data) != "lifecycle payload" {
+								return errors.New("incorrect decrypted payload")
+							}
+							chunks++
+						case "stream_end":
+							ends++
+						}
+						return nil
+					}, types.DecryptOptions{RawChunks: true, KeyWaitTimeout: 4 * time.Second,
+						OnDiagnostic: func(d types.Diagnostic) {
+							if strings.Contains(d.Code, "timeout") {
+								diagnosticMu.Lock()
+								timeouts++
+								diagnosticMu.Unlock()
+							}
+						},
+					})
+				}()
+				writer, err := pcapgo.NewNgWriter(pipe, layers.LinkTypeRaw)
+				if err != nil {
+					t.Fatal(err)
+				}
+				secret := bytes.Repeat([]byte{0x31}, 32)
+				record := keyLogStreamRecord(t, secret, 0)
+				keys := func(random []byte) string {
+					return fmt.Sprintf("CLIENT_TRAFFIC_SECRET_0 %x %x\nSERVER_TRAFFIC_SECRET_0 %x %x\n", random, secret, random, secret)
+				}
+				start := func(port uint16, random []byte, end bool) {
+					client, server := keyLogStreamHellos(random)
+					keyLogStreamPacket(t, writer, port, false, true, false, 100, nil)
+					keyLogStreamPacket(t, writer, port, true, true, false, 100, nil)
+					keyLogStreamPacket(t, writer, port, false, false, end, 101, append(client, record...))
+					keyLogStreamPacket(t, writer, port, true, false, end, 101, append(server, record...))
+				}
+				// Keep one fully established connection alive through all reclamation batches.
+				activeRandom := bytes.Repeat([]byte{0xff}, 32)
+				if err := writer.WriteDecryptionSecretsBlock(pcapgo.DSB_SECRETS_TYPE_TLS, []byte(keys(activeRandom))); err != nil {
+					t.Fatal(err)
+				}
+				start(39999, activeRandom, false)
+				if err := writer.Flush(); err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+				const batches, batchSize = 65, 256 // 16,640 unique connections, plus the active one.
+				for batch := 0; batch < batches; batch++ {
+					if rotating {
+						// Each incomplete ClientHello lives four seconds, but a new
+						// worker is admitted every second. Discovery never becomes
+						// globally quiescent while the healthy batches are running.
+						port := uint16(35000 + batch)
+						keyLogStreamPacket(t, writer, port, false, true, false, 100, nil)
+						keyLogStreamPacket(t, writer, port, false, false, false, 101, []byte{22, 3, 3, 0, 60, 1})
+					}
+					var dsb strings.Builder
+					for i := 0; i < batchSize; i++ {
+						random := make([]byte, 32)
+						binary.BigEndian.PutUint64(random[24:], uint64(batch*batchSize+i+1))
+						dsb.WriteString(keys(random))
+					}
+					if batch%2 == 0 {
+						if err := writer.WriteDecryptionSecretsBlock(pcapgo.DSB_SECRETS_TYPE_TLS, []byte(dsb.String())); err != nil {
+							t.Fatal(err)
+						}
+					}
+					for i := 0; i < batchSize; i++ {
+						random := make([]byte, 32)
+						binary.BigEndian.PutUint64(random[24:], uint64(batch*batchSize+i+1))
+						start(uint16(40000+i), random, true)
+					}
+					if err := writer.Flush(); err != nil {
+						t.Fatal(err)
+					}
+					synctest.Wait()
+					if batch%2 != 0 {
+						// Both FINs precede the DSB; no subsequent packet or EOF can wake retries.
+						if err := writer.WriteDecryptionSecretsBlock(pcapgo.DSB_SECRETS_TYPE_TLS, []byte(dsb.String())); err != nil {
+							t.Fatal(err)
+						}
+						if err := writer.Flush(); err != nil {
+							t.Fatal(err)
+						}
+						synctest.Wait()
+					}
+					if chunks != 2+(batch+1)*batchSize*2 || ends != (batch+1)*batchSize*2 {
+						pipe.Close()
+						t.Fatalf("batch %d: chunks=%d ends=%d err=%v", batch, chunks, ends, <-done)
+					}
+					if rotating {
+						time.Sleep(time.Second)
+						synctest.Wait()
+					}
+				}
+				client, server := keyLogStreamHellos(activeRandom)
+				next := keyLogStreamRecord(t, secret, 1)
+				keyLogStreamPacket(t, writer, 39999, false, false, true, uint32(101+len(client)+len(record)), next)
+				keyLogStreamPacket(t, writer, 39999, true, false, true, uint32(101+len(server)+len(record)), next)
+				if err := writer.Flush(); err != nil {
+					t.Fatal(err)
+				}
+				if rotating {
+					time.Sleep(4 * time.Second)
+					synctest.Wait()
+				}
+				if err := pipe.Close(); err != nil {
+					t.Fatal(err)
+				}
+				err = <-done
+				if rotating {
+					if !errors.Is(err, ErrConnectionFailures) || errors.Is(err, ErrPipelineFailure) || errors.Is(err, crypto.ErrKeyLogResourceLimit) {
+						t.Fatalf("expected only bounded connection summary: %v", err)
+					}
+					if timeouts != batches {
+						t.Fatalf("incomplete workers did not expire: timeouts=%d want=%d", timeouts, batches)
+					}
+				} else if err != nil {
+					t.Fatal(err)
+				}
+				if chunks != 4+batches*batchSize*2 || ends != 2+batches*batchSize*2 {
+					t.Fatal("active connection lost keys or final drain")
+				}
+			})
+		})
+	}
+}
+
+func TestPcapngStreamConnectionFailuresDoNotStopHealthyConnections(t *testing.T) {
+	for _, malformed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("malformed=%v", malformed), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				reader, pipe := io.Pipe()
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				defer reader.Close()
+				defer pipe.Close()
+				var mu sync.Mutex
+				var diagnostics []types.Diagnostic
+				chunks := 0
+				done := make(chan error, 1)
+				go func() {
+					done <- DecryptPcapngStreamWithOptions(ctx, reader, func(p *types.DecryptedPacket) error {
+						if len(p.Data) > 0 {
+							chunks++
+						}
+						return nil
+					}, types.DecryptOptions{RawChunks: true, KeyWaitTimeout: time.Second, MaxConnections: 2, OnDiagnostic: func(d types.Diagnostic) { mu.Lock(); defer mu.Unlock(); diagnostics = append(diagnostics, d) }})
+				}()
+				writer, err := pcapgo.NewNgWriter(pipe, layers.LinkTypeRaw)
+				if err != nil {
+					t.Fatal(err)
+				}
+				random, secret := bytes.Repeat([]byte{0x41}, 32), bytes.Repeat([]byte{0x31}, 32)
+				client, server := keyLogStreamHellos(random)
+				keyLogStreamPacket(t, writer, 40000, false, true, false, 100, nil)
+				keyLogStreamPacket(t, writer, 40000, true, true, false, 100, nil)
+				if malformed {
+					client = []byte{22, 3, 3, 0, 4, 2, 0, 0, 0}
+				}
+				keyLogStreamPacket(t, writer, 40000, false, false, false, 101, client)
+				keyLogStreamPacket(t, writer, 40000, true, false, false, 101, server)
+				if err := writer.Flush(); err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+				time.Sleep(time.Second)
+				synctest.Wait()
+				select {
+				case err := <-done:
+					t.Fatalf("connection failure ended stream: %v", err)
+				default:
+				}
+				// More healthy connections than MaxConnections prove failed/completed
+				// workers release admission slots, and historical failures do not stop input.
+				for i := 0; i < 4; i++ {
+					random[0]++
+					client, server = keyLogStreamHellos(random)
+					keylog := fmt.Sprintf("CLIENT_TRAFFIC_SECRET_0 %x %x\nSERVER_TRAFFIC_SECRET_0 %x %x\n", random, secret, random, secret)
+					if err := writer.WriteDecryptionSecretsBlock(pcapgo.DSB_SECRETS_TYPE_TLS, []byte(keylog)); err != nil {
+						t.Fatal(err)
+					}
+					record := keyLogStreamRecord(t, secret, 0)
+					keyLogStreamPacket(t, writer, 40001, false, true, false, 100, nil)
+					keyLogStreamPacket(t, writer, 40001, true, true, false, 100, nil)
+					keyLogStreamPacket(t, writer, 40001, false, false, true, 101, append(client, record...))
+					keyLogStreamPacket(t, writer, 40001, true, false, true, 101, append(server, record...))
+					if err := writer.Flush(); err != nil {
+						t.Fatal(err)
+					}
+					synctest.Wait()
+					if chunks != (i+1)*2 {
+						t.Fatalf("healthy connection %d did not decrypt: chunks=%d", i, chunks)
+					}
+				}
+				if err := pipe.Close(); err != nil {
+					t.Fatal(err)
+				}
+				err = <-done
+				if !errors.Is(err, ErrConnectionFailures) || errors.Is(err, ErrPipelineFailure) || errors.Is(err, ErrStreamCanceled) {
+					t.Fatalf("EOF classification: %v", err)
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				if len(diagnostics) == 0 || len(diagnostics) > 8 {
+					t.Fatalf("unbounded or missing diagnostics: %d", len(diagnostics))
+				}
+			})
+		})
+	}
+}
+
+func TestStreamPipelineErrorClassification(t *testing.T) {
+	for _, live := range []bool{false, true} {
+		var encoded bytes.Buffer
+		writer, err := pcapgo.NewNgWriter(&encoded, layers.LinkTypeEthernet)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var keylog strings.Builder
+		for i := 0; i < 16385; i++ {
+			fmt.Fprintf(&keylog, "CLIENT_RANDOM %064x %s\n", i, strings.Repeat("ab", 48))
+		}
+		if err := writer.WriteDecryptionSecretsBlock(pcapgo.DSB_SECRETS_TYPE_TLS, []byte(keylog.String())); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		if live {
+			err = DecryptLiveTraffic(nil, bytes.NewReader(encoded.Bytes()), nil)
+		} else {
+			err = DecryptPcapngStream(context.Background(), io.NopCloser(bytes.NewReader(encoded.Bytes())), func(*types.DecryptedPacket) error { return nil })
+		}
+		var detail *crypto.KeyLogResourceLimitError
+		if !errors.Is(err, ErrPipelineFailure) || !errors.Is(err, crypto.ErrKeyLogResourceLimit) || !errors.As(err, &detail) || detail.Resource != "entries" || errors.Is(err, ErrConnectionFailures) || errors.Is(err, ErrStreamCanceled) {
+			t.Fatalf("pipeline capacity classification live=%v: %v", live, err)
+		}
+	}
+	var encoded bytes.Buffer
+	writer, err := pcapgo.NewNgWriter(&encoded, layers.LinkTypeEthernet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := DecryptPcapngStream(context.Background(), io.NopCloser(bytes.NewReader(encoded.Bytes())), func(*types.DecryptedPacket) error { return nil }); err != nil {
+		t.Fatalf("normal EOF: %v", err)
+	}
+	err = DecryptPcapngStream(context.Background(), io.NopCloser(bytes.NewReader(encoded.Bytes()[:8])), func(*types.DecryptedPacket) error { return nil })
+	if !errors.Is(err, ErrPipelineFailure) || errors.Is(err, ErrConnectionFailures) {
+		t.Fatalf("malformed input classification: %v", err)
+	}
+}
+
+func TestLegacyLiveInputFailureIsNotEOF(t *testing.T) {
+	var encoded bytes.Buffer
+	writer := pcapgo.NewWriter(&encoded)
+	if err := writer.WriteFileHeader(65535, layers.LinkTypeEthernet); err != nil {
+		t.Fatal(err)
+	}
+	header := bytes.Clone(encoded.Bytes())
+	if err := writer.WritePacket(gopacket.CaptureInfo{CaptureLength: 60, Length: 60}, make([]byte, 60)); err != nil {
+		t.Fatal(err)
+	}
+	truncated := encoded.Bytes()[:encoded.Len()-1]
+	for _, seekable := range []bool{false, true} {
+		for _, data := range [][]byte{header, truncated} {
+			var input io.Reader = bytes.NewReader(data)
+			if !seekable {
+				input = struct{ io.Reader }{input}
+			}
+			err := DecryptLiveTraffic(nil, input, nil)
+			if len(data) == len(header) {
+				if err != nil {
+					t.Fatalf("legacy header EOF seek=%v: %v", seekable, err)
+				}
+			} else if !errors.Is(err, ErrPipelineFailure) || !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("truncated legacy input seek=%v: %v", seekable, err)
 			}
 		}
 	}

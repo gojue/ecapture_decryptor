@@ -347,6 +347,9 @@ func (q *QUICDecryptor) processQUICPacket(packet quicPacket, isClient bool, at t
 			}
 			if level == quicLevelApplication || level == quicLevelHandshake {
 				q.flow.handshake.confirmed = true
+				if err := q.resolveQUICKeyReferences(); err != nil {
+					return false, err
+				}
 			}
 			if err := q.parseQUICFrames(plaintext, level, isClient, at); err != nil {
 				return false, err
@@ -831,5 +834,26 @@ func (q *QUICDecryptor) processQUICInitial(packet quicPacket, isClient bool, at 
 			return false, err
 		}
 	}
-	return false, q.parseQUICFrames(plain, quicLevelInitial, isClient, at)
+	err = q.parseQUICFrames(plain, quicLevelInitial, isClient, at)
+	if err == nil {
+		err = q.resolveQUICKeyReferences()
+	}
+	return false, err
+}
+
+// Retry/VN can replace the ClientHello before confirmation. Once the current
+// hello is complete and confirmed by Initial, Handshake or 1-RTT, no supported
+// transition introduces another identity. Do not wait for a further Initial.
+func (q *QUICDecryptor) resolveQUICKeyReferences() error {
+	hs := &q.flow.handshake
+	if q.identityResolved || !hs.confirmed || !q.flow.clientHelloDone || hs.retry != nil && !hs.retryApplied {
+		return nil
+	}
+	if !q.keyLog.ResolveKeyReferences() {
+		q.flow.terminalErr = errors.New("QUIC key identity limit exceeded")
+		q.options.Report(q.connectionInfo, "keys", "resource_limit")
+		return q.flow.terminalErr
+	}
+	q.identityResolved = true
+	return nil
 }

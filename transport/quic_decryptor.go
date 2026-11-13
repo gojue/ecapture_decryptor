@@ -59,22 +59,24 @@ var quicDraft29InitialSalt = []byte{
 
 // QUICDecryptor implements Decryptor interface for QUIC protocol
 type QUICDecryptor struct {
-	connectionInfo types.ConnectionKey
-	keyLog         *crypto.KeyLogStore
-	logger         *log.Logger
-	closeCh        chan struct{}
-	closeOnce      sync.Once
-	isClosed       bool
-	mu             sync.Mutex
-	packetTime     time.Time
-	wake           chan struct{}
-	input          []quicDatagram
-	inputBytes     int
-	inputErr       error
-	flow           *quicFlowState
-	options        types.DecryptOptions
-	packetChan     chan *types.DecryptedPacket
-	routingHandler func([]byte, bool, bool) ([]QUICRoutedPacket, error)
+	identityStarted  time.Time
+	identityResolved bool
+	connectionInfo   types.ConnectionKey
+	keyLog           *crypto.KeyLogStore
+	logger           *log.Logger
+	closeCh          chan struct{}
+	closeOnce        sync.Once
+	isClosed         bool
+	mu               sync.Mutex
+	packetTime       time.Time
+	wake             chan struct{}
+	input            []quicDatagram
+	inputBytes       int
+	inputErr         error
+	flow             *quicFlowState
+	options          types.DecryptOptions
+	packetChan       chan *types.DecryptedPacket
+	routingHandler   func([]byte, bool, bool) ([]QUICRoutedPacket, error)
 
 	// Connection state
 	version    uint32
@@ -170,13 +172,14 @@ func (b *QUICBuffer) Close() {
 func NewQUICDecryptor(ci types.ConnectionKey, keyLog *crypto.KeyLogStore, logger *log.Logger, _ io.Writer, packetChan chan *types.DecryptedPacket) types.Decryptor {
 	ci.TLS = &types.ConnectionTLS{}
 	q := &QUICDecryptor{
-		connectionInfo: ci,
-		keyLog:         keyLog,
-		logger:         logger,
-		closeCh:        make(chan struct{}),
-		wake:           make(chan struct{}, 1),
-		flow:           newQUICFlowState(),
-		packetChan:     packetChan,
+		identityStarted: time.Now(),
+		connectionInfo:  ci,
+		keyLog:          keyLog.NewConnectionScope(),
+		logger:          logger,
+		closeCh:         make(chan struct{}),
+		wake:            make(chan struct{}, 1),
+		flow:            newQUICFlowState(),
+		packetChan:      packetChan,
 	}
 	// Initialize HTTP/3 parser if channel is available
 	if packetChan != nil {
@@ -219,6 +222,7 @@ func (q *QUICDecryptor) SetPacketTime(t time.Time) {
 
 // Decrypt starts the QUIC decryption process
 func (q *QUICDecryptor) Decrypt() (result error) {
+	defer q.keyLog.ReleaseKeyReferences()
 	q.logger.Printf("QUIC decryption started for %s", q.connectionInfo)
 	var keyTimer *time.Timer
 	var keyTimeout <-chan time.Time
@@ -259,6 +263,9 @@ func (q *QUICDecryptor) Decrypt() (result error) {
 			return q.flow.terminalErr
 		}
 		waitSince := q.flow.pendingSince
+		if !q.identityResolved && (waitSince.IsZero() || q.identityStarted.Before(waitSince)) {
+			waitSince = q.identityStarted
+		}
 		if early := q.flow.early.since; !early.IsZero() && (waitSince.IsZero() || early.Before(waitSince)) {
 			waitSince = early
 		}
@@ -289,8 +296,14 @@ func (q *QUICDecryptor) Decrypt() (result error) {
 		}
 		select {
 		case <-q.wake:
+			if q.identityWaitExpired() {
+				return q.quicWaitExpired()
+			}
 			q.drainQUICInput(true)
 		case <-updates:
+			if q.identityWaitExpired() {
+				return q.quicWaitExpired()
+			}
 			// Resubscribe before looking up keys: a concurrent DSB must wake the
 			// next select even if it arrives during this retry.
 			updates = q.keyLog.Updates()
@@ -365,8 +378,15 @@ func (q *QUICDecryptor) Decrypt() (result error) {
 	}
 }
 
+func (q *QUICDecryptor) identityWaitExpired() bool {
+	return !q.identityResolved && time.Since(q.identityStarted) >= q.options.SecretWaitTimeout()
+}
+
 func (q *QUICDecryptor) drainQUICInput(stopAtDeadline bool) {
 	for {
+		if stopAtDeadline && q.identityWaitExpired() {
+			return
+		}
 		q.mu.Lock()
 		if len(q.input) == 0 || q.inputErr != nil {
 			q.mu.Unlock()
@@ -385,7 +405,8 @@ func (q *QUICDecryptor) drainQUICInput(stopAtDeadline bool) {
 			since := q.http3Parser.PendingSince()
 			httpExpired = !since.IsZero() && time.Since(since) >= q.options.SecretWaitTimeout()
 		}
-		if q.flow.terminalErr != nil || stopAtDeadline && (keyExpired || earlyExpired || httpExpired) {
+		identityExpired := q.identityWaitExpired()
+		if q.flow.terminalErr != nil || stopAtDeadline && (identityExpired || keyExpired || earlyExpired || httpExpired) {
 			return
 		}
 	}
