@@ -1,3 +1,26 @@
+# v1.4.4 (2026-11-13)
+
+## Fixed
+
+* Reclaim unused keylog secrets in long-running streaming APIs after connection workers finish draining, while protecting active TLS, QUIC, DTLS and nested TLS references. Expire unassociated secrets using `IdleTimeout` (default 5 minutes); newly admitted unresolved connections no longer keep old secrets indefinitely.
+* Bound QUIC identity discovery by an absolute `KeyWaitTimeout` (default 30 seconds), including incomplete handshakes and Retry/version negotiation. Continued traffic or repeated DSBs do not renew the deadline; expiry reports `handshake/identity_timeout` and terminates the affected connection.
+* Preserve legacy pcap input read errors instead of treating them as normal EOF, and correctly read non-seekable legacy pcap input after format detection.
+* Drain available TLS stream-buffer data when a waiting read races with a write and close.
+
+## Added
+
+* Error categories supporting `errors.Is`: `ErrConnectionFailures`, `ErrPipelineFailure`, `ErrStreamCanceled` and `ErrEmitFailed`. Connection failures remain isolated during processing and are aggregated when the call ends; pipeline, callback and cancellation errors remain distinguishable and may coexist.
+* Typed `crypto.KeyLogResourceLimitError` details for line length, entry count and secret-byte limits, exposing only resource names and counters while preserving `errors.Is(err, crypto.ErrKeyLogResourceLimit)`.
+
+## Compatibility
+
+* Existing Go entry-point signatures and options remain unchanged. File APIs retain keys for the entire call; lifecycle-based reclamation applies to `DecryptPcapngStream`, `DecryptPcapngStreamWithOptions` and `DecryptLiveTraffic`. New connections reusing retired or expired key identities must receive the secrets again.
+* Keylog import limits, late-DSB handling and output backpressure remain enforced. Genuine capacity exhaustion still terminates the input pipeline rather than evicting required secrets. See the [API lifecycle and error contracts](docs/API.md#decryptpcapngstreamwithoptions--withoptions).
+
+**Full Changelog**: https://github.com/gojue/ecapture_decryptor/compare/v1.4.3...v1.4.4
+
+<hr>
+
 # v1.4.2 (2026-11-08)
 
 ## Added
