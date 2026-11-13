@@ -115,7 +115,7 @@ type DTLSDecryptor struct {
 }
 
 func NewDTLSDecryptor(conn types.ConnectionKey, keys *crypto.KeyLogStore, out chan *types.DecryptedPacket) *DTLSDecryptor {
-	return &DTLSDecryptor{conn: conn, keys: keys, out: out, wake: make(chan struct{}, 1), stop: make(chan struct{}), clientSide: -1, serverSide: -1, fragments: make(map[dtlsFragmentKey]*dtlsFragment)}
+	return &DTLSDecryptor{conn: conn, keys: keys.NewConnectionScope(), out: out, wake: make(chan struct{}, 1), stop: make(chan struct{}), clientSide: -1, serverSide: -1, fragments: make(map[dtlsFragmentKey]*dtlsFragment)}
 }
 func (d *DTLSDecryptor) SetOptions(o types.DecryptOptions) { d.options = o }
 func (d *DTLSDecryptor) GetAddr() types.ConnectionKey      { return d.conn }
@@ -158,6 +158,7 @@ func (d *DTLSDecryptor) failure(stage, code string, err error) error {
 	return d.err
 }
 func (d *DTLSDecryptor) Decrypt() error {
+	defer d.keys.ReleaseKeyReferences()
 	defer func() {
 		_ = d.Close()
 		d.mu.Lock()
@@ -477,6 +478,8 @@ func (d *DTLSDecryptor) hello(typ byte, body []byte, side int, epoch, seq uint16
 		if d.clientSide < 0 || seq >= d.clientHelloSeq {
 			d.clientSide = side
 			d.clientRandom = bytes.Clone(body[2:34])
+			d.keys.GetSecrets(d.clientRandom)
+			d.keys.ResolveKeyReferences()
 			d.clientHelloSeq = seq
 			d.offered = offered
 		}

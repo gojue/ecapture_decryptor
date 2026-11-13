@@ -1,14 +1,20 @@
 package ecapture_decryptor
 
 import (
+	"bytes"
+	"encoding/hex"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/gojue/ecapture_decryptor/crypto"
 	"github.com/gojue/ecapture_decryptor/transport"
 	"github.com/gojue/ecapture_decryptor/types"
 	"github.com/google/gopacket/layers"
@@ -228,4 +234,139 @@ func TestDTLSRoutingLimitAndIdleLifecycle(t *testing.T) {
 			}
 		})
 	})
+}
+
+func TestStreamingKeyReferencesReleasedByEngineLifecycle(t *testing.T) {
+	for _, mode := range []string{"idle", "handshake_failure", "eof"} {
+		t.Run(mode, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				store := crypto.NewStreamingKeyLogStore(time.Minute)
+				logger := log.New(io.Discard, "", 0)
+				packets := make(chan *types.DecryptedPacket, 16)
+				engine := &DecryptorEngine{keyLog: store, logger: logger, conntrack: make(map[string]types.Decryptor), tcpFlows: make(map[string]*tcpConnection)}
+				engine.factory = NewDecryptorFactory(store, logger, packets)
+				engine.factory.options = types.DecryptOptions{RawChunks: true, IdleTimeout: time.Second, KeyWaitTimeout: time.Second}
+				stop := engine.startIdleReaper()
+				defer stop()
+				defer engine.waitForAllConnections()
+				random, secret := bytes.Repeat([]byte{0x42}, 32), bytes.Repeat([]byte{0x31}, 32)
+				if _, err := store.Write([]byte(fmt.Sprintf("CLIENT_TRAFFIC_SECRET_0 %x %x\nSERVER_TRAFFIC_SECRET_0 %x %x\n", random, secret, random, secret))); err != nil {
+					t.Fatal(err)
+				}
+				engine.handlePacket(lifecycleIP(), lifecyclePacket(41000, true, false), time.Time{})
+				client, server := keyLogStreamHellos(random)
+				payload := append(client, keyLogStreamRecord(t, secret, 0)...)
+				tcp := lifecyclePacket(41000, false, false)
+				tcp.Seq = 101
+				tcp.Payload = payload
+				engine.handlePacket(lifecycleIP(), tcp, time.Time{})
+				if mode != "handshake_failure" {
+					tcp = transport.NewTCPAdapter(&layers.TCP{SrcPort: 443, DstPort: 41000, Seq: 101, BaseLayer: layers.BaseLayer{Payload: server}})
+					ip := transport.NewIPv4Adapter(&layers.IPv4{SrcIP: net.IPv4(192, 0, 2, 2), DstIP: net.IPv4(192, 0, 2, 1)})
+					engine.handlePacket(ip, tcp, time.Time{})
+				}
+				synctest.Wait()
+				if store.GetSecrets(random) == nil {
+					t.Fatal("live connection lost its key")
+				}
+				if mode == "eof" {
+					engine.waitForAllConnections()
+				} else {
+					time.Sleep(2 * time.Second)
+					synctest.Wait()
+				}
+				if engine.active != 0 || len(engine.conntrack) != 0 || store.GetSecrets(random) != nil {
+					t.Fatal("engine retirement retained routing, worker slot, or key")
+				}
+				if mode == "eof" && engine.connectionError() != nil {
+					t.Fatal(engine.connectionError())
+				}
+				if mode != "eof" && !errors.Is(engine.connectionError(), ErrConnectionFailures) {
+					t.Fatal("missing connection failure summary")
+				}
+			})
+		})
+	}
+}
+
+func TestCapturedProtocolWorkersReleaseStreamingKeyReferences(t *testing.T) {
+	for _, tc := range []struct {
+		name, capture string
+		keys          []string
+		options       types.DecryptOptions
+	}{
+		{"tls12", "d10_tls12_resume.pcapng", []string{"d10_openssl.keys"}, types.DecryptOptions{RawChunks: true}},
+		{"quic", "http3_keyupdate_v1.pcapng", []string{"http3_keyupdate_v1.keys"}, types.DecryptOptions{RawChunks: true}},
+		{"dtls", "d11_dtls_aes128.pcapng", []string{"d11_dtls.keys"}, types.DecryptOptions{UDPProtocol: "dtls"}},
+		{"tls_upgrade", "d09_https_connect.pcapng", []string{"d09_upgrade.keys", "d09_inner.keys"}, types.DecryptOptions{TLSUpgrade: "https-connect", RawChunks: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := crypto.NewStreamingKeyLogStore(time.Minute)
+			logger := log.New(io.Discard, "", 0)
+			var keylog []byte
+			var identities [][][]byte
+			for _, path := range tc.keys {
+				keys, err := os.ReadFile("test/testdata/" + path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				keylog = append(keylog, keys...)
+				var randoms [][]byte
+				for _, line := range bytes.Split(keys, []byte{'\n'}) {
+					f := bytes.Fields(line)
+					if len(f) != 3 || string(f[0]) != "CLIENT_RANDOM" && string(f[0]) != "CLIENT_TRAFFIC_SECRET_0" {
+						continue
+					}
+					random, err := hex.DecodeString(string(f[1]))
+					if err == nil {
+						randoms = append(randoms, random)
+					}
+				}
+				if len(randoms) == 0 {
+					t.Fatal("fixture has no supported key identities")
+				}
+				identities = append(identities, randoms)
+			}
+			capture, err := os.ReadFile("test/testdata/" + tc.capture)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Exercise normal EOF with a DSB after all captured packets. Only workers
+			// that actually parsed the fixture can associate and retire these keys.
+			input := append(capture, tlsFixtureDSB(t, keylog)...)
+			blocks := &pcapngBlockReader{source: bytes.NewReader(input), onTLSSecrets: func(payload []byte) error { _, err := store.Write(payload); return err }}
+			packets := make(chan *types.DecryptedPacket, 32)
+			drained := make(chan int, 1)
+			go func() {
+				count := 0
+				for p := range packets {
+					if len(p.Data) > 0 {
+						count++
+					}
+				}
+				drained <- count
+			}()
+			engine := &DecryptorEngine{config: &DecryptorConfig{pcapReader: blocks, strictPcapng: true}, keyLog: store, logger: logger, conntrack: make(map[string]types.Decryptor), tcpFlows: make(map[string]*tcpConnection)}
+			engine.factory = NewDecryptorFactory(store, logger, packets)
+			engine.factory.options = tc.options
+			err = engine.Run()
+			close(packets)
+			count := <-drained
+			if err != nil || count == 0 {
+				t.Fatalf("fixture failed: output=%d err=%v", count, err)
+			}
+			for i, randoms := range identities {
+				removed := false
+				for _, random := range randoms {
+					removed = removed || store.GetSecrets(random) == nil
+				}
+				if !removed {
+					t.Fatalf("worker retained every identity from %s", tc.keys[i])
+				}
+			}
+			if engine.active != 0 || len(engine.conntrack) != 0 {
+				t.Fatal("fixture worker remained active")
+			}
+		})
+	}
 }

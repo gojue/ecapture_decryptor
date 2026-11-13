@@ -25,6 +25,7 @@ func (e *DecryptorEngine) startIdleReaper() func() {
 			case now := <-ticker.C:
 				e.expireIdleConnections(now, timeout)
 				e.expireQUICPending(now, false)
+				e.keyLog.ReapUnusedKeys()
 			case <-stop:
 				return
 			}

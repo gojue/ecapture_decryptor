@@ -103,6 +103,19 @@ input stays open. Handshake/key waits default to 30 seconds, idle connections
 to five minutes, and concurrent decryptors to 1024 (including closing workers).
 See the [API contract](docs/API.md#decryptpcapngstreamwithoptions--withoptions)
 for options, fixed buffer limits, diagnostics and output backpressure.
+Long-lived streaming APIs reclaim keys after the last connection worker exits;
+unassociated keys use the idle timeout as their retention window (five minutes
+by default). Active references protect needed keys; pending identity discovery
+protects only the history available within each entry's admission boundary, so
+later unresolved connections cannot indefinitely extend retired keys' lifetime.
+QUIC identity discovery has an absolute 30-second default deadline, including
+partial handshakes, Retry and version negotiation. A new connection reusing a
+retired identity must supply its keys again.
+File APIs retain pre-scanned keys for the entire call. Import limits remain in
+place, with typed, content-free limit details. Connection failures are isolated
+while input continues and summarized at EOF; `errors.Is` markers distinguish
+that summary, pipeline failure, callback failure and context cancellation. See
+[the lifecycle and error contract](docs/API.md#decryptpcapngstreamwithoptions--withoptions).
 
 ```go
 err := ecapture_decryptor.DecryptPcapngStream(ctx, input, func(message *types.DecryptedPacket) error {

@@ -136,10 +136,111 @@ QUIC 每个 STREAM/CRYPTO assembler 的乱序载荷最多 16 MiB、65,536 个片
 超限报告 `resource_limit` 并终止该连接。这些是各组件上限，不是整个引擎的统一
 内存预算；现有应用 parser 上限继续有效。
 
-keylog 的 `Write` / `LoadFromReader` 导入每行最多 4096 字节（LF 前）、最多
-16,384 个 client random、16 MiB secret 字节；超限返回不含内容的
-`crypto.ErrKeyLogResourceLimit`，已导入密钥保留，未完成行释放。同 key 更新按
-字节增量计费。兼容入口 `AddSecret` 信任调用方管理内存，不应用导入上限。
+keylog 的 `Write` / `LoadFromReader` 导入仍限制每行 4096 字节（LF 前）、
+同时存储 16,384 个不同 Client Random、16 MiB secret 字节。同 key 更新按替换的
+字节增量计费，重复导入不增加条目或连接引用。超限释放未完成行；批次内此前成功的
+行仍有效，不承诺整批事务回滚。兼容入口 `AddSecret` 仍信任调用方管理内存，
+SDK 的导入和回收实现不通过该入口绕过限额。
+
+**密钥生命周期。** 不新增 `DecryptOptions` 字段，按入口区分用途：
+
+| 入口 | 密钥保留策略 |
+| --- | --- |
+| `DecryptPcapFile` / `DecryptWithConfig` | 有限输入策略：整次调用保留密钥，不按连接结束或实际时间删除。可 seek 的 pcapng 仍先扫描所有 DSB；不可 seek 的文件 reader 仍单遍观察 DSB。导入总量受原有限额限制。 |
+| `DecryptPcapngStream` / `DecryptPcapngStreamWithOptions` / `DecryptLiveTraffic` | 长期流策略：每次调用独立共享一个 store，按 worker 引用回收；只单遍读取。未关联条目从首次导入起保留 `IdleTimeout`（默认 5 分钟；`DecryptLiveTraffic` 使用默认值），窗口内重复值、替换或新增 label 不续期。长期流优先使用可取消的 pcapng 入口。 |
+
+TLS 1.2/1.3 在读到 ClientHello 时引用其 random，即使 DSB 尚未到达也登记引用；
+ECH 额外保护 Outer、选定的 application 和 CH1 Inner early 身份。QUIC 保留
+Retry/VN 尚可改变身份时的发现状态；ClientHello 完整、已应用观察到的 Retry，且
+由服务端 Initial 或认证成功的 Handshake/1-RTT 包确认后结束身份发现。DTLS 的
+cookie retry 复用同一 random。TLSUpgrade 的外层/内层有独立引用，在内层创建
+或明确拒绝协商前保留未发现身份的保护。内层从仍在发现身份的外层 scope 创建时，
+继承原连接的保护起点；交接不能将它视为后来接纳的新连接，也不能重置升级的
+总体协商期限。
+
+QUIC 身份发现使用从 worker 创建起算的绝对 `KeyWaitTimeout`（默认 30 秒），
+即使没有待解密包也生效。部分 ClientHello、持续来包、重复 DSB、Retry 和版本
+协商都不重置这个期限；输入持续可读时也检查期限。到期报告固定诊断
+`handshake/identity_timeout`，结束并清理该连接，其他连接继续。身份确定后的
+密钥、early data、QPACK 等待仍遵循各自既有有界等待机制。
+
+身份确定后的活跃连接、等密钥连接和正在排空的 worker 持有精确引用，不受未关联
+条目的保留窗口影响。同 random 可以有多个引用。最后一个引用释放时，已用条目
+只继续等待**此时已经接纳**且尚未完成身份发现的 worker；之后新接纳的未决连接
+不会继承该保护。比如 A 尚未识别时某密钥的最后一个引用释放，随后 B 才被接纳：
+A 识别完或退出后即可回收，B 的存在不会继续阻塞。若 A 实际读取了该密钥，则
+成为真实引用，按同一规则在它退出时重新判断。因此未决连接不断轮换不会使历史
+密钥无限积累，仍在使用的共享身份也不会被回收。
+
+引用在 `Decrypt` 完成关闭、输入/输出排空和清理后释放，单独 `Close`、FIN 或
+移除路由不提前释放。正常 EOF、失败、空闲回收和取消均走此路径。
+
+未关联条目从首次导入起保留 `IdleTimeout`；到期时只等待**窗口结束前已接纳**的
+未决 worker，窗口结束后新接纳的连接不再延长它。巡检、下一次导入或 worker
+状态转换会触发检查。窗口按实际时间计算，不按抓包时间戳。尚未关联的 DSB 应在
+窗口内接纳相应连接（TCP SYN、QUIC Initial 或 DTLS tuple）；窗口过后才出现的
+连接、或最后一个引用已释放后重新使用相同 random 的新连接，需要重新提供密钥，
+不能依赖其他未决 worker 暂时保留的历史数据。重新导入已删除、已退休或窗口已
+过期且无精确引用的条目，会建立新的保留窗口；仍在未过期窗口内的重复导入、
+更新或新增 label 不续期。不保留无限历史或 tombstone。
+
+每个 worker 最多记录 8 个不同身份；超过时不继续增长引用元数据，也不能声明
+身份发现完成。QUIC 在完成身份确认时遇到这个条件会以 `keys/resource_limit`
+结束该连接；尚未确认的连接仍受上述绝对期限约束。嵌套 TLS 最多两层，worker
+数量仍受 `MaxConnections` 约束。
+
+这不是对所有密钥应用 TTL/FIFO/LRU，也不保证任何输入速率下都能回收出空间：
+大量早到 DSB、仍在使用的密钥、未完成身份发现或被输出背压阻塞的 worker 都可能
+使容量确实耗尽。此时不驱逐所需密钥、不静默拒收 DSB，而是停止输入、排空 worker，
+返回管线错误。短时真实容量耗尽是保留的边界，不依靠放宽限额或定时重启规避。
+既有握手/密钥/空闲期限和背压契约继续适用；永久阻塞的 `emit`
+仍需调用方解除。有限文件中超过容量的全量预扫描也仍明确报错。
+
+超限错误保留 `errors.Is(err, crypto.ErrKeyLogResourceLimit)`，并可通过
+`errors.As(err, &detail)` 获取 `*crypto.KeyLogResourceLimitError`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `Resource` | 固定值 `line_bytes`、`entries` 或 `secret_bytes`，区分触发的限额 |
+| `Current` / `Limit` | 当前占用/上限；scanner 的行错误使用已观察到的行长度，可能已超过上限 |
+| `Requested` | 本次被拒绝的额外占用；scanner 已将观察长度记入 `Current`，此值为 0。secret 替换时为正的字节增量 |
+
+错误文本只含上述固定名称和数字，不含 Client Random、密钥、明文或原始 keylog。
+例如 `entries current=16384 limit=16384 requested=1`。隔离测试中 16,384 个
+32-byte random 各配 48-byte secret，secret 总量仅 786,432 字节，第 16,385 个
+触发条目数限额；这不能证明未记录缓存计数的线上同名错误也一定触发了条目数限制。
+
+底层 `crypto.NewKeyLogStore` / `NewKeyLogStoreFromReader` 保持有限输入语义。
+`NewStreamingKeyLogStore(retention)` 和 `NewConnectionScope`、
+`ResolveKeyReferences`、`ReleaseKeyReferences`、`ReapUnusedKeys` 用于跨包的
+生命周期接线；普通 SDK 集成方无需调用它们。自定义 `RegisterDecryptor` 若使用
+流式 store，必须在接收输入前创建 scope，通过 scope 读取/等待所有身份，确定
+不会再发现新身份后 resolve，并在 worker 完全退出后 release；未完成发现时不要
+提前 resolve。`ResolveKeyReferences()` 返回 false 表示身份数量超限，必须结束
+该 worker，不能继续宣称可解密。自定义 worker 也必须为未完成身份发现设置不随
+活动续期的期限。独立使用该低层 store 的调用方还需限制 scope 数量并定期 reap。
+
+**运行诊断与调用结束。** 缺密钥、握手、解密或解析失败先遵循既有有界等待/
+恢复规则，失败范围保持为相应连接或方向；其余连接继续消费输入。`OnDiagnostic`
+只报告运行中的固定阶段/原因，不能据此判断整个 API 已退出。历史连接错误仍在
+EOF/关闭时汇总（最多保留 16 个错误），不因首个连接失败立即停止读取。
+
+调用方可用 `errors.Is` 判断下列类别，无需解析字符串：
+
+| 返回值/标记 | 判断方式 |
+| --- | --- |
+| `err == nil` | 输入正常 EOF、回调及连接排空成功 |
+| `ErrStreamCanceled` | pcapng 流入口的调用方 context 已取消或到期；同时保留 `context.Canceled` / `context.DeadlineExceeded`。连接自身超时可能包含后者，因此判断整次调用取消应检查本标记 |
+| `ErrEmitFailed` | `emit` 返回错误，停止输入并排空；原回调错误仍支持 `errors.Is/As` |
+| `ErrPipelineFailure` | 输入读取/格式、DSB/keylog 导入等错误使管线无法继续；资源超限同时保留上述 keylog 错误类型 |
+| `ErrConnectionFailures` | 调用结束时存在连接错误汇总；单独出现表示没有报告输入管线失败，不代表仍在运行 |
+
+这些标记可以同时存在，例如输入失败前已有连接失败，或取消/回调失败关闭输入
+造成读取错误。调用方应分别检查并记录；主动取消优先用 `ErrStreamCanceled`
+归因，不把其引起的关闭读取错误误当成独立根因。参数/选项校验在启动前直接返回
+原校验错误。任何 API 返回都表示本次处理已经结束；即使只有连接错误汇总，也
+不能继续向这次调用供给输入。eCapture 应自行处理返回后的告警/退出，不在 SDK
+内加入重试或定时重启逻辑。
 
 raw 事件复用 `DecryptedPacket`：`Protocol` 为 `tls` 或 `quic`，`Data` 是
 已认证的原始字节；`Direction=request/response` 分别表示客户端到服务端、

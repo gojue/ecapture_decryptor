@@ -106,7 +106,7 @@ func TestRawStreamCallbackFailureDrainsProducers(t *testing.T) {
 		calls++
 		return want
 	}, types.DecryptOptions{RawChunks: true})
-	if !errors.Is(err, want) || errors.Is(err, context.DeadlineExceeded) || calls != 1 {
+	if !errors.Is(err, want) || !errors.Is(err, ErrEmitFailed) || errors.Is(err, ErrStreamCanceled) || errors.Is(err, context.DeadlineExceeded) || calls != 1 {
 		t.Fatalf("callback failure: calls=%d err=%v", calls, err)
 	}
 }

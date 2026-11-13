@@ -40,7 +40,7 @@ func DecryptPcapngStreamWithOptions(ctx context.Context, input io.ReadCloser, em
 	if err := options.Validate(); err != nil {
 		return err
 	}
-	keyLog := crypto.NewKeyLogStore()
+	keyLog := crypto.NewStreamingKeyLogStore(options.ConnectionIdleTimeout())
 	reader := &pcapngBlockReader{source: input, onTLSSecrets: func(payload []byte) error {
 		_, err := keyLog.Write(payload)
 		return err
@@ -93,7 +93,14 @@ func DecryptPcapngStreamWithOptions(ctx context.Context, input io.ReadCloser, em
 	<-callbackDone
 	callbackMu.Lock()
 	defer callbackMu.Unlock()
-	return errors.Join(runErr, callbackErr, ctx.Err())
+	if callbackErr != nil {
+		callbackErr = fmt.Errorf("%w: %w", ErrEmitFailed, callbackErr)
+	}
+	var cancelErr error
+	if ctx.Err() != nil {
+		cancelErr = fmt.Errorf("%w: %w", ErrStreamCanceled, ctx.Err())
+	}
+	return errors.Join(runErr, callbackErr, cancelErr)
 }
 
 // pcapngBlockReader passes complete blocks through unchanged and observes DSBs

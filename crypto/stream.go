@@ -75,6 +75,15 @@ func (sb *StreamBuffer) Read(p []byte) (int, error) {
 		case <-sb.newData:
 			// New data available, try again
 		case <-sb.Closed:
+			// Write and Close may both happen after the length check. Prefer the
+			// final buffered bytes even when select chooses Close over newData.
+			sb.mu.Lock()
+			if sb.buf.Len() >= len(p) {
+				n, err := sb.buf.Read(p)
+				sb.mu.Unlock()
+				return n, err
+			}
+			sb.mu.Unlock()
 			return 0, io.EOF
 		}
 	}

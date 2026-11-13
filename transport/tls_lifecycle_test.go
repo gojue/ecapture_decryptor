@@ -8,18 +8,20 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/gojue/ecapture_decryptor/crypto"
 	"github.com/gojue/ecapture_decryptor/types"
 )
 
 func newTLSUpgradeTest(options types.DecryptOptions, capacity int) (*TLSDecryptorWrapper, chan *types.DecryptedPacket) {
 	base, _ := newTLSRawTest(types.DecryptOptions{})
 	packets := make(chan *types.DecryptedPacket, capacity)
-	wrapper := NewTLSDecryptorLibrary(base.ConnectionInfo, base.keyLog, base.clientOut, base.serverOut, base.logger, packets).(*TLSDecryptorWrapper)
+	wrapper := NewTLSDecryptorLibrary(base.ConnectionInfo, crypto.NewStreamingKeyLogStore(time.Minute), base.clientOut, base.serverOut, base.logger, packets).(*TLSDecryptorWrapper)
 	wrapper.SetOptions(options)
 	return wrapper, packets
 }
@@ -680,6 +682,135 @@ func TestExplicitTLSProtocolSelectionFragments(t *testing.T) {
 					}
 				}
 				assertTLSBuffersReleased(t, td)
+			})
+		})
+	}
+}
+
+func TestTLSStreamingKeyReferencesSurviveCloseAndSharedWorkers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := crypto.NewStreamingKeyLogStore(time.Second)
+		base, _ := newTLSRawTest(types.DecryptOptions{})
+		random, secret := bytes.Repeat([]byte{0x44}, 32), bytes.Repeat([]byte{0x31}, 32)
+		if _, err := store.Write([]byte(fmt.Sprintf("CLIENT_TRAFFIC_SECRET_0 %x %x\nSERVER_TRAFFIC_SECRET_0 %x %x\n", random, secret, random, secret))); err != nil {
+			t.Fatal(err)
+		}
+		blocked := make(chan *types.DecryptedPacket)
+		buffered := make(chan *types.DecryptedPacket, 8)
+		first := NewTLSDecryptor(base.ConnectionInfo, store, base.clientOut, base.serverOut, base.logger, blocked)
+		second := NewTLSDecryptor(base.ConnectionInfo, store, base.clientOut, base.serverOut, base.logger, buffered)
+		first.SetOptions(types.DecryptOptions{RawChunks: true})
+		second.SetOptions(types.DecryptOptions{RawChunks: true})
+		for _, d := range []*TLSDecryptor{first, second} {
+			client, server := tlsUpgradeTestHellos(0x44)
+			if err := d.FeedClient(append(client, tls13RawTestRecord(t, secret, 0, []byte("test"), 23)...)); err != nil {
+				t.Fatal(err)
+			}
+			if err := d.FeedServer(server); err != nil {
+				t.Fatal(err)
+			}
+		}
+		firstDone, secondDone := make(chan error, 1), make(chan error, 1)
+		go func() { firstDone <- first.Decrypt() }()
+		go func() { secondDone <- second.Decrypt() }()
+		synctest.Wait()
+		closed := make(chan struct{})
+		go func() { _ = first.Close(); close(closed) }()
+		<-first.closeSignal
+		store.ReapUnusedKeys()
+		if store.GetSecrets(random) == nil {
+			t.Fatal("closing worker lost referenced key under output backpressure")
+		}
+		drained := make(chan struct{})
+		go func() {
+			for range blocked {
+			}
+			close(drained)
+		}()
+		<-closed
+		if err := <-firstDone; err != nil {
+			t.Fatal(err)
+		}
+		close(blocked)
+		<-drained
+		if store.GetSecrets(random) == nil {
+			t.Fatal("first exit reclaimed the second worker's shared key")
+		}
+		_ = second.CloseClient()
+		_ = second.CloseServer()
+		if err := <-secondDone; err != nil {
+			t.Fatal(err)
+		}
+		if store.GetSecrets(random) != nil {
+			t.Fatal("last completed TLS worker retained keys")
+		}
+	})
+}
+
+func TestTLSUpgradeInheritsPendingKeyProtection(t *testing.T) {
+	for _, retired := range []bool{false, true} {
+		t.Run(fmt.Sprintf("retired=%v", retired), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				store := crypto.NewStreamingKeyLogStore(time.Second)
+				base, _ := newTLSRawTest(types.DecryptOptions{})
+				packets := make(chan *types.DecryptedPacket, 16)
+				w := NewTLSDecryptorLibrary(base.ConnectionInfo, store, io.Discard, io.Discard, base.logger, packets).(*TLSDecryptorWrapper)
+				w.SetOptions(types.DecryptOptions{TLSUpgrade: "postgres", RawChunks: true, KeyWaitTimeout: 4 * time.Second})
+				random, secret := bytes.Repeat([]byte{0x44}, 32), bytes.Repeat([]byte{0x11}, 32)
+				if _, err := fmt.Fprintf(store, "CLIENT_TRAFFIC_SECRET_0 %x %x\nSERVER_TRAFFIC_SECRET_0 %x %x\n", random, secret, random, secret); err != nil {
+					t.Fatal(err)
+				}
+				client, server := tlsUpgradeTestHellos(0x44)
+				record := tls13RawTestRecord(t, secret, 0, []byte("payload"), 0x17)
+				client, server = append(client, record...), append(server, record...)
+				if retired {
+					// Another real worker uses and retires this identity while the
+					// original upgrade connection is still negotiating its layer.
+					previous := NewTLSDecryptor(base.ConnectionInfo, store, io.Discard, io.Discard, base.logger, make(chan *types.DecryptedPacket, 16))
+					previous.SetOptions(types.DecryptOptions{RawChunks: true})
+					if err := previous.FeedClient(client); err != nil {
+						t.Fatal(err)
+					}
+					if err := previous.FeedServer(server); err != nil {
+						t.Fatal(err)
+					}
+					_ = previous.CloseClient()
+					_ = previous.CloseServer()
+					if err := previous.Decrypt(); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					// The orphan window expires before inner TLS is instantiated;
+					// the already-admitted outer connection still protects it.
+					time.Sleep(time.Second)
+				}
+				store.ReapUnusedKeys()
+				if store.GetSecrets(random) == nil {
+					t.Fatal("outer discovery lost its early DSB")
+				}
+				done := make(chan error, 1)
+				go func() { done <- w.Decrypt() }()
+				if err := w.FeedClient(append([]byte{0, 0, 0, 8, 4, 210, 22, 47}, client...)); err != nil {
+					t.Fatal(err)
+				}
+				if err := w.FeedServer(append([]byte("S"), server...)); err != nil {
+					t.Fatal(err)
+				}
+				_ = w.CloseClient()
+				_ = w.CloseServer()
+				if err := <-done; err != nil {
+					t.Fatalf("nested handoff lost previously protected keys: %v", err)
+				}
+				chunks := 0
+				for len(packets) > 0 {
+					if p := <-packets; string(p.Data) == "payload" {
+						chunks++
+					}
+				}
+				if chunks != 2 || store.GetSecrets(random) != nil {
+					t.Fatal("inner TLS lost payload or retained keys after both layers exited")
+				}
+				assertTLSBuffersReleased(t, w.upgrade.inner)
 			})
 		})
 	}

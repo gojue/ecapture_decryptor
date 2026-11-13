@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -353,5 +355,333 @@ func TestECHKeyLogExactAssociationAndCloning(t *testing.T) {
 	_, err := store.Write([]byte("ECH_CONFIG " + outerHex + " 01020304\n"))
 	if !errors.Is(err, ErrKeyLogResourceLimit) || len(store.GetSecrets(outer).ECHConfig) != 3 {
 		t.Fatal("ECH import bypassed secret-byte budget")
+	}
+}
+
+func TestStreamingKeyLogReferencesAndAccounting(t *testing.T) {
+	store := NewStreamingKeyLogStore(time.Minute)
+	first, second, undiscovered := store.NewConnectionScope(), store.NewConnectionScope(), store.NewConnectionScope()
+	// References exist before a late DSB and repeated reads do not acquire more.
+	for _, scope := range []*KeyLogStore{first, second} {
+		scope.GetSecrets([]byte{1})
+		scope.GetSecrets([]byte{1})
+		scope.ResolveKeyReferences()
+	}
+	for _, line := range []string{"CLIENT_RANDOM 01 010203\n", "CLIENT_RANDOM 01 010203\n", "CLIENT_RANDOM 01 04\n", "SERVER_TRAFFIC_SECRET_0 01 0506\n"} {
+		if _, err := store.Write([]byte(line)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if store.secretBytes != 3 || store.entries["01"].refs != 2 {
+		t.Fatal("duplicate/update accounting changed reference count or bytes")
+	}
+	first.ReleaseKeyReferences()
+	first.ReleaseKeyReferences()
+	if store.GetSecrets([]byte{1}) == nil {
+		t.Fatal("first release removed a shared key")
+	}
+	second.ReleaseKeyReferences()
+	if store.GetSecrets([]byte{1}) == nil {
+		t.Fatal("undiscovered connection lost an early DSB")
+	}
+	// A later worker can pin still-retained history atomically, but its
+	// admission alone must not renew protection of already retired entries.
+	later := store.NewConnectionScope()
+	if later.GetSecrets([]byte{1}) == nil {
+		t.Fatal("retained shared key could not be pinned")
+	}
+	undiscovered.ReleaseKeyReferences()
+	if later.GetSecrets([]byte{1}) == nil {
+		t.Fatal("explicit shared reference was reclaimed")
+	}
+	later.ResolveKeyReferences()
+	later.ReleaseKeyReferences()
+	if len(store.entries) != 0 || len(store.secrets) != 0 || store.secretBytes != 0 || len(store.pending) != 0 {
+		t.Fatal("last worker retained keys or accounting")
+	}
+	// Missing keys have bounded references too; no secret needs to arrive to free them.
+	missing := store.NewConnectionScope()
+	missing.GetSecrets([]byte{2})
+	missing.ResolveKeyReferences()
+	missing.ReleaseKeyReferences()
+	if len(store.entries) != 0 {
+		t.Fatal("missing key reference survived failure")
+	}
+}
+
+func TestStreamingKeyLogOrphanExpiryAndActiveProtection(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := NewStreamingKeyLogStore(time.Second)
+		if _, err := store.Write([]byte("CLIENT_RANDOM 01 0102\nCLIENT_RANDOM 02 0304\n")); err != nil {
+			t.Fatal(err)
+		}
+		active := store.NewConnectionScope()
+		active.GetSecrets([]byte{1})
+		active.ResolveKeyReferences()
+		pending := store.NewConnectionScope()
+		time.Sleep(time.Second)
+		store.ReapUnusedKeys()
+		if store.GetSecrets([]byte{2}) == nil {
+			t.Fatal("expired unassociated key lost before existing worker discovered identity")
+		}
+		pending.GetSecrets([]byte{2})
+		pending.ResolveKeyReferences()
+		time.Sleep(time.Hour)
+		store.ReapUnusedKeys()
+		if store.GetSecrets([]byte{1}) == nil || store.GetSecrets([]byte{2}) == nil {
+			t.Fatal("active or waiting reference expired")
+		}
+		active.ReleaseKeyReferences()
+		pending.ReleaseKeyReferences()
+		if store.secretBytes != 0 {
+			t.Fatal("completed workers retained secrets")
+		}
+		if _, err := store.Write([]byte("CLIENT_RANDOM 03 0506\n")); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(750 * time.Millisecond)
+		if _, err := store.Write([]byte("CLIENT_RANDOM 03 0506\nSERVER_TRAFFIC_SECRET_0 03 0708\n")); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(250 * time.Millisecond)
+		store.ReapUnusedKeys()
+		if store.GetSecrets([]byte{3}) != nil || store.secretBytes != 0 {
+			t.Fatal("duplicate or additional label extended orphan lifetime")
+		}
+		persistent := NewKeyLogStore()
+		if _, err := persistent.Write([]byte("CLIENT_RANDOM 01 02\n")); err != nil {
+			t.Fatal(err)
+		}
+		fileScope := persistent.NewConnectionScope()
+		fileScope.GetSecrets([]byte{1})
+		fileScope.ResolveKeyReferences()
+		fileScope.ReleaseKeyReferences()
+		time.Sleep(24 * time.Hour)
+		persistent.ReapUnusedKeys()
+		if persistent.GetSecrets([]byte{1}) == nil {
+			t.Fatal("file pre-scan secret expired")
+		}
+	})
+}
+
+func TestKeyLogResourceLimitDetails(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		store := NewStreamingKeyLogStore(time.Minute)
+		active := store.NewConnectionScope()
+		active.GetSecrets(make([]byte, 32))
+		active.ResolveKeyReferences()
+		var batch strings.Builder
+		for i := 0; i < maxKeyLogEntries; i++ {
+			fmt.Fprintf(&batch, "CLIENT_RANDOM %064x %s\n", i, strings.Repeat("ab", 48))
+		}
+		// One Write is intentionally a multi-megabyte DSB, not an oversized line.
+		if _, err := store.Write([]byte(batch.String())); err != nil {
+			t.Fatal(err)
+		}
+		if store.secretBytes != 786432 {
+			t.Fatalf("secret bytes=%d", store.secretBytes)
+		}
+		err := importTestKeyLog(store, fmt.Sprintf("CLIENT_RANDOM %064x %s\n", maxKeyLogEntries, strings.Repeat("cd", 48)), streaming)
+		var detail *KeyLogResourceLimitError
+		if !errors.Is(err, ErrKeyLogResourceLimit) || !errors.As(err, &detail) || detail.Resource != "entries" || detail.Current != maxKeyLogEntries || detail.Limit != maxKeyLogEntries || detail.Requested != 1 {
+			t.Fatalf("incorrect safe entry limit: %v", err)
+		}
+		if strings.Contains(err.Error(), strings.Repeat("ab", 48)) || strings.Contains(err.Error(), fmt.Sprintf("%064x", maxKeyLogEntries)) {
+			t.Fatal("error disclosed keylog content")
+		}
+		if store.GetSecrets(make([]byte, 32)) == nil {
+			t.Fatal("pressure evicted the active connection's key")
+		}
+		active.ReleaseKeyReferences()
+		if store.secretBytes != 786432-48 || len(store.secrets) != maxKeyLogEntries-1 {
+			t.Fatal("release after capacity failure did not restore exact budget")
+		}
+		if err := importTestKeyLog(store, fmt.Sprintf("CLIENT_RANDOM %064x %s\n", maxKeyLogEntries, strings.Repeat("cd", 48)), streaming); err != nil {
+			t.Fatalf("released capacity unusable: %v", err)
+		}
+	}
+	for _, streaming := range []bool{false, true} {
+		store := NewKeyLogStore()
+		err := importTestKeyLog(store, strings.Repeat("PRIVATE", 600), streaming)
+		var detail *KeyLogResourceLimitError
+		if !errors.As(err, &detail) || detail.Resource != "line_bytes" || detail.Limit != 4096 || strings.Contains(err.Error(), "PRIVATE") {
+			t.Fatalf("line limit details: %v", err)
+		}
+		// Existing trusted API seeding only accelerates this byte-limit test.
+		store.AddSecret("CLIENT_RANDOM", "01", make([]byte, maxKeyLogSecretBytes))
+		err = importTestKeyLog(store, "SERVER_TRAFFIC_SECRET_0 01 abcd\n", streaming)
+		if !errors.As(err, &detail) || detail.Resource != "secret_bytes" || detail.Current != maxKeyLogSecretBytes || detail.Requested != 2 {
+			t.Fatalf("byte limit details: %v", err)
+		}
+	}
+}
+
+func TestStreamingKeyLogConcurrentImportReadAndRelease(t *testing.T) {
+	store := NewStreamingKeyLogStore(time.Minute)
+	var wg sync.WaitGroup
+	for worker := 0; worker < 16; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 128; i++ {
+				scope := store.NewConnectionScope()
+				random := []byte{byte(worker)}
+				scope.GetSecrets(random)
+				scope.ResolveKeyReferences()
+				line := []byte(fmt.Sprintf("CLIENT_RANDOM %x 01020304\n", random))
+				if _, err := store.Write(line); err != nil {
+					t.Error(err)
+					return
+				}
+				snapshot := scope.GetSecrets(random)
+				if snapshot == nil || len(snapshot.MasterSecret) != 4 {
+					t.Error("pinned secret disappeared")
+					return
+				}
+				snapshot.MasterSecret[0] = 99
+				if scope.GetSecrets(random).MasterSecret[0] != 1 {
+					t.Error("snapshot aliased cached secret")
+					return
+				}
+				scope.ReleaseKeyReferences()
+				store.ReapUnusedKeys()
+			}
+		}()
+	}
+	wg.Wait()
+	if len(store.entries) != 0 || store.secretBytes != 0 || len(store.pending) != 0 {
+		t.Fatal("concurrent workers leaked references")
+	}
+}
+
+func TestStreamingKeyLogDiscoveryMetadataBounded(t *testing.T) {
+	store := NewStreamingKeyLogStore(time.Minute)
+	scope := store.NewConnectionScope()
+	for i := 0; i < 100; i++ {
+		scope.GetSecrets([]byte{byte(i)})
+	}
+	if scope.ResolveKeyReferences() {
+		t.Fatal("overflowed identity set reported successful discovery")
+	}
+	if len(scope.scope.keys) != 8 || len(store.entries) != 8 || len(store.pending) != 1 {
+		t.Fatal("unbounded negotiation identities or missing conservative barrier")
+	}
+	if _, err := store.Write([]byte("CLIENT_RANDOM ff 01\n")); err != nil {
+		t.Fatal(err)
+	}
+	scope.ReleaseKeyReferences()
+	if len(store.entries) != 1 || store.secretBytes != 1 || len(store.pending) != 0 {
+		t.Fatal("bounded discovery cleanup damaged unrelated early DSB")
+	}
+}
+
+func TestStreamingKeyLogPendingCohortsDoNotInheritRetiredHistory(t *testing.T) {
+	store := NewStreamingKeyLogStore(time.Minute)
+	older := store.NewConnectionScope()
+	live := store.NewConnectionScope()
+	live.GetSecrets([]byte{1})
+	live.ResolveKeyReferences()
+	if _, err := store.Write([]byte("CLIENT_RANDOM 01 010203\n")); err != nil {
+		t.Fatal(err)
+	}
+	live.ReleaseKeyReferences()
+	later := store.NewConnectionScope()
+	if store.GetSecrets([]byte{1}) == nil {
+		t.Fatal("earlier unresolved consumer lost the retained key")
+	}
+	older.ReleaseKeyReferences()
+	if store.GetSecrets([]byte{1}) != nil || store.secretBytes != 0 || len(store.pending) != 1 {
+		t.Fatal("later admission inherited historical protection")
+	}
+	// A fresh DSB, even for the same random, is available to the later worker.
+	if _, err := store.Write([]byte("CLIENT_RANDOM 01 0405\n")); err != nil {
+		t.Fatal(err)
+	}
+	if got := later.GetSecrets([]byte{1}); got == nil || !bytes.Equal(got.MasterSecret, []byte{4, 5}) {
+		t.Fatal("fresh publication lost")
+	}
+	later.ResolveKeyReferences()
+	later.ReleaseKeyReferences()
+	if len(store.entries) != 0 || store.secretBytes != 0 {
+		t.Fatal("new lifecycle did not release its keys")
+	}
+}
+
+func TestStreamingKeyLogRepublishedHistoryProtectsNewConsumers(t *testing.T) {
+	for _, republish := range []bool{false, true} {
+		store := NewStreamingKeyLogStore(time.Minute)
+		older, live := store.NewConnectionScope(), store.NewConnectionScope()
+		live.GetSecrets([]byte{1})
+		live.ResolveKeyReferences()
+		if _, err := store.Write([]byte("CLIENT_RANDOM 01 0102\n")); err != nil {
+			t.Fatal(err)
+		}
+		live.ReleaseKeyReferences()
+		later := store.NewConnectionScope()
+		if republish {
+			// It is still physically retained for older. Reimport must give later
+			// the same guarantee it would get if the entry had already been deleted.
+			if _, err := store.Write([]byte("CLIENT_RANDOM 01 030405\n")); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			// The pre-retirement consumer may discover this shared identity late.
+			if older.GetSecrets([]byte{1}) == nil {
+				t.Fatal("pre-retirement reader lost the key")
+			}
+			older.ResolveKeyReferences()
+		}
+		older.ReleaseKeyReferences()
+		if later.GetSecrets([]byte{1}) == nil {
+			t.Fatal("fresh publication or overlapping live reference lost")
+		}
+		later.ResolveKeyReferences()
+		later.ReleaseKeyReferences()
+		if store.secretBytes != 0 || len(store.entries) != 0 {
+			t.Fatal("republished/reference accounting leaked")
+		}
+	}
+}
+
+func TestStreamingKeyLogOrphanProtectionDoesNotExtendToLaterAdmissions(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := NewStreamingKeyLogStore(time.Second)
+		if _, err := store.Write([]byte("CLIENT_RANDOM 01 01\nCLIENT_RANDOM 02 02\n")); err != nil {
+			t.Fatal(err)
+		}
+		older := store.NewConnectionScope()
+		time.Sleep(time.Second)
+		later := store.NewConnectionScope()
+		// Reimport after the original window makes 02 available to new consumers.
+		if _, err := store.Write([]byte("CLIENT_RANDOM 02 0203\n")); err != nil {
+			t.Fatal(err)
+		}
+		older.ReleaseKeyReferences()
+		if store.GetSecrets([]byte{1}) != nil || store.secretBytes != 2 {
+			t.Fatal("later scope extended old orphan retention or broke new import")
+		}
+		if later.GetSecrets([]byte{2}) == nil {
+			t.Fatal("republished orphan expired before later discovery")
+		}
+		later.ResolveKeyReferences()
+		later.ReleaseKeyReferences()
+		if len(store.entries) != 0 || store.secretBytes != 0 {
+			t.Fatal("orphan publication leaked")
+		}
+	})
+}
+
+func TestStreamingKeyLogMissingReferenceDoesNotAccumulateMetadata(t *testing.T) {
+	store := NewStreamingKeyLogStore(time.Minute)
+	pending := store.NewConnectionScope()
+	defer pending.ReleaseKeyReferences()
+	for i := 0; i < 100; i++ {
+		scope := store.NewConnectionScope()
+		scope.GetSecrets([]byte{byte(i)})
+		scope.ResolveKeyReferences()
+		scope.ReleaseKeyReferences()
+	}
+	if len(store.entries) != 0 {
+		t.Fatal("retired missing keys accumulated behind an unresolved worker")
 	}
 }

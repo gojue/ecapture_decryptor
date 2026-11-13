@@ -100,6 +100,14 @@ err = ecapture_decryptor.DecryptPcapFile(keylogFile, pcapngFile, packetChan)
 QUIC 在匹配的密钥到达时也会重试缓存包。因此，即使 DSB 晚于最后一个 UDP 包，
 输入保持打开时仍可输出 HTTP/3 消息或原始 STREAM chunk。原有待解密包上限和
 关闭时缺少密钥的错误语义保持不变。
+长期流式入口在最后一个连接 worker 退出后回收已用密钥；未关联条目使用空闲期限
+作为保留窗口（默认 5 分钟）。活跃引用保护所需密钥；未决身份仅在每条密钥自己的
+接纳边界内提供保护，后来连接的持续轮换不会无限延长旧密钥寿命。QUIC 身份发现
+有默认 30 秒的绝对期限，部分握手、Retry 和版本协商不续期；新连接复用已退休
+身份必须重新提供密钥。文件入口
+保持整次调用保留预扫描密钥。导入限额不变，超限可获取不含敏感内容的类型化计数。
+个别连接失败不立即停止输入，EOF/关闭时仍汇总；可用 `errors.Is` 区分连接汇总、
+管线终止、回调失败和 context 取消，详见 [生命周期与错误契约](docs/API.md#decryptpcapngstreamwithoptions--withoptions)。
 
 ```go
 err := ecapture_decryptor.DecryptPcapngStream(ctx, input, func(message *types.DecryptedPacket) error {

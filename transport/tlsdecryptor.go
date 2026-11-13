@@ -37,6 +37,7 @@ type TLSDecryptor struct {
 	serverEnded, tcpReset    atomic.Bool
 	ConnectionInfo           types.ConnectionKey
 	keyLog                   *crypto.KeyLogStore
+	deferKeyDiscovery        bool
 	clientIn                 *crypto.StreamBuffer
 	serverIn                 *crypto.StreamBuffer
 	clientOut                io.Writer
@@ -191,7 +192,7 @@ func NewTLSDecryptor(ci types.ConnectionKey, keyLog *crypto.KeyLogStore, clientO
 	ci.TLS = &types.ConnectionTLS{}
 	td := &TLSDecryptor{
 		ConnectionInfo: ci,
-		keyLog:         keyLog,
+		keyLog:         keyLog.NewConnectionScope(),
 		clientIn:       crypto.NewStreamBuffer(),
 		serverIn:       crypto.NewStreamBuffer(),
 		clientOut:      clientOut,
@@ -706,6 +707,7 @@ func (td *TLSDecryptor) Close() error {
 }
 
 func (td *TLSDecryptor) Decrypt() error {
+	defer td.keyLog.ReleaseKeyReferences()
 	defer func() {
 		_ = td.Close()
 		td.releaseBuffers()
@@ -846,6 +848,10 @@ func (td *TLSDecryptor) parseHandshake() error {
 
 	td.ConnectionInfo.TLS.Observe(crypto.ClientHelloMetadata(hello.Message, "t"))
 	clientRandom := hello.Random
+	td.keyLog.GetSecrets(clientRandom) // Pin before waiting for the peer or DSB.
+	if !hello.ECHOffered && !td.deferKeyDiscovery {
+		td.keyLog.ResolveKeyReferences()
+	}
 	td.logger.Printf("Client Random: %s", hex.EncodeToString(clientRandom))
 
 	// Read Server Hello and determine TLS version and cipher suite
@@ -959,6 +965,11 @@ func (td *TLSDecryptor) parseHandshake() error {
 		}
 		if len(secrets.ECHSecret) > 0 && len(secrets.ECHConfig) > 0 {
 			clientRandom = hello.Random
+			td.keyLog.GetSecrets(clientRandom)
+			td.keyLog.GetSecrets(earlyRandom)
+			if !td.deferKeyDiscovery {
+				td.keyLog.ResolveKeyReferences()
+			}
 			td.echRejected = status == "rejected"
 			td.options.Report(td.ConnectionInfo, "handshake", "ech_"+status)
 			secrets, err = td.keyLog.WaitForSecrets(clientRandom, func(s *crypto.TLSSecrets) bool {
@@ -976,6 +987,10 @@ func (td *TLSDecryptor) parseHandshake() error {
 	}
 	td.clientRandom = bytes.Clone(clientRandom)
 	td.earlyClientRandom = bytes.Clone(earlyRandom)
+	td.keyLog.GetSecrets(earlyRandom)
+	if !td.deferKeyDiscovery {
+		td.keyLog.ResolveKeyReferences()
+	}
 	td.earlyOffered = version == tls.VersionTLS13 && len(earlyRandom) != 0
 	if len(td.retryEarlyRecords) > 0 && !td.earlyOffered {
 		return errTLS13Handshake
